@@ -1,10 +1,40 @@
-# JITHelpers.psm1 — shared helpers for the JIT NSG function app.
+﻿# JITHelpers.psm1 — shared helpers for the JIT NSG function app.
+#
+# This module depends on HttpHelpers.psm1 instead of Az.* modules so the
+# function app stays slim. All Azure ops go through Invoke-RestMethod via
+# the helpers in that module.
+#
+# IMPORTANT: HttpHelpers must already be loaded (in global scope) before any
+# JITHelpers function is invoked. Each endpoint's run.ps1 is responsible for
+# Import-Module'ing HttpHelpers FIRST. We do NOT re-import here, because
+# Import-Module from inside another .psm1 with -Force has the side effect of
+# clearing the inner module's ExportedCommands (PowerShell nested-module
+# behavior), which makes Get-ManagedIdentityToken etc. invisible at runtime.
 
-#region ── JWKS Cache ───────────────────────────────────────────────────────────────
-# Module-scoped variables persist within a worker process lifetime,
-# giving us an in-memory JWKS cache that survives across invocations.
+#region ── Per-worker Caches ────────────────────────────────────────────────────────
+# Module-scoped variables persist within a worker process lifetime.
 $script:JwksCache    = $null   # { Keys: [...], FetchedAt: [DateTime] }
 $script:JwksCacheTtl = [TimeSpan]::FromHours(1)
+
+# Cache of the JIT Requester role definition GUID. Resolved once per worker.
+$script:JitRoleDefIdCache = $null   # @{ Name; Guid }
+
+# Cache of per-caller authz decisions. Keyed by "{oid}|{siteResourceId}".
+# Cap is 60 seconds for both positive and negative decisions so role
+# assignments and revocations take effect within ~1 minute without needing
+# a function-app restart, while still saving an ARM round-trip per request
+# under typical bursty usage (a grant flow makes several calls back-to-back).
+$script:RoleCheckCache    = @{}
+$script:RoleCheckCacheTtl = [TimeSpan]::FromSeconds(60)
+
+# ARM audiences accepted on bearer tokens. Override via EXPECTED_AUDIENCES env var
+# (comma-separated) for sovereign clouds.
+$script:DefaultArmAudiences = @(
+    'https://management.azure.com/'
+    'https://management.azure.com'
+    'https://management.core.windows.net/'
+    'https://management.core.windows.net'
+)
 
 function Get-CachedJwks {
     param([string]$TenantId)
@@ -60,12 +90,19 @@ function ConvertFrom-Base64UrlBytes {
 function Invoke-JwtValidation {
     <#
     .SYNOPSIS
-        Validates an Azure AD JWT bearer token.
+        Validates an Azure AD JWT bearer token issued for Azure Resource Manager.
 
     .DESCRIPTION
         Performs full RS256 signature verification against Azure AD's published JWKS,
-        then validates the standard claims: expiry, tenant, issuer, audience, and
-        whether the calling app's client ID is in the approved list.
+        then validates expiry, tenant, issuer, and audience.
+
+        The audience must match one of the accepted ARM audiences (defaults cover
+        commercial Azure; override via the EXPECTED_AUDIENCES env var for sovereign
+        clouds, comma-separated).
+
+        Authorization (the JIT Requester role check) is performed by the caller
+        via Test-CallerHasJitRequesterRole — keep this function focused on
+        authentication only.
 
     .PARAMETER Token
         The raw bearer token string (without the "Bearer " prefix).
@@ -73,11 +110,9 @@ function Invoke-JwtValidation {
     .PARAMETER TenantId
         The expected Azure AD tenant ID.
 
-    .PARAMETER Audience
-        The expected 'aud' claim (typically api://<functionAppClientId>).
-
-    .PARAMETER AllowedClientIds
-        Array of Azure AD client IDs (appid claim) that are permitted callers.
+    .PARAMETER AllowedAudiences
+        Optional override for accepted audiences. When omitted, EXPECTED_AUDIENCES
+        env var is consulted; falls back to the ARM defaults.
 
     .OUTPUTS
         The decoded payload PSObject if valid; $null if any validation step fails.
@@ -85,9 +120,19 @@ function Invoke-JwtValidation {
     param(
         [Parameter(Mandatory)][string]   $Token,
         [Parameter(Mandatory)][string]   $TenantId,
-        [Parameter(Mandatory)][string]   $Audience,
-        [Parameter(Mandatory)][string[]] $AllowedClientIds
+        [string[]]                        $AllowedAudiences
     )
+
+    if (-not $AllowedAudiences -or $AllowedAudiences.Count -eq 0) {
+        if ($env:EXPECTED_AUDIENCES) {
+            $AllowedAudiences = ($env:EXPECTED_AUDIENCES -split ',') |
+                ForEach-Object { $_.Trim() } |
+                Where-Object   { $_ }
+        }
+        if (-not $AllowedAudiences -or $AllowedAudiences.Count -eq 0) {
+            $AllowedAudiences = $script:DefaultArmAudiences
+        }
+    }
 
     try {
         $parts = $Token.Split('.')
@@ -100,10 +145,22 @@ function Invoke-JwtValidation {
         $header  = ConvertFrom-Base64Url $parts[0] | ConvertFrom-Json
         $payload = ConvertFrom-Base64Url $parts[1] | ConvertFrom-Json
 
+        # ── Header: algorithm ────────────────────────────────────────────────
+        if ($header.alg -ne 'RS256') {
+            Write-Warning "JWT: unsupported algorithm '$($header.alg)' — only RS256 is accepted"
+            return $null
+        }
+
         # ── Claim: expiry ─────────────────────────────────────────────────────
         $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
         if ($payload.exp -lt $now) {
             Write-Warning 'JWT: token has expired'
+            return $null
+        }
+
+        # ── Claim: not before ─────────────────────────────────────────────────
+        if ($payload.nbf -and $payload.nbf -gt $now) {
+            Write-Warning 'JWT: token not yet valid (nbf in future)'
             return $null
         }
 
@@ -123,17 +180,14 @@ function Invoke-JwtValidation {
             return $null
         }
 
-        # ── Claim: audience ───────────────────────────────────────────────────
+        # ── Claim: audience (must match an ARM audience) ─────────────────────
         $audList = @($payload.aud)
-        if ($Audience -notin $audList) {
-            Write-Warning "JWT: audience mismatch (expected '$Audience', got '$($audList -join ', ')')"
-            return $null
+        $audOk   = $false
+        foreach ($a in $audList) {
+            if ($a -in $AllowedAudiences) { $audOk = $true; break }
         }
-
-        # ── Claim: approved calling app ───────────────────────────────────────
-        $callerAppId = if ($payload.appid) { $payload.appid } else { $payload.azp }
-        if ($callerAppId -notin $AllowedClientIds) {
-            Write-Warning "JWT: appid '$callerAppId' is not in the approved list"
+        if (-not $audOk) {
+            Write-Warning "JWT: audience mismatch (got '$($audList -join ', ')')"
             return $null
         }
 
@@ -184,12 +238,142 @@ function Invoke-JwtValidation {
 
 #endregion
 
+#region ── Authorization (custom RBAC role check) ───────────────────────────────────
+
+function Get-JitRequesterRoleDefinitionGuid {
+    <#
+    .SYNOPSIS
+        Resolves the GUID of the custom RBAC role definition by name (e.g. "JIT Requester").
+        Cached for the lifetime of the worker process.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $RoleDefinitionName,
+        [Parameter(Mandatory)][string] $SubscriptionId
+    )
+
+    if ($script:JitRoleDefIdCache -and $script:JitRoleDefIdCache.Name -eq $RoleDefinitionName) {
+        return $script:JitRoleDefIdCache.Guid
+    }
+
+    try {
+        $resp = Invoke-ArmRest `
+            -Path  "/subscriptions/$SubscriptionId/providers/Microsoft.Authorization/roleDefinitions" `
+            -Query @{ '$filter' = "roleName eq '$RoleDefinitionName'" }
+
+        if (@($resp.value).Count -gt 0) {
+            # response.value[].name is the role definition GUID
+            $guid = $resp.value[0].name
+            $script:JitRoleDefIdCache = @{ Name = $RoleDefinitionName; Guid = $guid }
+            return $guid
+        }
+    }
+    catch {
+        Write-Warning "JIT: role definition lookup failed for '$RoleDefinitionName' in sub $SubscriptionId — $_"
+    }
+
+    return $null
+}
+
+function Test-CallerHasJitRequesterRole {
+    <#
+    .SYNOPSIS
+        Returns $true if the caller (identified by AAD objectId) has an active
+        assignment of the custom "JIT Requester" role at, above, or below the
+        function app's own site resource scope.
+
+    .DESCRIPTION
+        Uses the function app's managed identity to query ARM for role
+        assignments via the assignedTo() filter, which returns assignments
+        that apply to the principal at the given scope including those
+        inherited from parent scopes (subscription, RG).
+
+        Decisions are cached per (callerObjectId, siteResourceId) for
+        60 seconds — long enough to absorb a burst of calls in a single
+        grant/revoke flow, short enough that role assignments and
+        revocations take effect within ~1 minute without a restart.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $CallerObjectId,
+        [Parameter(Mandatory)][string] $SiteResourceId,
+        [Parameter(Mandatory)][string] $RoleDefinitionName
+    )
+
+    $cacheKey = "$CallerObjectId|$SiteResourceId"
+    $now      = [DateTime]::UtcNow
+
+    if ($script:RoleCheckCache.ContainsKey($cacheKey) -and
+        ($now - $script:RoleCheckCache[$cacheKey].At) -lt $script:RoleCheckCacheTtl) {
+        return $script:RoleCheckCache[$cacheKey].Allowed
+    }
+
+    # Breadcrumb so we can confirm this code is loaded and being invoked.
+    # Logged as Information so it definitely flows through to Function logs.
+    Write-Host "JIT-AUTH: checking caller $CallerObjectId on $SiteResourceId for role '$RoleDefinitionName'."
+
+    $allowed = $false
+    try {
+        $subId       = ($SiteResourceId -split '/')[2]
+        $roleDefGuid = Get-JitRequesterRoleDefinitionGuid `
+                          -RoleDefinitionName $RoleDefinitionName `
+                          -SubscriptionId    $subId
+
+        if (-not $roleDefGuid) {
+            Write-Host "JIT-AUTH: role '$RoleDefinitionName' not found in sub $subId — DENIED."
+        }
+        else {
+            # NB: ARM's assignedTo() takes a bare GUID. The Microsoft docs
+            # render the placeholder as "{principalId}" — that's
+            # documentation punctuation; wrapping in braces returns 0 results.
+            Write-Host "JIT-AUTH: querying roleAssignments at $SiteResourceId with assignedTo('$CallerObjectId')"
+            # Follow nextLink so a matching assignment on a later page isn't
+            # missed (ARM paginates roleAssignments).
+            $assignments = @()
+            $nextUrl     = "$SiteResourceId/providers/Microsoft.Authorization/roleAssignments"
+            $firstPage   = $true
+            do {
+                $resp = if ($firstPage) {
+                    Invoke-ArmRest -Path $nextUrl -Query @{ '$filter' = "assignedTo('$CallerObjectId')" }
+                } else {
+                    Invoke-ArmRest -Path $nextUrl   # nextLink is absolute; carries $filter + api-version
+                }
+                $firstPage    = $false
+                $assignments += @($resp.value)
+                $nextUrl      = $resp.nextLink
+            } while ($nextUrl)
+            $assignmentSummary = if ($assignments.Count -eq 0) {
+                '(none found via assignedTo)'
+            } else {
+                ($assignments | ForEach-Object {
+                    "$(($_.properties.roleDefinitionId -split '/')[-1])@$($_.properties.scope)"
+                }) -join '; '
+            }
+            Write-Host "JIT-AUTH: looked for role-def GUID $roleDefGuid; ARM returned $($assignments.Count) assignment(s): $assignmentSummary"
+
+            foreach ($a in $assignments) {
+                $assignedGuid = ($a.properties.roleDefinitionId -split '/')[-1]
+                if ($assignedGuid -eq $roleDefGuid) { $allowed = $true; break }
+            }
+
+            Write-Host "JIT-AUTH: result for $CallerObjectId — $(if ($allowed) { 'ALLOWED' } else { 'DENIED' })"
+        }
+    }
+    catch {
+        Write-Warning "JIT: role check failed for $CallerObjectId — $_"
+    }
+
+    $script:RoleCheckCache[$cacheKey] = @{ Allowed = $allowed; At = $now }
+    return $allowed
+}
+
+#endregion
+
 #region ── Audit Logging ───────────────────────────────────────────────────────────────
 
 function Write-JITAuditEvent {
     <#
     .SYNOPSIS
-        Writes a structured JSON audit event to stdout (picked up by Application Insights).
+        Writes a structured JSON audit event to stdout (surfaced in the function app's
+        standard logs — Log stream, Kudu, az functionapp log tail).
         All JIT-AzAccess decisions — grants, denials, and expirations — flow through here.
     #>
     param(
@@ -208,7 +392,7 @@ function Write-JITAuditEvent {
         [hashtable]$Extra = @{}
     )
 
-    $event = @{
+    $auditEntry = @{
         auditEvent     = $EventType
         timestamp      = [DateTime]::UtcNow.ToString('o')
         caller         = $Caller
@@ -220,14 +404,15 @@ function Write-JITAuditEvent {
         ruleId         = $RuleId
         denyReason     = $DenyReason
     }
-    foreach ($k in $Extra.Keys) { $event[$k] = $Extra[$k] }
+    foreach ($k in $Extra.Keys) { $auditEntry[$k] = $Extra[$k] }
 
-    Write-Host ($event | ConvertTo-Json -Compress)
+    Write-Host ($auditEntry | ConvertTo-Json -Compress)
 }
 
 #endregion
 
 #region ── NSG Helpers ───────────────────────────────────────────────────────────────
+function Get-AvailableNsgPriority {
     <#
     .SYNOPSIS
         Returns the lowest unused inbound rule priority in the given range.
@@ -235,7 +420,7 @@ function Write-JITAuditEvent {
     #>
     param(
         [Parameter(Mandatory)]
-        [Microsoft.Azure.Commands.Network.Models.PSNetworkSecurityGroup]$Nsg,
+        $Nsg,
         [int]$Min = 1000,
         [int]$Max = 3900
     )
@@ -274,29 +459,39 @@ function Invoke-WithBlobLock {
     )
 
     $containerName = 'jit-locks'
-    $ctx           = New-AzStorageContext -ConnectionString $env:AzureWebJobsStorage
 
-    # Ensure container exists (idempotent)
-    if (-not (Get-AzStorageContainer -Name $containerName -Context $ctx -ErrorAction SilentlyContinue)) {
-        New-AzStorageContainer -Name $containerName -Context $ctx -Permission Off | Out-Null
-    }
+    # Ensure container exists (idempotent).
+    New-Container -Container $containerName
 
-    # Ensure lock blob exists (content irrelevant; just needs to be a leasable blob)
-    $tmpFile = [System.IO.Path]::GetTempFileName()
+    # Ensure lock blob exists. Use If-None-Match: * so PUT only creates when
+    # absent — avoids racing against an active lease which forbids overwrites.
     try {
-        [System.IO.File]::WriteAllText($tmpFile, 'lock')
-        Set-AzStorageBlobContent -Container $containerName -Blob $LockName -File $tmpFile `
-            -Context $ctx -Force -ErrorAction SilentlyContinue | Out-Null
+        $bytes = [Text.Encoding]::UTF8.GetBytes('lock')
+        Invoke-BlobRest -Method PUT -Container $containerName -Blob $LockName `
+            -BodyBytes $bytes -ContentType 'application/octet-stream' `
+            -ExtraHeaders @{ 'x-ms-blob-type' = 'BlockBlob'; 'If-None-Match' = '*' } | Out-Null
+    } catch {
+        # 409/412 means the blob already exists — that's fine, we just want to lease it.
+        $status = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+        if ($status -ne 409 -and $status -ne 412) { throw }
     }
-    finally { Remove-Item $tmpFile -ErrorAction SilentlyContinue }
 
-    # Try to acquire a lease, retrying on conflict
+    # Acquire lease (POST ?comp=lease with x-ms-lease-action: acquire).
     $leaseId = $null
     for ($i = 0; $i -lt $RetryCount; $i++) {
         try {
-            $blob    = Get-AzStorageBlob -Container $containerName -Blob $LockName -Context $ctx
-            $leaseId = $blob.ICloudBlob.AcquireLease(
-                [nullable[TimeSpan]]([TimeSpan]::FromSeconds($LeaseDurationSeconds)), $null)
+            $headers = @{
+                'x-ms-lease-action'   = 'acquire'
+                'x-ms-lease-duration' = "$LeaseDurationSeconds"
+            }
+            $resp = Invoke-WebRequest -Method PUT `
+                -Uri ((Get-LockBlobUri $containerName $LockName) + '?comp=lease') `
+                -Headers (New-LeaseHeaders -ResourcePath "/$containerName/$LockName" `
+                                           -Query 'comp=lease' `
+                                           -ExtraHeaders $headers) `
+                -ErrorAction Stop
+            $leaseId = $resp.Headers['x-ms-lease-id']
+            if ($leaseId -is [array]) { $leaseId = $leaseId[0] }
             break
         }
         catch {
@@ -307,92 +502,167 @@ function Invoke-WithBlobLock {
         }
     }
 
+    $actionResult = $null
     try {
-        & $Action
+        # Capture and return the action's output. The scriptblock runs in a
+        # child scope, so a caller relying on `$x = ...` *inside* the block
+        # would lose it; callers must use `$x = Invoke-WithBlobLock -Action {...}`.
+        $actionResult = & $Action
     }
     finally {
+        # Release lease.
         try {
-            $blob = Get-AzStorageBlob -Container $containerName -Blob $LockName -Context $ctx
-            $condition = [Microsoft.Azure.Storage.AccessCondition]::GenerateLeaseCondition($leaseId)
-            $blob.ICloudBlob.ReleaseLease($condition)
+            $headers = @{
+                'x-ms-lease-action' = 'release'
+                'x-ms-lease-id'     = $leaseId
+            }
+            Invoke-WebRequest -Method PUT `
+                -Uri ((Get-LockBlobUri $containerName $LockName) + '?comp=lease') `
+                -Headers (New-LeaseHeaders -ResourcePath "/$containerName/$LockName" `
+                                           -Query 'comp=lease' `
+                                           -ExtraHeaders $headers) `
+                -ErrorAction SilentlyContinue | Out-Null
         }
         catch {
             Write-Warning "Failed to release blob lease '$LockName': $_"
         }
     }
+
+    return $actionResult
+}
+
+# Minimal helpers for the lease ops (which need direct Invoke-WebRequest to
+# read response headers for the lease id).
+function script:Get-LockBlobUri {
+    param([string]$Container, [string]$Blob)
+    $sp = & (Get-Module HttpHelpers) { Get-StorageParts }
+    return "https://$($sp.Account).blob.$($sp.Suffix)/$Container/$Blob"
+}
+function script:New-LeaseHeaders {
+    param([string]$ResourcePath, [string]$Query, [hashtable]$ExtraHeaders)
+    $date = [DateTime]::UtcNow.ToString('R')
+    $headers = @{ 'x-ms-version' = '2021-12-02'; 'x-ms-date' = $date }
+    foreach ($k in $ExtraHeaders.Keys) { $headers[$k] = $ExtraHeaders[$k] }
+
+    $sp = & (Get-Module HttpHelpers) { Get-StorageParts }
+
+    # CanonicalResource must use the Blob recipe: the query param goes on its
+    # own "comp:lease" line, NOT the literal "?comp=lease" (that's the Table
+    # form). Reuse the same helper Invoke-BlobRest uses so the two can't drift.
+    $canResource = & (Get-Module HttpHelpers) {
+        param($A, $P, $Q) Get-BlobCanonicalResource -Account $A -Path $P -Query $Q
+    } $sp.Account $ResourcePath $Query
+
+    $sig = & (Get-Module HttpHelpers) {
+        param($M, $C, $H, $L, $T) New-SharedKeySignature -Method $M -CanonicalResource $C -Headers $H -ContentLength $L -ContentType $T
+    } 'PUT' $canResource $headers 0 ''
+    $headers.Authorization = $sig
+    return $headers
 }
 
 #endregion
 
 #region ── Table Storage Helpers ──────────────────────────────────────────────
 
-function Get-JITCloudTable {
+function Get-JITTableName {
     <#
     .SYNOPSIS
-        Returns the AzTable CloudTable object for the JIT rules table,
-        creating the table if it does not already exist.
+        Returns the name of the JIT rules table, creating it via Table REST
+        if it does not yet exist. Replaces the Az.Storage/AzTable cmdlets.
     #>
-    param([string]$TableName)
+    param([Parameter(Mandatory)][string]$TableName)
 
-    $ctx   = New-AzStorageContext -ConnectionString $env:AzureWebJobsStorage
-    $table = Get-AzStorageTable -Name $TableName -Context $ctx -ErrorAction SilentlyContinue
-
-    if (-not $table) {
-        Write-Host "Creating JIT rules table '$TableName'..."
-        $table = New-AzStorageTable -Name $TableName -Context $ctx
+    # Ensure the table exists (POST /Tables, idempotent against 409).
+    try {
+        Invoke-TableRest -Method POST -Path '/Tables' -Body @{ TableName = $TableName } | Out-Null
+    } catch {
+        $status = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+        if ($status -ne 409) { throw }  # 409 = already exists
     }
+    return $TableName
+}
 
-    return $table.CloudTable
+function Get-JITTableRows {
+    <#
+    .SYNOPSIS
+        Reads rows from a Table Storage table. Optional OData $filter.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$TableName,
+        [string]$Filter = ''
+    )
+    $query = if ($Filter) { '$filter=' + [Uri]::EscapeDataString($Filter) } else { '' }
+    $resp  = Invoke-TableRest -Method GET -Path "/$TableName()" -Query $query
+    return @($resp.value)
+}
+
+function Add-JITTableRow {
+    <#
+    .SYNOPSIS
+        Inserts a row into a Table Storage table.
+        Properties must include PartitionKey and RowKey.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$TableName,
+        [Parameter(Mandatory)][hashtable]$Properties
+    )
+    Invoke-TableRest -Method POST -Path "/$TableName" -Body $Properties | Out-Null
+}
+
+function Remove-JITTableRow {
+    <#
+    .SYNOPSIS
+        Deletes a row from a Table Storage table.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$TableName,
+        [Parameter(Mandatory)][string]$PartitionKey,
+        [Parameter(Mandatory)][string]$RowKey
+    )
+    $pk   = [Uri]::EscapeDataString($PartitionKey)
+    $rk   = [Uri]::EscapeDataString($RowKey)
+    Invoke-TableRest -Method DELETE -Path "/$TableName(PartitionKey='$pk',RowKey='$rk')" `
+        -ExtraHeaders @{ 'If-Match' = '*' } | Out-Null
 }
 
 #endregion
 
-#region ── Target Manifest (Blob Storage) ─────────────────────────────────────
+#region ── Caller IP ──────────────────────────────────────────────────────────
 
-function Get-JITTargetManifest {
+function Get-CallerIp {
     <#
     .SYNOPSIS
-        Reads the JIT target manifest from jit-config/targets.json in the
-        AzureWebJobsStorage account.  Returns an empty array if the blob
-        does not yet exist.  This is the server-of-record for which resources
-        are available in the plugin's browse list.
+        Extracts the caller's public IP from the request. Azure injects the real
+        client IP into X-Forwarded-For (leftmost entry is the originating IP);
+        entries may be "ip:port" (IPv4), "[ipv6]:port", or bare. Falls back to
+        the socket remote address. Shared by Request-JITAccess (to write the
+        firewall rule) and Get-JITRules (to report the IP back to the client),
+        so both agree on exactly which IP a grant would use.
     #>
-    $containerName = 'jit-config'
-    $blobName      = 'targets.json'
-    $ctx           = New-AzStorageContext -ConnectionString $env:AzureWebJobsStorage
+    param([Parameter(Mandatory)]$Request)
 
-    # Create container if it doesn't exist (idempotent, private access)
-    if (-not (Get-AzStorageContainer -Name $containerName -Context $ctx -ErrorAction SilentlyContinue)) {
-        New-AzStorageContainer -Name $containerName -Context $ctx -Permission Off | Out-Null
+    $xff = $Request.Headers['X-Forwarded-For']
+    if ($xff) {
+        $first = ($xff.ToString() -split ',')[0].Trim()
+        if ($first -match '^\[(.+)\]:\d+$')                  { return $matches[1] }  # [ipv6]:port
+        if ($first -match '^(\d{1,3}(\.\d{1,3}){3}):\d+$')   { return $matches[1] }  # ipv4:port
+        return $first                                                                # bare ip
     }
 
-    $blob = Get-AzStorageBlob -Container $containerName -Blob $blobName `
-                -Context $ctx -ErrorAction SilentlyContinue
-
-    if (-not $blob) {
-        Write-Host "JIT: target manifest blob '$containerName/$blobName' not found — returning empty list."
-        return @()
-    }
-
-    $tmpFile = [System.IO.Path]::GetTempFileName()
-    try {
-        Get-AzStorageBlobContent -Container $containerName -Blob $blobName `
-            -Destination $tmpFile -Context $ctx -Force | Out-Null
-        $json = Get-Content -Path $tmpFile -Raw -Encoding UTF8
-        return ($json | ConvertFrom-Json)
-    }
-    finally {
-        Remove-Item $tmpFile -ErrorAction SilentlyContinue
-    }
+    return $Request.HttpContext.Connection.RemoteIpAddress.ToString()
 }
 
 #endregion
 
 Export-ModuleMember -Function @(
     'Invoke-JwtValidation'
+    'Test-CallerHasJitRequesterRole'
     'Write-JITAuditEvent'
     'Get-AvailableNsgPriority'
     'Invoke-WithBlobLock'
-    'Get-JITCloudTable'
-    'Get-JITTargetManifest'
+    'Get-JITTableName'
+    'Get-JITTableRows'
+    'Add-JITTableRow'
+    'Remove-JITTableRow'
+    'Get-CallerIp'
 )

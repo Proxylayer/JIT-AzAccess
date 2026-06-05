@@ -11,14 +11,14 @@
         "resourceGroupName": {
             "value": "rg-jit-azaccess"
         },
-        "approvedClientIds": {
-            "value": "<comma-separated AAD client IDs allowed to call the JIT API>"
+        "azureTrayAppRegistrationName": {
+            "value": "AzureTray"
         },
-        "jwtAudience": {
-            "value": "<Application ID URI of this service's app registration, e.g. api://jit-azaccess>"
+        "azureTrayAppRegistrationObjectId": {
+            "value": "<object ID of the AzureTray app registration — fill in or leave blank to let Deploy.ps1 resolve it>"
         },
-        "jitAppRegistrationObjectId": {
-            "value": "<Object ID of the app registration — leave blank, fill in after Set-JITAppRegistration.ps1>"
+        "jitRequesterRoleName": {
+            "value": "JIT Requester"
         },
         "allowedDurationsHours": {
             "value": "1,4,8"
@@ -34,9 +34,6 @@
         },
         "maxRulesPerResource": {
             "value": "20"
-        },
-        "logRetentionDays": {
-            "value": 90
         }
     }
 }

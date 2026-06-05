@@ -1,35 +1,36 @@
-# Revoke-JITAccess/run.ps1
+﻿# Revoke-JITAccess/run.ps1
 #
 # HTTP DELETE /api/Revoke-JITAccess/{ruleId}
 #
 # Removes an active JIT rule before its natural expiry.
-# The caller must be the rule's original requester, or hold the JIT.Admin role.
+# The caller can only revoke rules they personally requested.
 #
-# Authorization: Bearer <AAD token with JIT.Requester (or JIT.Admin) role>
+# Authorization: Bearer <AAD ARM token>; caller must hold the "JIT Requester"
+# RBAC role on the function app site resource.
 
 using namespace System.Net
 
 param($Request, $TriggerMetadata)
 
-Import-Module "$PSScriptRoot/../Modules/JITHelpers/JITHelpers.psm1"  -Force
-Import-Module "$PSScriptRoot/../Modules/JITTargets/JITTargets.psm1" -Force
+Import-Module "$PSScriptRoot/../Modules/HttpHelpers/HttpHelpers.psm1" -Force -DisableNameChecking
+Import-Module "$PSScriptRoot/../Modules/JITHelpers/JITHelpers.psm1"   -Force
+Import-Module "$PSScriptRoot/../Modules/JITTargets/JITTargets.psm1"   -Force
 
-$tenantId         = $env:AZURE_TENANT_ID
-$audience         = $env:JWT_AUDIENCE
-$allowedClientIds = ($env:APPROVED_CLIENT_IDS -split ',') |
-                        ForEach-Object { $_.Trim() } | Where-Object { $_ }
-$tableName        = if ($env:JIT_TABLE_NAME) { $env:JIT_TABLE_NAME } else { 'JITRules' }
+$tenantId             = $env:AZURE_TENANT_ID
+$siteResourceId       = $env:JIT_SITE_RESOURCE_ID
+$jitRequesterRoleName = if ($env:JIT_REQUESTER_ROLE_NAME) { $env:JIT_REQUESTER_ROLE_NAME } else { 'JIT Requester' }
+$tableName            = if ($env:JIT_TABLE_NAME)          { $env:JIT_TABLE_NAME }          else { 'JITRules' }
 
 function Write-JsonResponse {
     param([HttpStatusCode]$Status, [hashtable]$Body)
     Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
         StatusCode = $Status
-        Body       = ($Body | ConvertTo-Json -Compress)
+        Body       = (ConvertTo-Json -InputObject $Body -Compress)
         Headers    = @{ 'Content-Type' = 'application/json' }
     })
 }
 
-#region ── 1. Validate token ──────────────────────────────────────────────────
+#region ── 1. Validate token + authz ──────────────────────────────────────────
 
 $authHeader = $Request.Headers['Authorization']
 if (-not $authHeader -or -not $authHeader.ToString().StartsWith('Bearer ')) {
@@ -38,25 +39,33 @@ if (-not $authHeader -or -not $authHeader.ToString().StartsWith('Bearer ')) {
 }
 
 $token  = $authHeader.ToString().Substring(7)
-$claims = Invoke-JwtValidation -Token $token `
-                               -TenantId $tenantId `
-                               -Audience $audience `
-                               -AllowedClientIds $allowedClientIds
+$claims = Invoke-JwtValidation -Token $token -TenantId $tenantId
 
 if (-not $claims) {
     Write-JsonResponse -Status Forbidden -Body @{ error = 'Token validation failed.' }
     return
 }
 
-$callerRoles = @()
-if ($claims.roles) { $callerRoles = @($claims.roles) }
-
-if ('JIT.Requester' -notin $callerRoles) {
-    Write-JsonResponse -Status Forbidden -Body @{ error = 'JIT.Requester role required.' }
+if (-not $siteResourceId) {
+    Write-JsonResponse -Status InternalServerError -Body @{ error = 'Function app is misconfigured: JIT_SITE_RESOURCE_ID is not set.' }
     return
 }
 
-$isAdmin     = 'JIT.Admin' -in $callerRoles
+$callerObjectId = $claims.oid
+if (-not $callerObjectId) {
+    Write-JsonResponse -Status Forbidden -Body @{ error = 'Token has no oid claim.' }
+    return
+}
+
+if (-not (Test-CallerHasJitRequesterRole -CallerObjectId $callerObjectId `
+            -SiteResourceId $siteResourceId -RoleDefinitionName $jitRequesterRoleName)) {
+    Write-JsonResponse -Status Forbidden -Body @{
+        error        = "Caller does not hold the '$jitRequesterRoleName' RBAC role on this function app."
+        requiredRole = $jitRequesterRoleName
+    }
+    return
+}
+
 $requestedBy = if ($claims.upn)         { $claims.upn }
                elseif ($claims.unique_name) { $claims.unique_name }
                else                         { $claims.sub }
@@ -65,17 +74,20 @@ $requestedBy = if ($claims.upn)         { $claims.upn }
 
 #region ── 2. Look up the rule ────────────────────────────────────────────────
 
+# Accept both the legacy id shape (jit-<8hex>) and the username-tagged shape
+# (jit-<username>-<8hex>). The charset stays restricted to lowercase
+# alphanumerics + hyphens, so $ruleId is still safe to interpolate into the
+# OData filter below (no quotes possible).
 $ruleId = $Request.Params.ruleId
-if (-not $ruleId -or $ruleId -notmatch '^jit-[0-9a-fA-F]{8}$') {
+if (-not $ruleId -or $ruleId -notmatch '^jit-([a-z0-9]{1,20}-)?[0-9a-fA-F]{8}$') {
     Write-JsonResponse -Status BadRequest -Body @{ error = 'Invalid or missing ruleId in URL path.' }
     return
 }
 
 try {
-    $cloudTable = Get-JITCloudTable -TableName $tableName
+    Get-JITTableName -TableName $tableName | Out-Null
     # RowKey equals the ruleId; partition key is the subscriptionId which we don't know without a scan.
-    $row = Get-AzTableRow -Table $cloudTable `
-               -CustomFilter "RowKey eq '$ruleId'" |
+    $row = Get-JITTableRows -TableName $tableName -Filter "RowKey eq '$ruleId'" |
                Select-Object -First 1
 }
 catch {
@@ -90,11 +102,10 @@ if (-not $row) {
     return
 }
 
-# Ownership check — only the original requester or an admin may revoke.
-if ($row.RequestedBy -ne $requestedBy -and -not $isAdmin) {
+# Ownership check — callers can only revoke rules they personally requested.
+if ($row.RequestedBy -ne $requestedBy) {
     Write-JsonResponse -Status Forbidden -Body @{
-        error = 'You can only revoke rules you personally requested. ' +
-                'The JIT.Admin role is required to revoke rules for other users.'
+        error = 'You can only revoke rules you personally requested.'
     }
     return
 }
@@ -137,9 +148,9 @@ catch {
 #region ── 4. Delete table record ────────────────────────────────────────────
 
 try {
-    Remove-AzTableRow -Table $cloudTable `
-                      -PartitionKey $row.PartitionKey `
-                      -RowKey       $row.RowKey | Out-Null
+    Remove-JITTableRow -TableName $tableName `
+                       -PartitionKey $row.PartitionKey `
+                       -RowKey       $row.RowKey
 }
 catch {
     Write-Warning "Rule was removed from the resource but the table record deletion failed for '$ruleId': $_"

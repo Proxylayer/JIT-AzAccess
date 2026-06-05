@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using AzureTray.Plugin.Contracts;
 using AzureTray.Plugin.JITAzAccess.Models;
+using Microsoft.Extensions.Logging;
 
 namespace AzureTray.Plugin.JITAzAccess;
 
@@ -48,9 +49,13 @@ internal sealed class ArmVerifier
         using var timeoutCts = new CancellationTokenSource(timeoutMs);
         using var linked     = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
 
+        _context.Logger.LogDebug(
+            "JIT ARM verify: starting for {TargetType} {ResourceName} (rule {RuleId}).",
+            grant.TargetType, grant.ResourceName, grant.RuleId);
+
         try
         {
-            return grant.TargetType switch
+            var result = grant.TargetType switch
             {
                 "nsg"            => await VerifyNsgRuleAsync(grant, tenantId, linked.Token),
                 "sqlServer"      => await VerifySqlRuleAsync(grant, tenantId, linked.Token),
@@ -58,13 +63,23 @@ internal sealed class ArmVerifier
                 "keyVault"       => await VerifyKeyVaultRuleAsync(grant, tenantId, linked.Token),
                 _                => VerificationResult.Skipped,
             };
+
+            if (result == VerificationResult.Skipped)
+                _context.Logger.LogDebug(
+                    "JIT ARM verify: no implementation for target type {TargetType} — skipped.",
+                    grant.TargetType);
+
+            return result;
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
         {
             return VerificationResult.Timeout;
         }
-        catch
+        catch (Exception ex)
         {
+            _context.Logger.LogWarning(ex,
+                "JIT ARM verify: unexpected error for {TargetType} {ResourceName} (rule {RuleId}).",
+                grant.TargetType, grant.ResourceName, grant.RuleId);
             return VerificationResult.Error;
         }
     }
@@ -106,14 +121,26 @@ internal sealed class ArmVerifier
                   $"?api-version={StorageApi}";
 
         var response = await ArmGetAsync(tenantId, url, ct).ConfigureAwait(false);
-        if (!response.IsSuccessStatusCode) return VerificationResult.Error;
+        if (!response.IsSuccessStatusCode)
+        {
+            _context.Logger.LogWarning(
+                "JIT ARM verify (storage): GET {Url} returned {Status}.",
+                url, (int)response.StatusCode);
+            return VerificationResult.Error;
+        }
 
         var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
         using var doc = JsonDocument.Parse(body);
 
-        if (!doc.RootElement.TryGetProperty("properties", out var props)) return VerificationResult.Error;
-        if (!props.TryGetProperty("networkAcls", out var acls))           return VerificationResult.Error;
-        if (!acls.TryGetProperty("ipRules", out var ipRules))             return VerificationResult.NotFound;
+        if (!doc.RootElement.TryGetProperty("properties", out var props) ||
+            !props.TryGetProperty("networkAcls", out var acls))
+        {
+            _context.Logger.LogWarning(
+                "JIT ARM verify (storage): unexpected response shape for {ResourceName} — missing properties.networkAcls.",
+                grant.ResourceName);
+            return VerificationResult.Error;
+        }
+        if (!acls.TryGetProperty("ipRules", out var ipRules)) return VerificationResult.NotFound;
 
         foreach (var rule in ipRules.EnumerateArray())
         {
@@ -135,14 +162,26 @@ internal sealed class ArmVerifier
                   $"?api-version={KeyVaultApi}";
 
         var response = await ArmGetAsync(tenantId, url, ct).ConfigureAwait(false);
-        if (!response.IsSuccessStatusCode) return VerificationResult.Error;
+        if (!response.IsSuccessStatusCode)
+        {
+            _context.Logger.LogWarning(
+                "JIT ARM verify (keyVault): GET {Url} returned {Status}.",
+                url, (int)response.StatusCode);
+            return VerificationResult.Error;
+        }
 
         var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
         using var doc = JsonDocument.Parse(body);
 
-        if (!doc.RootElement.TryGetProperty("properties", out var props)) return VerificationResult.Error;
-        if (!props.TryGetProperty("networkAcls", out var acls))           return VerificationResult.Error;
-        if (!acls.TryGetProperty("ipRules", out var ipRules))             return VerificationResult.NotFound;
+        if (!doc.RootElement.TryGetProperty("properties", out var props) ||
+            !props.TryGetProperty("networkAcls", out var acls))
+        {
+            _context.Logger.LogWarning(
+                "JIT ARM verify (keyVault): unexpected response shape for {ResourceName} — missing properties.networkAcls.",
+                grant.ResourceName);
+            return VerificationResult.Error;
+        }
+        if (!acls.TryGetProperty("ipRules", out var ipRules)) return VerificationResult.NotFound;
 
         var expected = $"{grant.CallerIp}/32";
         foreach (var rule in ipRules.EnumerateArray())
@@ -160,8 +199,8 @@ internal sealed class ArmVerifier
         string tenantId, string url, CancellationToken ct)
     {
         var request = new HttpRequestMessage(HttpMethod.Get, url);
-        return _context.Http.SendAsync(
-            PluginHttpClientNames.Arm, tenantId, _context.ArmScope, request, ct);
+        return _context.GetHttpClient(tenantId).SendAsync(
+            PluginHttpClientNames.Arm, _context.ArmScope, request, ct);
     }
 }
 

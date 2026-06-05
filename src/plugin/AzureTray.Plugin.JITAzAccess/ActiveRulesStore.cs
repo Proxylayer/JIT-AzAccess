@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Text.Json;
 using AzureTray.Plugin.JITAzAccess.Models;
+using Microsoft.Extensions.Logging;
 
 namespace AzureTray.Plugin.JITAzAccess;
 
@@ -18,10 +19,12 @@ internal sealed class ActiveRulesStore
 
     private readonly string _filePath;
     private readonly object _lock = new();
+    private readonly ILogger? _logger;
     private List<ActiveRule> _rules;
 
-    public ActiveRulesStore(string dataDir)
+    public ActiveRulesStore(string dataDir, ILogger? logger = null)
     {
+        _logger = logger;
         Directory.CreateDirectory(dataDir);
         _filePath = Path.Combine(dataDir, "active-rules.json");
         _rules = Load();
@@ -65,8 +68,11 @@ internal sealed class ActiveRulesStore
             return loaded?.Where(r => r.ExpiryUtc > now).ToList()
                    ?? new List<ActiveRule>();
         }
-        catch
+        catch (Exception ex)
         {
+            _logger?.LogWarning(ex,
+                "JIT: could not load local rule store at {FilePath}; starting with an empty store.",
+                _filePath);
             return new List<ActiveRule>();
         }
     }
@@ -77,9 +83,12 @@ internal sealed class ActiveRulesStore
         {
             File.WriteAllText(_filePath, JsonSerializer.Serialize(rules, JsonOptions));
         }
-        catch
+        catch (Exception ex)
         {
             // Non-critical: in-memory state is authoritative for the current session.
+            _logger?.LogWarning(ex,
+                "JIT: could not persist local rule store to {FilePath}; in-memory state retained.",
+                _filePath);
         }
     }
 }

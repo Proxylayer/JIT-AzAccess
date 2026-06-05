@@ -1,10 +1,12 @@
+using System.Collections.Generic;
 using System.Text.Json.Serialization;
 
 namespace AzureTray.Plugin.JITAzAccess.Models;
 
 /// <summary>
-/// A pre-approved JIT target from the server manifest (GET /api/Get-JITTargets).
-/// The server controls which resources appear in the plugin's browse list.
+/// A JIT target the user can request access to. Discovered client-side from
+/// the signed-in user's own ARM resources (see <see cref="ResourceDiscovery"/>),
+/// so the browse list reflects whatever resources the caller can already see.
 /// </summary>
 public sealed record JitTarget
 {
@@ -49,4 +51,13 @@ public sealed record JitTarget
     /// <summary>When true the plugin prompts for a justification string before granting.</summary>
     [JsonPropertyName("requiresJustification")]
     public bool RequiresJustification { get; init; }
+
+    /// <summary>
+    /// IP/CIDR values already present in this resource's firewall (discovered
+    /// from ARM, not server-supplied). Used to detect when the caller's IP is
+    /// already permanently allowed. Case-insensitive set for O(1) exact-match.
+    /// </summary>
+    [JsonIgnore]
+    public IReadOnlySet<string> WhitelistedIps { get; init; } =
+        new HashSet<string>(System.StringComparer.OrdinalIgnoreCase);
 }

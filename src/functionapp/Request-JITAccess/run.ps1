@@ -1,4 +1,4 @@
-# Request-jitazaccess/run.ps1
+﻿# Request-jitazaccess/run.ps1
 #
 # HTTP POST — Grants a caller's IP address temporary access on a supported target resource.
 #
@@ -14,23 +14,25 @@
 #   "port":           "443"       // NSG only — omit to allow any port
 # }
 #
-# Authorization: Bearer <AAD token>
-#   Token must match AZURE_TENANT_ID, JWT_AUDIENCE, and APPROVED_CLIENT_IDS.
+# Authorization: Bearer <AAD ARM token>
+#   Token must match AZURE_TENANT_ID and carry an ARM audience.
+#   Caller's AAD objectId must hold the "JIT Requester" custom RBAC role
+#   at or above the function app site resource (controlled by
+#   JIT_SITE_RESOURCE_ID / JIT_REQUESTER_ROLE_NAME env vars).
 
 using namespace System.Net
 
 param($Request, $TriggerMetadata)
 
-Import-Module "$PSScriptRoot/../Modules/JITHelpers/JITHelpers.psm1"  -Force
-Import-Module "$PSScriptRoot/../Modules/JITTargets/JITTargets.psm1" -Force
+Import-Module "$PSScriptRoot/../Modules/HttpHelpers/HttpHelpers.psm1" -Force -DisableNameChecking
+Import-Module "$PSScriptRoot/../Modules/JITHelpers/JITHelpers.psm1"   -Force
+Import-Module "$PSScriptRoot/../Modules/JITTargets/JITTargets.psm1"   -Force
 
 #region ── Configuration ──────────────────────────────────────────────────────
 
-$tenantId        = $env:AZURE_TENANT_ID
-$audience        = $env:JWT_AUDIENCE
-$allowedClientIds = ($env:APPROVED_CLIENT_IDS -split ',') |
-                        ForEach-Object { $_.Trim() } |
-                        Where-Object   { $_ }
+$tenantId            = $env:AZURE_TENANT_ID
+$siteResourceId      = $env:JIT_SITE_RESOURCE_ID
+$jitRequesterRoleName = if ($env:JIT_REQUESTER_ROLE_NAME) { $env:JIT_REQUESTER_ROLE_NAME } else { 'JIT Requester' }
 $allowedDurations = ($env:ALLOWED_DURATIONS_HOURS -split ',') |
                         ForEach-Object { [int]$_.Trim() }
 $tableName           = if ($env:JIT_TABLE_NAME)            { $env:JIT_TABLE_NAME }            else { 'JITRules' }
@@ -47,7 +49,7 @@ function Write-JsonResponse {
     param([HttpStatusCode]$Status, [hashtable]$Body)
     Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
         StatusCode = $Status
-        Body       = ($Body | ConvertTo-Json -Compress)
+        Body       = (ConvertTo-Json -InputObject $Body -Compress)
         Headers    = @{ 'Content-Type' = 'application/json' }
     })
 }
@@ -63,14 +65,11 @@ if (-not $authHeader -or -not $authHeader.ToString().StartsWith('Bearer ')) {
 }
 
 $token  = $authHeader.ToString().Substring(7)
-$claims = Invoke-JwtValidation -Token $token `
-                               -TenantId $tenantId `
-                               -Audience $audience `
-                               -AllowedClientIds $allowedClientIds
+$claims = Invoke-JwtValidation -Token $token -TenantId $tenantId
 
 if (-not $claims) {
     Write-JITAuditEvent -EventType JITDenied -DenyReason 'TokenValidationFailed' -CallerIp 'unknown'
-    Write-JsonResponse -Status Forbidden -Body @{ error = 'Token validation failed. Check tenant, audience, and client ID.' }
+    Write-JsonResponse -Status Forbidden -Body @{ error = 'Token validation failed. Check tenant and audience.' }
     return
 }
 
@@ -79,19 +78,35 @@ $requestedBy = if ($claims.upn)         { $claims.upn }
                elseif ($claims.unique_name) { $claims.unique_name }
                else                         { $claims.sub }
 
-Write-Host "JIT request from: $requestedBy (appid: $($claims.appid ?? $claims.azp))"
+# Sanitize for OData filter injection — UPNs can contain apostrophes (e.g. o'brien@contoso.com)
+# Azure Table Storage OData escapes single quotes by doubling them.
+$oDataRequestedBy = $requestedBy -replace "'", "''"
 
-# ── Require JIT.Requester app role (must be activated via PIM) ───────────────
-$callerRoles = @()
-if ($claims.roles) { $callerRoles = @($claims.roles) }
+Write-Host "JIT request from: $requestedBy (oid: $($claims.oid))"
 
-if ('JIT.Requester' -notin $callerRoles) {
+# ── Require the JIT Requester custom RBAC role on the function app site ─────
+if (-not $siteResourceId) {
+    Write-JsonResponse -Status InternalServerError -Body @{
+        error = 'Function app is misconfigured: JIT_SITE_RESOURCE_ID is not set.'
+    }
+    return
+}
+
+$callerObjectId = $claims.oid
+if (-not $callerObjectId) {
     Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp 'unknown' `
-        -DenyReason 'MissingRole' -Extra @{ requiredRole = 'JIT.Requester' }
+        -DenyReason 'MissingObjectIdClaim'
+    Write-JsonResponse -Status Forbidden -Body @{ error = 'Token has no oid claim; cannot evaluate authorization.' }
+    return
+}
+
+if (-not (Test-CallerHasJitRequesterRole -CallerObjectId $callerObjectId `
+            -SiteResourceId $siteResourceId -RoleDefinitionName $jitRequesterRoleName)) {
+    Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp 'unknown' `
+        -DenyReason 'MissingJitRequesterRole' -Extra @{ requiredRole = $jitRequesterRoleName }
     Write-JsonResponse -Status Forbidden -Body @{
-        error        = 'Caller does not have the JIT.Requester role. ' +
-                       'Activate it via PIM before requesting access.'
-        requiredRole = 'JIT.Requester'
+        error        = "Caller does not hold the '$jitRequesterRoleName' RBAC role on this function app."
+        requiredRole = $jitRequesterRoleName
     }
     return
 }
@@ -100,11 +115,26 @@ if ('JIT.Requester' -notin $callerRoles) {
 
 #region ── 2. Parse and validate request body ─────────────────────────────────
 
-try {
-    $body = $Request.Body | ConvertFrom-Json -ErrorAction Stop
+# The Functions PowerShell worker auto-deserializes an application/json request
+# body into a Hashtable/PSCustomObject, so only re-parse when it's still a raw
+# string. Piping an already-parsed object to ConvertFrom-Json stringifies it to
+# "@{…}" and the parser dies on "@" — the same object-vs-string trap that broke
+# Get-JITTargets (see tests/HttpHelpers.Tests.ps1).
+$rawBody = $Request.Body
+if ($rawBody -is [string]) {
+    try {
+        $body = $rawBody | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        Write-JsonResponse -Status BadRequest -Body @{ error = 'Request body is not valid JSON.' }
+        return
+    }
 }
-catch {
-    Write-JsonResponse -Status BadRequest -Body @{ error = 'Request body is not valid JSON.' }
+elseif ($null -ne $rawBody) {
+    $body = $rawBody
+}
+else {
+    Write-JsonResponse -Status BadRequest -Body @{ error = 'Request body is required.' }
     return
 }
 
@@ -157,7 +187,14 @@ if ($resourceName -notmatch '^[a-zA-Z0-9._\-]{1,90}$') {
     Write-JsonResponse -Status BadRequest -Body @{ error = 'resourceName contains invalid characters.' }
     return
 }
+
+if ($port -and $port -notmatch '^\d{1,5}(-\d{1,5})?$') {
     Write-JsonResponse -Status BadRequest -Body @{ error = "port must be a number or range (e.g. '443' or '8080-8090')." }
+    return
+}
+
+if ($justification -and $justification.Length -gt 500) {
+    Write-JsonResponse -Status BadRequest -Body @{ error = 'Justification must be 500 characters or fewer.' }
     return
 }
 
@@ -165,18 +202,18 @@ if ($resourceName -notmatch '^[a-zA-Z0-9._\-]{1,90}$') {
 
 #region ── 3. Determine caller IP ─────────────────────────────────────────────
 
-# Azure injects the real client IP into X-Forwarded-For.
-# The header may contain a comma-separated chain; the leftmost is the originating IP.
-$xForwardedFor = $Request.Headers['X-Forwarded-For']
-if ($xForwardedFor) {
-    $callerIp = ($xForwardedFor.ToString() -split ',')[0].Trim() -replace ':\d+$', ''
-}
-else {
-    $callerIp = $Request.HttpContext.Connection.RemoteIpAddress.ToString()
-}
+# Shared helper (also used by Get-JITRules) so the IP this grant whitelists is
+# exactly the IP reported back to clients for already-allowed detection.
+$callerIp = Get-CallerIp -Request $Request
 
 if (-not $callerIp -or $callerIp -eq '::1' -or $callerIp -eq '127.0.0.1') {
     Write-JsonResponse -Status BadRequest -Body @{ error = 'Could not determine caller IP address.' }
+    return
+}
+
+# Validate IP format — guards against log injection and crafted X-Forwarded-For values.
+if ($callerIp -notmatch '^(\d{1,3}\.){3}\d{1,3}$' -and $callerIp -notmatch '^[0-9a-fA-F:]{2,45}$') {
+    Write-JsonResponse -Status BadRequest -Body @{ error = 'Invalid caller IP address format.' }
     return
 }
 
@@ -187,13 +224,13 @@ Write-Host "Caller IP: $callerIp"
 #region ── 3b. Abuse prevention ─────────────────────────────────────────────────────────────
 
 try {
-    $cloudTableCheck = Get-JITCloudTable -TableName $tableName
+    Get-JITTableName -TableName $tableName | Out-Null
     $now             = [DateTime]::UtcNow.ToString('o')
 
     # Count active (non-expired) rules for this caller across all resources
-    $callerActive = (Get-AzTableRow -Table $cloudTableCheck `
-        -CustomFilter "RequestedBy eq '$requestedBy'") |
-        Where-Object { [DateTime]::Parse($_.ExpiryUtc) -gt [DateTime]::UtcNow }
+    $callerActive = (Get-JITTableRows -TableName $tableName `
+        -Filter "RequestedBy eq '$oDataRequestedBy'") |
+        Where-Object { try { [DateTime]::Parse($_.ExpiryUtc) -gt [DateTime]::UtcNow } catch { $false } }
 
     if ($callerActive.Count -ge $maxRulesPerCaller) {
         Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp $callerIp `
@@ -208,9 +245,9 @@ try {
     }
 
     # Count active rules on the target resource
-    $resourceActive = (Get-AzTableRow -Table $cloudTableCheck `
-        -CustomFilter "ResourceName eq '$resourceName' and ResourceRg eq '$resourceGroup'") |
-        Where-Object { [DateTime]::Parse($_.ExpiryUtc) -gt [DateTime]::UtcNow }
+    $resourceActive = (Get-JITTableRows -TableName $tableName `
+        -Filter "ResourceName eq '$resourceName' and ResourceRg eq '$resourceGroup'") |
+        Where-Object { try { [DateTime]::Parse($_.ExpiryUtc) -gt [DateTime]::UtcNow } catch { $false } }
 
     if ($resourceActive.Count -ge $maxRulesPerResource) {
         Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp $callerIp `
@@ -243,10 +280,27 @@ try {
     }
 }
 catch {
-    Write-Warning "Abuse check failed (non-fatal, proceeding): $_"
+    # Fail CLOSED: if the rules table can't be read we cannot verify the
+    # per-caller / per-resource limits or the cooldown, so deny rather than
+    # allow unbounded rule creation during a Storage outage.
+    Write-Error "Abuse-prevention check failed: $_"
+    Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp $callerIp `
+        -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
+        -SubscriptionId $subscriptionId -DenyReason 'AbuseCheckError'
+    Write-JsonResponse -Status ServiceUnavailable -Body @{
+        error = 'Could not verify request limits right now. Please retry shortly.'
+    }
+    return
 }
 
-$ruleId  = "jit-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+# Embed the caller's username in the rule id so rules are identifiable at a
+# glance and in the portal (e.g. jit-jbland-cc5d7ef8). Take the local part of
+# the UPN, strip to alphanumerics (NSG/SQL rule names disallow most symbols),
+# lowercase, and cap the length so the full name stays within Azure's limits.
+$callerUser = ((($requestedBy -split '@')[0]) -replace '[^A-Za-z0-9]', '').ToLowerInvariant()
+if (-not $callerUser)            { $callerUser = 'user' }
+if ($callerUser.Length -gt 20)   { $callerUser = $callerUser.Substring(0, 20) }
+$ruleId  = "jit-$callerUser-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
 $portVal = if ($port) { $port } else { '*' }
 $expiry  = [DateTime]::UtcNow.AddHours($durationHours)
 
@@ -263,8 +317,10 @@ try {
     # to prevent two simultaneous requests selecting the same priority number.
     if ($targetType -eq 'nsg') {
         $lockName = "nsg-$($subscriptionId.Substring(0,8))-$($resourceGroup)-$($resourceName)"
-        Invoke-WithBlobLock -LockName $lockName -Action {
-            $result = Add-JITNsgRule @addParams -Port $portVal -PriorityMin $priorityMin -PriorityMax $priorityMax
+        # Capture the result from the lock's return value — assigning inside the
+        # scriptblock would be lost (it runs in a child scope).
+        $result = Invoke-WithBlobLock -LockName $lockName -Action {
+            Add-JITNsgRule @addParams -Port $portVal -PriorityMin $priorityMin -PriorityMax $priorityMax
         }
     }
     else {
@@ -297,24 +353,22 @@ catch {
 #region ── 5. Record expiry in Table Storage ──────────────────────────────────
 
 try {
-    $cloudTable = Get-JITCloudTable -TableName $tableName
+    Get-JITTableName -TableName $tableName | Out-Null
 
-    Add-AzTableRow `
-        -Table        $cloudTable `
-        -PartitionKey $subscriptionId `
-        -RowKey       $ruleId `
-        -Property     @{
-            TargetType     = $targetType
-            ResourceName   = $resourceName
-            ResourceRg     = $resourceGroup
-            SubscriptionId = $subscriptionId
-            RuleIdentifier = $result.RuleIdentifier
-            CallerIp       = $callerIp
-            Port           = $portVal
-            RequestedBy    = $requestedBy
-            ExpiryUtc      = $expiry.ToString('o')
-            Justification  = if ($justification) { $justification } else { '' }
-        } | Out-Null
+    Add-JITTableRow -TableName $tableName -Properties @{
+        PartitionKey   = $subscriptionId
+        RowKey         = $ruleId
+        TargetType     = $targetType
+        ResourceName   = $resourceName
+        ResourceRg     = $resourceGroup
+        SubscriptionId = $subscriptionId
+        RuleIdentifier = $result.RuleIdentifier
+        CallerIp       = $callerIp
+        Port           = $portVal
+        RequestedBy    = $requestedBy
+        ExpiryUtc      = $expiry.ToString('o')
+        Justification  = if ($justification) { $justification } else { '' }
+    }
 }
 catch {
     Write-Warning "Table write failed. Rule '$($result.RuleIdentifier)' was added but expiry record was not saved: $_"
@@ -327,6 +381,9 @@ Write-JsonResponse -Status OK -Body @{
     ruleIdentifier = $result.RuleIdentifier
     targetType     = $targetType
     resource       = "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/$resourceName"
+    subscriptionId = $subscriptionId
+    resourceGroup  = $resourceGroup
+    resourceName   = $resourceName
     callerIp       = $callerIp
     port           = if ($targetType -eq 'nsg') { $portVal } else { $null }
     expiresUtc     = $expiry.ToString('o')

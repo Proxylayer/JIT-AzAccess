@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
@@ -8,13 +9,17 @@ using System.Threading;
 using System.Threading.Tasks;
 using AzureTray.Plugin.Contracts;
 using AzureTray.Plugin.JITAzAccess.Models;
+using Microsoft.Extensions.Logging;
 
 namespace AzureTray.Plugin.JITAzAccess;
 
 /// <summary>
-/// Typed HTTP client for all JIT-AzAccess function app endpoints.
-/// Uses the host's ARM named client for resilience while supplying the
-/// custom JIT audience scope for token acquisition.
+/// Typed HTTP client for the JIT-AzAccess function app endpoints.
+///
+/// The function app accepts ARM-audience bearer tokens (no custom scope), and
+/// gates authorization on the caller's "JIT Requester" custom RBAC role
+/// assignment on the function app site resource.  So the plugin uses the host's
+/// ARM named client + ArmScope — exactly what other plugins (e.g. PIM) use.
 /// </summary>
 internal sealed class JitClient
 {
@@ -38,7 +43,6 @@ internal sealed class JitClient
     public async Task<JitGrantResponse> RequestAccessAsync(
         string            tenantId,
         string            functionAppUrl,
-        string            jitScope,
         JitRequest        request,
         CancellationToken ct)
     {
@@ -50,68 +54,73 @@ internal sealed class JitClient
             Content = new StringContent(body, Encoding.UTF8, "application/json"),
         };
 
-        var response = await _context.Http
-            .SendAsync(PluginHttpClientNames.Arm, tenantId, jitScope, httpRequest, ct)
+        _context.Logger.LogDebug(
+            "JIT: POST {Url} (targetType={TargetType}, resource={ResourceName}, hours={DurationHours}).",
+            url, request.TargetType, request.ResourceName, request.DurationHours);
+
+        var response = await _context.GetHttpClient(tenantId)
+            .SendAsync(PluginHttpClientNames.Arm, _context.ArmScope, httpRequest, ct)
             .ConfigureAwait(false);
 
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (!response.IsSuccessStatusCode)
-            throw new InvalidOperationException(
-                $"JIT grant failed ({(int)response.StatusCode}): {TryExtractError(responseBody) ?? responseBody}");
+        {
+            var serverError = TryExtractError(responseBody);
+            _context.Logger.LogWarning(
+                "JIT: POST {Url} returned {Status}.", url, (int)response.StatusCode);
+            throw new JitHttpException(
+                (int)response.StatusCode,
+                "Request-JITAccess",
+                serverError,
+                $"JIT grant failed ({(int)response.StatusCode}): {serverError ?? responseBody}");
+        }
 
         return JsonSerializer.Deserialize<JitGrantResponse>(responseBody, DeserializeOptions)
                ?? throw new InvalidOperationException("Empty response from JIT function app.");
     }
 
-    // ── GET /api/Get-JITTargets ───────────────────────────────────────────────
-
-    public async Task<List<JitTarget>> GetTargetsAsync(
-        string            tenantId,
-        string            functionAppUrl,
-        string            jitScope,
-        CancellationToken ct)
-    {
-        var url = $"{functionAppUrl.TrimEnd('/')}/api/Get-JITTargets";
-        using var httpRequest = new HttpRequestMessage(HttpMethod.Get, url);
-
-        var response = await _context.Http
-            .SendAsync(PluginHttpClientNames.Arm, tenantId, jitScope, httpRequest, ct)
-            .ConfigureAwait(false);
-
-        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-
-        if (!response.IsSuccessStatusCode)
-            throw new InvalidOperationException(
-                $"Get-JITTargets failed ({(int)response.StatusCode}): {TryExtractError(body) ?? body}");
-
-        return JsonSerializer.Deserialize<List<JitTarget>>(body, DeserializeOptions)
-               ?? new List<JitTarget>();
-    }
-
     // ── GET /api/Get-JITRules ─────────────────────────────────────────────────
 
-    public async Task<List<JitServerRule>> GetActiveRulesAsync(
+    public async Task<ActiveRulesResult> GetActiveRulesAsync(
         string            tenantId,
         string            functionAppUrl,
-        string            jitScope,
         CancellationToken ct)
     {
         var url = $"{functionAppUrl.TrimEnd('/')}/api/Get-JITRules";
         using var httpRequest = new HttpRequestMessage(HttpMethod.Get, url);
 
-        var response = await _context.Http
-            .SendAsync(PluginHttpClientNames.Arm, tenantId, jitScope, httpRequest, ct)
+        _context.Logger.LogDebug("JIT: GET {Url}", url);
+
+        var response = await _context.GetHttpClient(tenantId)
+            .SendAsync(PluginHttpClientNames.Arm, _context.ArmScope, httpRequest, ct)
             .ConfigureAwait(false);
 
         var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (!response.IsSuccessStatusCode)
-            throw new InvalidOperationException(
-                $"Get-JITRules failed ({(int)response.StatusCode}): {TryExtractError(body) ?? body}");
+        {
+            var serverError = TryExtractError(body);
+            _context.Logger.LogWarning(
+                "JIT: GET {Url} returned {Status}.", url, (int)response.StatusCode);
+            throw new JitHttpException(
+                (int)response.StatusCode,
+                "Get-JITRules",
+                serverError,
+                $"Get-JITRules failed ({(int)response.StatusCode}): {serverError ?? body}");
+        }
 
-        return JsonSerializer.Deserialize<List<JitServerRule>>(body, DeserializeOptions)
-               ?? new List<JitServerRule>();
+        // The function reports the caller's current public IP (the exact IP a
+        // grant would whitelist) in this header, so the plugin can flag
+        // resources whose firewall already allows it.
+        string? callerIp = null;
+        if (response.Headers.TryGetValues("X-JIT-Caller-IP", out var ipValues))
+            callerIp = ipValues.FirstOrDefault();
+
+        var rules = JsonSerializer.Deserialize<List<JitServerRule>>(body, DeserializeOptions)
+                    ?? new List<JitServerRule>();
+
+        return new ActiveRulesResult(rules, callerIp);
     }
 
     // ── DELETE /api/Revoke-JITAccess/{ruleId} ────────────────────────────────
@@ -119,22 +128,29 @@ internal sealed class JitClient
     public async Task RevokeAsync(
         string            tenantId,
         string            functionAppUrl,
-        string            jitScope,
         string            ruleId,
         CancellationToken ct)
     {
         var url = $"{functionAppUrl.TrimEnd('/')}/api/Revoke-JITAccess/{Uri.EscapeDataString(ruleId)}";
         using var httpRequest = new HttpRequestMessage(HttpMethod.Delete, url);
 
-        var response = await _context.Http
-            .SendAsync(PluginHttpClientNames.Arm, tenantId, jitScope, httpRequest, ct)
+        _context.Logger.LogDebug("JIT: DELETE {Url}", url);
+
+        var response = await _context.GetHttpClient(tenantId)
+            .SendAsync(PluginHttpClientNames.Arm, _context.ArmScope, httpRequest, ct)
             .ConfigureAwait(false);
 
         if (!response.IsSuccessStatusCode)
         {
             var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-            throw new InvalidOperationException(
-                $"Revoke failed ({(int)response.StatusCode}): {TryExtractError(body) ?? body}");
+            var serverError = TryExtractError(body);
+            _context.Logger.LogWarning(
+                "JIT: DELETE {Url} returned {Status}.", url, (int)response.StatusCode);
+            throw new JitHttpException(
+                (int)response.StatusCode,
+                "Revoke-JITAccess",
+                serverError,
+                $"Revoke failed ({(int)response.StatusCode}): {serverError ?? body}");
         }
     }
 
@@ -145,8 +161,29 @@ internal sealed class JitClient
         try
         {
             using var doc = JsonDocument.Parse(body);
-            return doc.RootElement.TryGetProperty("error", out var el) ? el.GetString() : null;
+            var root = doc.RootElement;
+
+            var error = root.TryGetProperty("error", out var el) ? el.GetString() : null;
+
+            // The function app attaches the underlying exception text in a
+            // "detail" field on 500s (e.g. the ARM error behind a failed NSG
+            // write). Surface it — without it the caller only sees the generic
+            // "Failed to modify nsg…" message and can't tell an RBAC denial
+            // from a real bug.
+            var detail = root.TryGetProperty("detail", out var de) ? de.GetString() : null;
+
+            if (!string.IsNullOrWhiteSpace(error) && !string.IsNullOrWhiteSpace(detail))
+                return $"{error} — {detail}";
+
+            return error ?? detail;
         }
         catch { return null; }
     }
 }
+
+/// <summary>
+/// Result of <see cref="JitClient.GetActiveRulesAsync"/>: the caller's active
+/// rules plus the current public IP the function observed (from the
+/// X-JIT-Caller-IP header), used to detect already-allowed resources.
+/// </summary>
+internal sealed record ActiveRulesResult(List<JitServerRule> Rules, string? CallerIp);

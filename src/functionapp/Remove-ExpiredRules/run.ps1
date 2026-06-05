@@ -1,4 +1,4 @@
-# Remove-ExpiredRules/run.ps1
+﻿# Remove-ExpiredRules/run.ps1
 #
 # Timer trigger — runs every 5 minutes.
 # Scans the JITRules Table Storage table for expired entries and removes
@@ -6,8 +6,9 @@
 
 param($Timer)
 
-Import-Module "$PSScriptRoot/../Modules/JITHelpers/JITHelpers.psm1"  -Force
-Import-Module "$PSScriptRoot/../Modules/JITTargets/JITTargets.psm1" -Force
+Import-Module "$PSScriptRoot/../Modules/HttpHelpers/HttpHelpers.psm1" -Force -DisableNameChecking
+Import-Module "$PSScriptRoot/../Modules/JITHelpers/JITHelpers.psm1"   -Force
+Import-Module "$PSScriptRoot/../Modules/JITTargets/JITTargets.psm1"   -Force
 
 $tableName = if ($env:JIT_TABLE_NAME) { $env:JIT_TABLE_NAME } else { 'JITRules' }
 
@@ -16,8 +17,8 @@ Write-Host "JIT cleanup started at $(Get-Date -Format u)"
 #region ── Load expired records ───────────────────────────────────────────────
 
 try {
-    $cloudTable = Get-JITCloudTable -TableName $tableName
-    $allRows    = Get-AzTableRow -Table $cloudTable
+    Get-JITTableName -TableName $tableName | Out-Null
+    $allRows    = Get-JITTableRows -TableName $tableName
 }
 catch {
     Write-Error "JIT cleanup: failed to read table '$tableName' — $_"
@@ -26,7 +27,7 @@ catch {
 
 $now     = [DateTime]::UtcNow
 $expired = $allRows | Where-Object {
-    try   { [DateTime]::Parse($_.ExpiryUtc) -lt $now }
+    try   { [DateTimeOffset]::Parse($_.ExpiryUtc).UtcDateTime -lt $now }
     catch { $false }
 }
 
@@ -41,19 +42,28 @@ Write-Host "JIT cleanup: found $($expired.Count) expired rule(s) to remove."
 
 #region ── Remove each expired rule ──────────────────────────────────────────
 
-foreach ($row in $expired) {
-    $label   = "'$($row.RuleIdentifier)' ($($row.TargetType)) on '$($row.ResourceName)' (expired $($row.ExpiryUtc))"
-    $removed = $false
+$supportedTypes = @('nsg', 'sqlServer', 'storageAccount', 'keyVault')
 
+foreach ($row in $expired) {
+    $label = "'$($row.RuleIdentifier)' ($($row.TargetType)) on '$($row.ResourceName)' (expired $($row.ExpiryUtc))"
+
+    # Unknown type — we can't act on the resource, but the record is expired and
+    # unactionable, so delete it (don't retry forever) without a misleading
+    # "expired/removed" audit event.
+    if ($row.TargetType -notin $supportedTypes) {
+        Write-Warning "  Unknown targetType '$($row.TargetType)' for $($row.RowKey) — deleting stale record without resource cleanup."
+        try   { Remove-JITTableRow -TableName $tableName -PartitionKey $row.PartitionKey -RowKey $row.RowKey }
+        catch { Write-Warning "  Failed to delete stale record $($row.RowKey) — $_" }
+        continue
+    }
+
+    $removed = $false
     try {
         switch ($row.TargetType) {
             'nsg'            { Remove-JITNsgRule            -Row $row }
             'sqlServer'      { Remove-JITSqlFirewallRule     -Row $row }
             'storageAccount' { Remove-JITStorageNetworkRule  -Row $row }
             'keyVault'       { Remove-JITKeyVaultNetworkRule -Row $row }
-            default          {
-                Write-Warning "  Unknown targetType '$($row.TargetType)' — skipping removal, deleting stale record."
-            }
         }
         Write-Host "  Removed $label"
         Write-JITAuditEvent -EventType JITExpired `
@@ -73,7 +83,7 @@ foreach ($row in $expired) {
 
     if ($removed) {
         try {
-            Remove-AzTableRow -Table $cloudTable -PartitionKey $row.PartitionKey -RowKey $row.RowKey | Out-Null
+            Remove-JITTableRow -TableName $tableName -PartitionKey $row.PartitionKey -RowKey $row.RowKey
             Write-Host "  Deleted table record for $($row.RowKey)"
         }
         catch {

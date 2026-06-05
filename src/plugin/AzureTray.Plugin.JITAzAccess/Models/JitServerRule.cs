@@ -42,4 +42,12 @@ public sealed record JitServerRule
 
     [JsonPropertyName("justification")]
     public string? Justification { get; init; }
+
+    /// <summary>
+    /// Client-only: the JIT function-app URL this rule was fetched from. Used
+    /// to route Revoke calls to the correct deployment in multi-function-app
+    /// setups. Not serialised back to the server.
+    /// </summary>
+    [JsonIgnore]
+    public string SourceFunctionAppUrl { get; init; } = string.Empty;
 }

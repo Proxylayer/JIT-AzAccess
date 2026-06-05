@@ -2,6 +2,9 @@
 **/bin/
 **/obj/
 
+# Dev logs
+**/jit-logs/
+
 # VS / Rider
 .vs/
 .idea/
