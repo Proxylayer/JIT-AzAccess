@@ -1,0 +1,171 @@
+name: Publish plugin
+
+# Publishes the AzureTray.Plugin.JITAzAccess .nupkg to nuget.org.
+# Modeled on the AzureTray host's publish-plugins.yml, collapsed to the
+# single plugin this repo ships. Three triggers:
+#   - Tag push like `v0.3.1`
+#       → authoritative: builds the plugin at the tag's version
+#         (overriding the csproj <Version>) and pushes to NuGet.
+#   - Branch push to main with changes inside the plugin folder
+#       → opportunistic: builds at the csproj <Version>;
+#         --skip-duplicate makes it a no-op if that version is already
+#         on NuGet.
+#   - workflow_dispatch → manual run with an optional version override
+#     (for retry / out-of-band republish).
+#
+# Tag-driven is the recommended workflow because the tag IS the
+# version-of-record. Bumping the csproj <Version> is optional and
+# historical-only — useful for keeping the checked-in state in sync with
+# what shipped, but not required for the publish itself.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/plugin/AzureTray.Plugin.JITAzAccess/**'
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Optional version override (leave blank to use the csproj <Version>)
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write       # for attest-build-provenance
+  attestations: write   # for attest-build-provenance
+
+concurrency:
+  group: publish-plugin
+  cancel-in-progress: false
+
+env:
+  CSPROJ: src/plugin/AzureTray.Plugin.JITAzAccess/AzureTray.Plugin.JITAzAccess.csproj
+
+jobs:
+  publish:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # SourceLink needs history
+
+      # Resolve trigger → optional version override. A tag push and a manual
+      # override both pin an explicit version; a branch push leaves it blank
+      # so the csproj <Version> is used.
+      - name: Resolve version
+        id: pick
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          MANUAL_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          $version = ''
+
+          if ($env:EVENT_NAME -eq 'push' -and $env:REF -like 'refs/tags/*') {
+            # Tag push: parse `v<version>` from the tag name. Anything that
+            # doesn't match is rejected loudly — a tag is meant to ship
+            # something specific; ambiguity isn't safe.
+            $tag = $env:REF -replace '^refs/tags/', ''
+            if ($tag -match '^v(?<ver>.+)$') {
+              $version = $Matches['ver']
+              Write-Host "Tag-driven publish: version=$version" -ForegroundColor Cyan
+            } else {
+              throw "Tag '$tag' doesn't match expected pattern 'v<version>'."
+            }
+          }
+          elseif ($env:EVENT_NAME -eq 'workflow_dispatch' -and -not [string]::IsNullOrWhiteSpace($env:MANUAL_VERSION)) {
+            $version = $env:MANUAL_VERSION.Trim()
+            Write-Host "Manual publish (override): version=$version" -ForegroundColor Cyan
+          }
+          else {
+            Write-Host "Publish at csproj <Version>." -ForegroundColor Cyan
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore $env:CSPROJ
+
+      - name: Build (Release)
+        shell: pwsh
+        env:
+          PIN_VERSION: ${{ steps.pick.outputs.version }}
+        run: |
+          # Tag-driven and manual-override paths supply an explicit version;
+          # pass it as /p:Version so AssemblyFileVersion,
+          # AssemblyInformationalVersion, and PackageVersion all line up.
+          # Branch-push leaves the csproj <Version> as-is.
+          if ([string]::IsNullOrWhiteSpace($env:PIN_VERSION)) {
+            dotnet build $env:CSPROJ --configuration Release --no-restore
+          } else {
+            dotnet build $env:CSPROJ --configuration Release --no-restore /p:Version=$env:PIN_VERSION
+          }
+
+      - name: Pack
+        shell: pwsh
+        env:
+          PIN_VERSION: ${{ steps.pick.outputs.version }}
+        run: |
+          if (-not (Test-Path NuGet)) { New-Item -ItemType Directory -Path NuGet | Out-Null }
+          if ([string]::IsNullOrWhiteSpace($env:PIN_VERSION)) {
+            Write-Host "Packing at csproj <Version> ..." -ForegroundColor Cyan
+            dotnet pack $env:CSPROJ --configuration Release --no-build --output NuGet
+          } else {
+            Write-Host "Packing at pinned version $env:PIN_VERSION ..." -ForegroundColor Cyan
+            dotnet pack $env:CSPROJ --configuration Release --no-build --output NuGet /p:Version=$env:PIN_VERSION
+          }
+          if ($LASTEXITCODE -ne 0) { throw "dotnet pack failed for $env:CSPROJ" }
+
+      - name: Upload nupkg as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-package
+          path: NuGet/*.nupkg
+          if-no-files-found: error
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: NuGet/*.nupkg
+
+      - name: Check NuGet config
+        id: nugetcfg
+        shell: pwsh
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          $enabled = -not [string]::IsNullOrWhiteSpace($env:NUGET_API_KEY)
+          "enabled=$($enabled.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          Write-Host "Push to nuget.org enabled: $enabled"
+
+      - name: Push to nuget.org
+        if: steps.nugetcfg.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          # --skip-duplicate keeps the push idempotent: a branch-push run that
+          # didn't bump the csproj's <Version> is a no-op rather than a
+          # workflow failure. Tag-driven and manual-override runs are expected
+          # to be unique versions.
+          $packages = Get-ChildItem NuGet\*.nupkg | Where-Object { $_.Name -notlike '*.symbols.nupkg' }
+          foreach ($pkg in $packages) {
+            Write-Host "Pushing $($pkg.Name)..."
+            dotnet nuget push $pkg.FullName `
+              --api-key $env:NUGET_API_KEY `
+              --source https://api.nuget.org/v3/index.json `
+              --skip-duplicate
+            if ($LASTEXITCODE -ne 0) { throw "nuget push failed for $($pkg.Name)" }
+          }

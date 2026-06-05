@@ -13,8 +13,10 @@ namespace AzureTray.Plugin.JITAzAccess;
 /// <summary>
 /// AzureTray plugin for JIT-AzAccess.
 ///
-/// Designed to "just work" once an AzureTray tenant is signed in — no plugin
-/// options, no separate app registration, no manual URLs:
+/// Designed to "just work" once an AzureTray tenant is signed in — no separate
+/// app registration and no manual URLs. Optional settings (default/offered
+/// grant durations, a tenant allow-list, and the host app-registration name)
+/// are exposed via <see cref="IPluginConfigurable"/>:
 ///
 ///   • Token acquisition piggybacks on the host's ARM token (ArmScope).
 ///   • The function app URL is discovered by reading the host's app
@@ -30,12 +32,13 @@ namespace AzureTray.Plugin.JITAzAccess;
 ///     written to the resource via ARM.
 ///   • Justification prompts — shown before granting when target requires it.
 /// </summary>
-public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadgeProvider, IPluginTestProvider, IDisposable
+public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadgeProvider, IPluginTestProvider, IPluginConfigurable, IDisposable
 {
     // ── Events ────────────────────────────────────────────────────────────────
 
     public event Action? MenuChanged;
     public event Action? BadgeChanged;
+    public event Action? ValuesChanged;
 
     // ── ITrayPlugin ───────────────────────────────────────────────────────────
 
@@ -194,16 +197,185 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         return anyFail ? PluginTestResult.Fail(summary) : PluginTestResult.Pass(summary);
     }
 
-    // ── Internal state ────────────────────────────────────────────────────────
+    // ── IPluginConfigurable ───────────────────────────────────────────────────
 
+    private const string DefaultDurationOptionKey  = "defaultDurationHours";
+    private const string AllowedDurationsOptionKey = "allowedDurations";
+    private const string AllowedTenantsOptionKey   = "allowedTenantIds";
+    private const string AppRegistrationOptionKey  = "appRegistrationName";
+
+    // Defaults applied before the user changes anything (and the fallback when
+    // a stored value is blank or malformed).
+    private const int    DefaultDurationHoursValue = 4;
+    private const string DefaultAllowedDurations   = "1,2,4,8";
     // displayName of the AzureTray host's per-tenant app registration whose
-    // tags carry the jit-baseurl:<sub>=<url> entries. Hardcoded to match the
-    // host default; can be made configurable later if needed.
-    private const string AzureTrayAppRegistrationName = "AzureTray";
+    // tags carry the jit-baseurl:<sub>=<url> entries. Matches the host default.
+    private const string DefaultAppRegistrationName = "AzureTray";
 
-    // Default UX duration when target.allowedDurations is empty. Per-target
-    // overrides are still honoured.
-    private const int DefaultDurationHours = 4;
+    public IReadOnlyList<PluginOption> Options { get; } = new[]
+    {
+        new PluginOption(
+            Key:          DefaultDurationOptionKey,
+            Label:        "Default access duration (hours)",
+            Kind:         PluginOptionKind.Number,
+            Description:  "Pre-selected duration in the grant prompt. A resource that declares its own durations still overrides this.",
+            DefaultValue: DefaultDurationHoursValue),
+        new PluginOption(
+            Key:          AllowedDurationsOptionKey,
+            Label:        "Offered durations (hours)",
+            Kind:         PluginOptionKind.Text,
+            Description:  "Comma-separated durations offered in the grant prompt (e.g. 1,2,4,8). Used when a resource doesn't specify its own.",
+            DefaultValue: DefaultAllowedDurations),
+        new PluginOption(
+            Key:          AllowedTenantsOptionKey,
+            Label:        "Limit to tenant IDs",
+            Kind:         PluginOptionKind.Text,
+            Description:  "Comma-separated tenant (directory) GUIDs this plugin may operate on. Leave blank to allow every signed-in tenant. (The host's per-tenant enable grid still applies on top of this.)",
+            DefaultValue: ""),
+        new PluginOption(
+            Key:          AppRegistrationOptionKey,
+            Label:        "AzureTray app registration name",
+            Kind:         PluginOptionKind.Text,
+            Description:  "Display name of the host app registration whose tags carry the JIT function-app URLs. Change only if your AzureTray app registration uses a non-default name.",
+            DefaultValue: DefaultAppRegistrationName),
+    };
+
+    // Seeded with every option's default so the keys exist before the host
+    // hydrates persisted values (SetValue ignores unknown keys), and so the
+    // typed accessors below always resolve.
+    private readonly Dictionary<string, object?> _optionValues = new(StringComparer.Ordinal)
+    {
+        [DefaultDurationOptionKey]  = DefaultDurationHoursValue,
+        [AllowedDurationsOptionKey] = DefaultAllowedDurations,
+        [AllowedTenantsOptionKey]   = string.Empty,
+        [AppRegistrationOptionKey]  = DefaultAppRegistrationName,
+    };
+
+    public IReadOnlyDictionary<string, object?> Values => _optionValues;
+
+    public void SetValue(string key, object? value)
+    {
+        if (!_optionValues.TryGetValue(key, out var current)) return;   // unknown key
+        if (Equals(current, value)) return;
+        _optionValues[key] = value;
+        ValuesChanged?.Invoke();
+
+        // React to the changes that have side effects beyond the next read:
+        // a tenant allow-list change can orphan the active tenant, and an
+        // app-registration rename invalidates the discovered URLs.
+        if (key is AllowedTenantsOptionKey or AppRegistrationOptionKey)
+            ApplyTenantPolicy(key);
+
+        MenuChanged?.Invoke();
+    }
+
+    public object? BuildSettingsView() => null;   // generic option grid only
+
+    // ── Option accessors ──────────────────────────────────────────────────────
+
+    // Pre-selected grant duration. Falls back to the built-in default if the
+    // stored value is missing, non-numeric, or non-positive.
+    private int DurationHoursDefault =>
+        TryToInt(_optionValues.GetValueOrDefault(DefaultDurationOptionKey), out var n) && n > 0
+            ? n
+            : DefaultDurationHoursValue;
+
+    // Durations offered when a target doesn't declare its own.
+    private int[] OfferedDurations =>
+        ParseDurations(_optionValues.GetValueOrDefault(AllowedDurationsOptionKey) as string);
+
+    // displayName of the AzureTray host app registration used for URL discovery.
+    private string AzureTrayAppRegistrationName
+    {
+        get
+        {
+            var s = _optionValues.GetValueOrDefault(AppRegistrationOptionKey) as string;
+            return string.IsNullOrWhiteSpace(s) ? DefaultAppRegistrationName : s.Trim();
+        }
+    }
+
+    // Tenant GUIDs the plugin may bind to. Empty set = no restriction.
+    private HashSet<string> AllowedTenantIds =>
+        ParseTenantIds(_optionValues.GetValueOrDefault(AllowedTenantsOptionKey) as string);
+
+    private bool IsTenantAllowed(string tenantId)
+    {
+        var allowed = AllowedTenantIds;
+        return allowed.Count == 0 || allowed.Contains(tenantId);
+    }
+
+    // Re-evaluates which tenant the plugin is bound to after an options change.
+    // Drops the active tenant if the allow-list now excludes it, then binds to
+    // the first allowed ready tenant; re-runs discovery if the app reg changed.
+    private void ApplyTenantPolicy(string changedKey)
+    {
+        var context = _context;
+        if (context is null) return;   // options seeded before init — nothing to do yet
+
+        if (!string.IsNullOrWhiteSpace(_tenantId) && !IsTenantAllowed(_tenantId))
+        {
+            context.Logger.LogInformation(
+                "JIT: active tenant {TenantId} excluded by the allow-list; unbinding.", _tenantId);
+            ClearActiveTenant();
+        }
+
+        if (string.IsNullOrWhiteSpace(_tenantId))
+        {
+            var pick = context.ReadyTenants.FirstOrDefault(t => IsTenantAllowed(t.TenantId));
+            if (pick is not null)
+                _ = ApplyTenantAndDiscoverAsync(pick, CancellationToken.None);
+        }
+        else if (changedKey == AppRegistrationOptionKey)
+        {
+            context.Logger.LogInformation(
+                "JIT: app registration name changed to '{Name}'; re-running URL discovery.",
+                AzureTrayAppRegistrationName);
+            _urls = JitUrlDiscoveryResult.Empty;
+            _ = RetryDiscoveryAsync();
+        }
+    }
+
+    private static bool TryToInt(object? value, out int result)
+    {
+        switch (value)
+        {
+            case int i:                                       result = i;                     return true;
+            case long l:                                      result = (int)l;                return true;
+            case double d:                                    result = (int)Math.Round(d);    return true;
+            case string s when int.TryParse(s, out var p):    result = p;                     return true;
+            default:                                          result = 0;                     return false;
+        }
+    }
+
+    private static int[] ParseDurations(string? csv)
+    {
+        if (string.IsNullOrWhiteSpace(csv)) return new[] { 1, 2, 4, 8 };
+        var parsed = csv
+            .Split(new[] { ',', ';', ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(s => int.TryParse(s, out var n) ? n : 0)
+            .Where(n => n > 0)
+            .Distinct()
+            .OrderBy(n => n)
+            .ToArray();
+        return parsed.Length > 0 ? parsed : new[] { 1, 2, 4, 8 };
+    }
+
+    private static HashSet<string> ParseTenantIds(string? csv)
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(csv))
+        {
+            foreach (var t in csv.Split(
+                         new[] { ',', ';', ' ', '\t', '\r', '\n' },
+                         StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                set.Add(t);
+            }
+        }
+        return set;
+    }
+
+    // ── Internal state ────────────────────────────────────────────────────────
 
     private IPluginContext?    _context;
     private JitClient?         _client;
@@ -269,9 +441,13 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         context.TenantReady   += OnTenantReady;
         context.TenantRemoved += OnTenantRemoved;
 
-        // Auto-select the first already-signed-in tenant, if any.
-        if (context.ReadyTenants.Count > 0)
-            _ = ApplyTenantAndDiscoverAsync(context.ReadyTenants[0], cancellationToken);
+        // Auto-select the first already-signed-in tenant the allow-list permits.
+        // (At init the allow-list is still at its default — empty = all allowed.
+        // The host hydrates the stored value right after this via SetValue, which
+        // re-applies the policy and unbinds the tenant if it's now excluded.)
+        var initial = context.ReadyTenants.FirstOrDefault(t => IsTenantAllowed(t.TenantId));
+        if (initial is not null)
+            _ = ApplyTenantAndDiscoverAsync(initial, cancellationToken);
 
         return Task.CompletedTask;
     }
@@ -597,7 +773,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         if (_targets.Count == 0)
         {
             items.Add(new PluginMenuItem(
-                "  No targets configured — add entries to jit-config/targets.json in storage.",
+                "  No Azure resources found that you have access to request.",
                 IsEnabled: false));
             return items;
         }
@@ -760,7 +936,10 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         var context = _context;
         if (context is null) return;
 
-        var durations = BuildDurationList(DefaultDurationHours, target.AllowedDurations);
+        // A resource that declares its own durations wins; otherwise offer the
+        // configured list. The configured default is pre-selected either way.
+        var offered   = target.AllowedDurations is { Length: > 0 } ? target.AllowedDurations : OfferedDurations;
+        var durations = BuildDurationList(DurationHoursDefault, offered);
         var choices   = durations.Select(h => h == 1 ? "1 hour" : $"{h} hours").ToArray();
 
         var result = await context.Notifier.ShowAsync(
@@ -1053,6 +1232,14 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
 
     private void OnTenantReady(PluginTenant tenant)
     {
+        if (!IsTenantAllowed(tenant.TenantId))
+        {
+            _context?.Logger.LogInformation(
+                "JIT: TenantReady fired for {TenantId} ({DisplayName}); excluded by the allow-list — ignored.",
+                tenant.TenantId, tenant.DisplayName);
+            return;
+        }
+
         if (string.IsNullOrWhiteSpace(_tenantId))
         {
             _context?.Logger.LogInformation(
@@ -1072,22 +1259,30 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
     {
         if (string.Equals(_tenantId, tenantId, StringComparison.OrdinalIgnoreCase))
         {
-            _pollTimer?.Change(Timeout.Infinite, Timeout.Infinite);
-            // Reassign new empty lists rather than .Clear() — a concurrent poll
-            // / menu build / badge read enumerates these, and clearing in place
-            // can throw "collection modified". Reference swap is atomic.
-            _serverRules = new();
-            _targets     = new();
-            _targetsAt   = DateTime.MinValue;
-            _rulesAt     = DateTime.MinValue;
-            _callerIp    = null;
-            _tenantId    = string.Empty;
-            _urls        = JitUrlDiscoveryResult.Empty;
-            BadgeChanged?.Invoke();
-            MenuChanged?.Invoke();
+            ClearActiveTenant();
             _context?.Logger.LogWarning(
                 "JIT: active tenant {TenantId} signed out. Plugin suspended until another tenant is ready.", tenantId);
         }
+    }
+
+    // Unbinds the active tenant and resets all per-tenant state. Used when the
+    // tenant signs out and when an options change excludes the current tenant.
+    private void ClearActiveTenant()
+    {
+        _pollTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+        // Reassign new empty lists rather than .Clear() — a concurrent poll
+        // / menu build / badge read enumerates these, and clearing in place
+        // can throw "collection modified". Reference swap is atomic.
+        _serverRules   = new();
+        _targets       = new();
+        _targetsAt     = DateTime.MinValue;
+        _rulesAt       = DateTime.MinValue;
+        _callerIp      = null;
+        _tenantId      = string.Empty;
+        _urls          = JitUrlDiscoveryResult.Empty;
+        _pollSuspended = false;
+        BadgeChanged?.Invoke();
+        MenuChanged?.Invoke();
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

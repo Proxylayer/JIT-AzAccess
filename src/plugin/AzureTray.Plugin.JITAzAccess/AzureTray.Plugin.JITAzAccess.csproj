@@ -6,7 +6,15 @@
     <ImplicitUsings>disable</ImplicitUsings>
 
     <IsPackable>true</IsPackable>
-    <PackageId>Proxylayer.AzureTray.Plugin.JITAzAccess</PackageId>
+    <!--
+      PackageId MUST equal the assembly name. The AzureTray host installs a
+      plugin into plugins/<packageId>/ and only recognizes the plugin DLL at
+      plugins/<packageId>/<packageId>.dll. A mismatch means the host extracts
+      the files but never lists the plugin as installed (no config button, and
+      it keeps showing in "available"). Matches the sibling AzureTray.Plugin.*
+      packages, which are all unprefixed.
+    -->
+    <PackageId>AzureTray.Plugin.JITAzAccess</PackageId>
     <!--
       Single source of truth for the plugin version. Drives:
         - The .nupkg filename (PackageVersion)
@@ -14,7 +22,7 @@
         - The string the plugin reports to the host at runtime
           (via JitAzAccessPlugin.Version, which reads AssemblyInformationalVersion).
     -->
-    <Version>0.3.0</Version>
+    <Version>0.5.0</Version>
     <PackageDescription>
       JIT (Just-in-Time) Azure IP access plugin for AzureTray.
       Grants temporary firewall rules on NSG, Azure SQL Server, Storage Accounts,
@@ -27,6 +35,13 @@
     -->
     <PackageTags>proxylayer.azuretray-plugin;jit;azure;firewall;nsg;sql;storage;keyvault</PackageTags>
 
+    <!-- Packaged docs + license (MIT, shared with the AzureTray host). -->
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
+    <PackageProjectUrl>https://github.com/Proxylayer/JIT-AzAccess</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Proxylayer/JIT-AzAccess</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+
     <!--
       Bundle transitive NuGet runtime DLLs into the .nupkg so the host can
       resolve them when it extracts and loads the plugin.
@@ -34,6 +49,13 @@
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);PackTransitiveAssets</TargetsForTfmSpecificBuildOutput>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- README ships from the plugin folder; LICENSE from the repo root
+         (three levels up: src/plugin/<proj>/ → repo root). -->
+    <None Include="README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\..\LICENSE" Pack="true" PackagePath="\" Visible="false" />
+  </ItemGroup>
 
   <ItemGroup>
     <!--
