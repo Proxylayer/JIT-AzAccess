@@ -1,0 +1,42 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "location": {
+            "value": "eastus"
+        },
+        "appName": {
+            "value": "jitazaccess"
+        },
+        "resourceGroupName": {
+            "value": "rg-jit-azaccess"
+        },
+        "approvedClientIds": {
+            "value": "<comma-separated AAD client IDs allowed to call the JIT API>"
+        },
+        "jwtAudience": {
+            "value": "<Application ID URI of this service's app registration, e.g. api://jit-azaccess>"
+        },
+        "jitAppRegistrationObjectId": {
+            "value": "<Object ID of the app registration — leave blank, fill in after Set-JITAppRegistration.ps1>"
+        },
+        "allowedDurationsHours": {
+            "value": "1,4,8"
+        },
+        "nsgPriorityMin": {
+            "value": "1000"
+        },
+        "nsgPriorityMax": {
+            "value": "3900"
+        },
+        "maxRulesPerCaller": {
+            "value": "5"
+        },
+        "maxRulesPerResource": {
+            "value": "20"
+        },
+        "logRetentionDays": {
+            "value": 90
+        }
+    }
+}

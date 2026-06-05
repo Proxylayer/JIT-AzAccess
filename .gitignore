@@ -1,0 +1,21 @@
+# Build output
+**/bin/
+**/obj/
+
+# VS / Rider
+.vs/
+.idea/
+*.user
+
+# NuGet
+*.nupkg
+*.snupkg
+
+# PowerShell local Az context
+.azure/
+
+# Azure Functions local settings (contains secrets)
+local.settings.json
+
+# Deployment parameters with real values
+azuredeploy.parameters.json

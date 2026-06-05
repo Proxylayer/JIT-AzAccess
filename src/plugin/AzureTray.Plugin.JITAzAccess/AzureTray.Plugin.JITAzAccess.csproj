@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyVersion>0.1.0.0</AssemblyVersion>
+
+    <IsPackable>true</IsPackable>
+    <PackageId>Proxylayer.AzureTray.Plugin.JITAzAccess</PackageId>
+    <Version>0.1.0</Version>
+    <PackageDescription>
+      JIT (Just-in-Time) Azure IP access plugin for AzureTray.
+      Grants temporary firewall rules on NSG, Azure SQL Server, Storage Accounts,
+      and Key Vaults directly from the system tray by calling a JIT-AzAccess
+      function app backend.
+    </PackageDescription>
+    <!--
+      proxylayer.azuretray-plugin is the discovery tag the host queries on
+      nuget.org. Without it the package won't appear in Browse online plugins.
+    -->
+    <PackageTags>proxylayer.azuretray-plugin;jit;azure;firewall;nsg;sql;storage;keyvault</PackageTags>
+
+    <!--
+      Bundle transitive NuGet runtime DLLs into the .nupkg so the host can
+      resolve them when it extracts and loads the plugin.
+    -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);PackTransitiveAssets</TargetsForTfmSpecificBuildOutput>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      PrivateAssets="all" is mandatory: the host loads its OWN copy of the
+      contracts assembly into a collectible AssemblyLoadContext. Shipping a
+      transitive dependency on it would cause duplicate type loads and break
+      the ITrayPlugin cast.
+    -->
+    <PackageReference Include="AzureTray.Plugin.Contracts" Version="0.2.0" PrivateAssets="all" />
+  </ItemGroup>
+
+  <Target Name="PackTransitiveAssets">
+    <ItemGroup>
+      <!-- RuntimeCopyLocalItems lists NuGet-resolved runtime DLLs. -->
+      <BuildOutputInPackage Include="@(RuntimeCopyLocalItems)" />
+    </ItemGroup>
+  </Target>
+
+</Project>

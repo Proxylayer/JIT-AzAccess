@@ -1,0 +1,180 @@
+using System;
+using System.Net.Http;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using AzureTray.Plugin.Contracts;
+using AzureTray.Plugin.JITAzAccess.Models;
+
+namespace AzureTray.Plugin.JITAzAccess;
+
+/// <summary>
+/// After a JIT grant succeeds, makes a read-only ARM call to confirm the
+/// firewall/network rule was actually written to the resource.
+///
+/// This catches silent failures where the function app returned 200 but the
+/// underlying Azure resource mutation failed or was rolled back.
+/// </summary>
+internal sealed class ArmVerifier
+{
+    // ARM API versions — use the latest stable version for each provider.
+    private const string NsgApi          = "2024-03-01";
+    private const string SqlApi          = "2021-11-01";
+    private const string StorageApi      = "2023-01-01";
+    private const string KeyVaultApi     = "2023-07-01";
+    private const string ArmBase         = "https://management.azure.com";
+
+    private static readonly JsonSerializerOptions JsonOpts = new()
+    {
+        PropertyNameCaseInsensitive = true,
+    };
+
+    private readonly IPluginContext _context;
+
+    public ArmVerifier(IPluginContext context) => _context = context;
+
+    /// <summary>
+    /// Returns <see cref="VerificationResult.Confirmed"/> when the rule/IP is
+    /// visible in the resource's current configuration via ARM.
+    /// Times out after <paramref name="timeoutMs"/> ms and returns
+    /// <see cref="VerificationResult.Timeout"/> rather than blocking the menu.
+    /// </summary>
+    public async Task<VerificationResult> VerifyAsync(
+        JitGrantResponse grant,
+        string           tenantId,
+        int              timeoutMs = 8_000,
+        CancellationToken ct       = default)
+    {
+        using var timeoutCts = new CancellationTokenSource(timeoutMs);
+        using var linked     = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+
+        try
+        {
+            return grant.TargetType switch
+            {
+                "nsg"            => await VerifyNsgRuleAsync(grant, tenantId, linked.Token),
+                "sqlServer"      => await VerifySqlRuleAsync(grant, tenantId, linked.Token),
+                "storageAccount" => await VerifyStorageRuleAsync(grant, tenantId, linked.Token),
+                "keyVault"       => await VerifyKeyVaultRuleAsync(grant, tenantId, linked.Token),
+                _                => VerificationResult.Skipped,
+            };
+        }
+        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
+        {
+            return VerificationResult.Timeout;
+        }
+        catch
+        {
+            return VerificationResult.Error;
+        }
+    }
+
+    // ── NSG — check security rule by name ─────────────────────────────────────
+
+    private async Task<VerificationResult> VerifyNsgRuleAsync(
+        JitGrantResponse grant, string tenantId, CancellationToken ct)
+    {
+        // GET individual security rule — 200 = exists, 404 = not found.
+        var url = $"{ArmBase}/subscriptions/{grant.SubscriptionId}/resourceGroups/{grant.ResourceGroup}" +
+                  $"/providers/Microsoft.Network/networkSecurityGroups/{grant.ResourceName}" +
+                  $"/securityRules/{grant.RuleId}?api-version={NsgApi}";
+
+        var response = await ArmGetAsync(tenantId, url, ct).ConfigureAwait(false);
+        return response.IsSuccessStatusCode ? VerificationResult.Confirmed : VerificationResult.NotFound;
+    }
+
+    // ── Azure SQL Server — check firewall rule by name ────────────────────────
+
+    private async Task<VerificationResult> VerifySqlRuleAsync(
+        JitGrantResponse grant, string tenantId, CancellationToken ct)
+    {
+        var url = $"{ArmBase}/subscriptions/{grant.SubscriptionId}/resourceGroups/{grant.ResourceGroup}" +
+                  $"/providers/Microsoft.Sql/servers/{grant.ResourceName}" +
+                  $"/firewallRules/{grant.RuleId}?api-version={SqlApi}";
+
+        var response = await ArmGetAsync(tenantId, url, ct).ConfigureAwait(false);
+        return response.IsSuccessStatusCode ? VerificationResult.Confirmed : VerificationResult.NotFound;
+    }
+
+    // ── Storage Account — check IP rule by value ──────────────────────────────
+
+    private async Task<VerificationResult> VerifyStorageRuleAsync(
+        JitGrantResponse grant, string tenantId, CancellationToken ct)
+    {
+        var url = $"{ArmBase}/subscriptions/{grant.SubscriptionId}/resourceGroups/{grant.ResourceGroup}" +
+                  $"/providers/Microsoft.Storage/storageAccounts/{grant.ResourceName}" +
+                  $"?api-version={StorageApi}";
+
+        var response = await ArmGetAsync(tenantId, url, ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode) return VerificationResult.Error;
+
+        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        using var doc = JsonDocument.Parse(body);
+
+        if (!doc.RootElement.TryGetProperty("properties", out var props)) return VerificationResult.Error;
+        if (!props.TryGetProperty("networkAcls", out var acls))           return VerificationResult.Error;
+        if (!acls.TryGetProperty("ipRules", out var ipRules))             return VerificationResult.NotFound;
+
+        foreach (var rule in ipRules.EnumerateArray())
+        {
+            if (rule.TryGetProperty("value", out var v) &&
+                v.GetString()?.StartsWith(grant.CallerIp) == true)
+                return VerificationResult.Confirmed;
+        }
+
+        return VerificationResult.NotFound;
+    }
+
+    // ── Key Vault — check IP rule (CIDR /32) ──────────────────────────────────
+
+    private async Task<VerificationResult> VerifyKeyVaultRuleAsync(
+        JitGrantResponse grant, string tenantId, CancellationToken ct)
+    {
+        var url = $"{ArmBase}/subscriptions/{grant.SubscriptionId}/resourceGroups/{grant.ResourceGroup}" +
+                  $"/providers/Microsoft.KeyVault/vaults/{grant.ResourceName}" +
+                  $"?api-version={KeyVaultApi}";
+
+        var response = await ArmGetAsync(tenantId, url, ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode) return VerificationResult.Error;
+
+        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        using var doc = JsonDocument.Parse(body);
+
+        if (!doc.RootElement.TryGetProperty("properties", out var props)) return VerificationResult.Error;
+        if (!props.TryGetProperty("networkAcls", out var acls))           return VerificationResult.Error;
+        if (!acls.TryGetProperty("ipRules", out var ipRules))             return VerificationResult.NotFound;
+
+        var expected = $"{grant.CallerIp}/32";
+        foreach (var rule in ipRules.EnumerateArray())
+        {
+            if (rule.TryGetProperty("value", out var v) && v.GetString() == expected)
+                return VerificationResult.Confirmed;
+        }
+
+        return VerificationResult.NotFound;
+    }
+
+    // ── Shared ARM helper ──────────────────────────────────────────────────────
+
+    private Task<HttpResponseMessage> ArmGetAsync(
+        string tenantId, string url, CancellationToken ct)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Get, url);
+        return _context.Http.SendAsync(
+            PluginHttpClientNames.Arm, tenantId, _context.ArmScope, request, ct);
+    }
+}
+
+public enum VerificationResult
+{
+    /// <summary>The rule was found in the resource's current config via ARM.</summary>
+    Confirmed,
+    /// <summary>The ARM lookup returned but the rule was not present.</summary>
+    NotFound,
+    /// <summary>The resource type has no ARM verification implementation.</summary>
+    Skipped,
+    /// <summary>The verification timed out — result unknown.</summary>
+    Timeout,
+    /// <summary>An error occurred during verification — result unknown.</summary>
+    Error,
+}

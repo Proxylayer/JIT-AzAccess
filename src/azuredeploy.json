@@ -1,0 +1,332 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2018-05-01/subscriptionDeploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "resourceGroupName": {
+            "type": "string",
+            "defaultValue": "rg-jit-azaccess",
+            "metadata": { "description": "Name of the resource group to create and deploy into." }
+        },
+        "location": {
+            "type": "string",
+            "metadata": { "description": "Azure region for all resources (e.g. eastus, westeurope)." }
+        },
+        "appName": {
+            "type": "string",
+            "defaultValue": "jitazaccess",
+            "maxLength": 15,
+            "metadata": {
+                "description": "Short lowercase alphanumeric identifier (3-15 chars, no hyphens) used to derive all resource names. E.g. 'jitazaccess' produces func-jitazaccess, key-jitazaccess, etc."
+            }
+        },
+        "approvedClientIds": {
+            "type": "string",
+            "metadata": {
+                "description": "Comma-separated list of AAD application (client) IDs whose tokens will be accepted. These are the IDs of applications that are allowed to request JIT-AzAccess."
+            }
+        },
+        "jwtAudience": {
+            "type": "string",
+            "metadata": {
+                "description": "Expected 'aud' claim in the bearer token. Typically the Application ID URI of this function app's app registration (e.g. api://jit-azaccess)."
+            }
+        },
+        "jitAppRegistrationObjectId": {
+            "type": "string",
+            "defaultValue": "",
+            "metadata": {
+                "description": "Object ID of the AAD app registration for the JIT service. Used by the function app to self-update its endpoint URL. Can be set later via Set-JITAppRegistration.ps1."
+            }
+        },
+        "allowedDurationsHours": {
+            "type": "string",
+            "defaultValue": "1,4,8",
+            "metadata": { "description": "Comma-separated list of allowed JIT durations in hours that callers may request." }
+        },
+        "nsgPriorityMin": {
+            "type": "string",
+            "defaultValue": "1000",
+            "metadata": { "description": "Lowest NSG rule priority the JIT app may use (1000-4096)." }
+        },
+        "nsgPriorityMax": {
+            "type": "string",
+            "defaultValue": "3900",
+            "metadata": { "description": "Highest NSG rule priority the JIT app may use (must be > nsgPriorityMin)." }
+        },
+        "maxRulesPerCaller": {
+            "type": "string",
+            "defaultValue": "5",
+            "metadata": { "description": "Maximum number of simultaneously active JIT rules a single caller identity may hold." }
+        },
+        "maxRulesPerResource": {
+            "type": "string",
+            "defaultValue": "20",
+            "metadata": { "description": "Maximum number of simultaneously active JIT rules on a single target resource." }
+        },
+        "logRetentionDays": {
+            "type": "int",
+            "defaultValue": 90,
+            "metadata": { "description": "Log Analytics workspace retention in days." }
+        }
+    },
+    "variables": {
+        "storageName":      "[format('st{0}', parameters('appName'))]",
+        "planName":         "[format('asp-{0}', parameters('appName'))]",
+        "functionName":     "[format('func-{0}', parameters('appName'))]",
+        "keyVaultName":     "[format('key-{0}', parameters('appName'))]",
+        "logAnalyticsName": "[format('log-{0}', parameters('appName'))]",
+        "appInsightsName":  "[format('appin-{0}', parameters('appName'))]"
+    },
+    "resources": [
+        {
+            "type": "Microsoft.Resources/resourceGroups",
+            "apiVersion": "2022-09-01",
+            "name": "[parameters('resourceGroupName')]",
+            "location": "[parameters('location')]",
+            "properties": {}
+        },
+        {
+            "type": "Microsoft.Resources/deployments",
+            "apiVersion": "2022-09-01",
+            "name": "jit-azaccess-resources",
+            "resourceGroup": "[parameters('resourceGroupName')]",
+            "dependsOn": [
+                "[subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('resourceGroupName'))]"
+            ],
+            "properties": {
+                "mode": "Incremental",
+                "expressionEvaluationOptions": { "scope": "inner" },
+                "parameters": {
+                    "location":                   { "value": "[parameters('location')]" },
+                    "storageName":                { "value": "[variables('storageName')]" },
+                    "planName":                   { "value": "[variables('planName')]" },
+                    "functionName":               { "value": "[variables('functionName')]" },
+                    "keyVaultName":               { "value": "[variables('keyVaultName')]" },
+                    "logAnalyticsName":           { "value": "[variables('logAnalyticsName')]" },
+                    "appInsightsName":            { "value": "[variables('appInsightsName')]" },
+                    "approvedClientIds":          { "value": "[parameters('approvedClientIds')]" },
+                    "jwtAudience":                { "value": "[parameters('jwtAudience')]" },
+                    "jitAppRegistrationObjectId": { "value": "[parameters('jitAppRegistrationObjectId')]" },
+                    "allowedDurationsHours":      { "value": "[parameters('allowedDurationsHours')]" },
+                    "nsgPriorityMin":             { "value": "[parameters('nsgPriorityMin')]" },
+                    "nsgPriorityMax":             { "value": "[parameters('nsgPriorityMax')]" },
+                    "maxRulesPerCaller":          { "value": "[parameters('maxRulesPerCaller')]" },
+                    "maxRulesPerResource":        { "value": "[parameters('maxRulesPerResource')]" },
+                    "logRetentionDays":           { "value": "[parameters('logRetentionDays')]" }
+                },
+                "template": {
+                    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+                    "contentVersion": "1.0.0.0",
+                    "parameters": {
+                        "location":                   { "type": "string" },
+                        "storageName":                { "type": "string" },
+                        "planName":                   { "type": "string" },
+                        "functionName":               { "type": "string" },
+                        "keyVaultName":               { "type": "string" },
+                        "logAnalyticsName":           { "type": "string" },
+                        "appInsightsName":            { "type": "string" },
+                        "approvedClientIds":          { "type": "string" },
+                        "jwtAudience":                { "type": "string" },
+                        "jitAppRegistrationObjectId": { "type": "string" },
+                        "allowedDurationsHours":      { "type": "string" },
+                        "nsgPriorityMin":             { "type": "string" },
+                        "nsgPriorityMax":             { "type": "string" },
+                        "maxRulesPerCaller":          { "type": "string" },
+                        "maxRulesPerResource":        { "type": "string" },
+                        "logRetentionDays":           { "type": "int" }
+                    },
+                    "variables": {
+                        "rbacKeyVaultSecretsUser": "4633458b-17de-408a-b874-0445c86b69e6"
+                    },
+                    "resources": [
+                        {
+                            "type": "Microsoft.OperationalInsights/workspaces",
+                            "apiVersion": "2022-10-01",
+                            "name": "[parameters('logAnalyticsName')]",
+                            "location": "[parameters('location')]",
+                            "properties": {
+                                "sku": { "name": "PerGB2018" },
+                                "retentionInDays": "[parameters('logRetentionDays')]"
+                            }
+                        },
+                        {
+                            "type": "Microsoft.Insights/components",
+                            "apiVersion": "2020-02-02",
+                            "name": "[parameters('appInsightsName')]",
+                            "location": "[parameters('location')]",
+                            "kind": "web",
+                            "dependsOn": [
+                                "[resourceId('Microsoft.OperationalInsights/workspaces', parameters('logAnalyticsName'))]"
+                            ],
+                            "properties": {
+                                "Application_Type": "web",
+                                "WorkspaceResourceId": "[resourceId('Microsoft.OperationalInsights/workspaces', parameters('logAnalyticsName'))]",
+                                "DisableIpMasking": false
+                            }
+                        },
+                        {
+                            "type": "Microsoft.Storage/storageAccounts",
+                            "apiVersion": "2022-09-01",
+                            "name": "[parameters('storageName')]",
+                            "location": "[parameters('location')]",
+                            "sku": { "name": "Standard_LRS" },
+                            "kind": "StorageV2",
+                            "properties": {
+                                "supportsHttpsTrafficOnly": true,
+                                "minimumTlsVersion": "TLS1_2",
+                                "allowBlobPublicAccess": false,
+                                "allowSharedKeyAccess": true,
+                                "networkAcls": {
+                                    "defaultAction": "Allow",
+                                    "bypass": "AzureServices"
+                                }
+                            }
+                        },
+                        {
+                            "type": "Microsoft.Web/serverfarms",
+                            "apiVersion": "2022-03-01",
+                            "name": "[parameters('planName')]",
+                            "location": "[parameters('location')]",
+                            "kind": "functionapp",
+                            "sku": { "name": "Y1", "tier": "Dynamic" },
+                            "properties": {}
+                        },
+                        {
+                            "type": "Microsoft.KeyVault/vaults",
+                            "apiVersion": "2023-02-01",
+                            "name": "[parameters('keyVaultName')]",
+                            "location": "[parameters('location')]",
+                            "properties": {
+                                "sku": { "family": "A", "name": "standard" },
+                                "tenantId": "[subscription().tenantId]",
+                                "enableRbacAuthorization": true,
+                                "enableSoftDelete": true,
+                                "softDeleteRetentionInDays": 7,
+                                "enablePurgeProtection": false,
+                                "networkAcls": {
+                                    "defaultAction": "Allow",
+                                    "bypass": "AzureServices"
+                                }
+                            }
+                        },
+                        {
+                            "type": "Microsoft.KeyVault/vaults/secrets",
+                            "apiVersion": "2023-02-01",
+                            "name": "[format('{0}/approved-client-ids', parameters('keyVaultName'))]",
+                            "dependsOn": [
+                                "[resourceId('Microsoft.KeyVault/vaults', parameters('keyVaultName'))]"
+                            ],
+                            "properties": {
+                                "value": "[parameters('approvedClientIds')]",
+                                "attributes": { "enabled": true }
+                            }
+                        },
+                        {
+                            "type": "Microsoft.KeyVault/vaults/secrets",
+                            "apiVersion": "2023-02-01",
+                            "name": "[format('{0}/jwt-audience', parameters('keyVaultName'))]",
+                            "dependsOn": [
+                                "[resourceId('Microsoft.KeyVault/vaults', parameters('keyVaultName'))]"
+                            ],
+                            "properties": {
+                                "value": "[parameters('jwtAudience')]",
+                                "attributes": { "enabled": true }
+                            }
+                        },
+                        {
+                            "type": "Microsoft.Web/sites",
+                            "apiVersion": "2022-03-01",
+                            "name": "[parameters('functionName')]",
+                            "location": "[parameters('location')]",
+                            "kind": "functionapp",
+                            "identity": { "type": "SystemAssigned" },
+                            "dependsOn": [
+                                "[resourceId('Microsoft.Web/serverfarms', parameters('planName'))]",
+                                "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageName'))]",
+                                "[resourceId('Microsoft.Insights/components', parameters('appInsightsName'))]",
+                                "[resourceId('Microsoft.KeyVault/vaults/secrets', parameters('keyVaultName'), 'approved-client-ids')]",
+                                "[resourceId('Microsoft.KeyVault/vaults/secrets', parameters('keyVaultName'), 'jwt-audience')]"
+                            ],
+                            "properties": {
+                                "serverFarmId": "[resourceId('Microsoft.Web/serverfarms', parameters('planName'))]",
+                                "httpsOnly": true,
+                                "siteConfig": {
+                                    "minTlsVersion": "1.2",
+                                    "ftpsState": "Disabled",
+                                    "powerShellVersion": "7.2",
+                                    "cors": { "allowedOrigins": [], "supportCredentials": false },
+                                    "appSettings": [
+                                        {
+                                            "name": "AzureWebJobsStorage",
+                                            "value": "[format('DefaultEndpointsProtocol=https;AccountName={0};AccountKey={1};EndpointSuffix=core.windows.net', parameters('storageName'), listKeys(resourceId('Microsoft.Storage/storageAccounts', parameters('storageName')), '2022-09-01').keys[0].value)]"
+                                        },
+                                        { "name": "FUNCTIONS_EXTENSION_VERSION",           "value": "~4" },
+                                        { "name": "FUNCTIONS_WORKER_RUNTIME",              "value": "powershell" },
+                                        { "name": "APPLICATIONINSIGHTS_CONNECTION_STRING", "value": "[reference(resourceId('Microsoft.Insights/components', parameters('appInsightsName')), '2020-02-02').connectionString]" },
+                                        { "name": "AZURE_TENANT_ID",                       "value": "[subscription().tenantId]" },
+                                        { "name": "APPROVED_CLIENT_IDS",                   "value": "[format('@Microsoft.KeyVault(VaultName={0};SecretName=approved-client-ids)', parameters('keyVaultName'))]" },
+                                        { "name": "JWT_AUDIENCE",                          "value": "[format('@Microsoft.KeyVault(VaultName={0};SecretName=jwt-audience)', parameters('keyVaultName'))]" },
+                                        { "name": "ALLOWED_DURATIONS_HOURS",               "value": "[parameters('allowedDurationsHours')]" },
+                                        { "name": "JIT_TABLE_NAME",                        "value": "JITRules" },
+                                        { "name": "JIT_NSG_PRIORITY_MIN",                  "value": "[parameters('nsgPriorityMin')]" },
+                                        { "name": "JIT_NSG_PRIORITY_MAX",                  "value": "[parameters('nsgPriorityMax')]" },
+                                        { "name": "JIT_MAX_RULES_PER_CALLER",              "value": "[parameters('maxRulesPerCaller')]" },
+                                        { "name": "JIT_MAX_RULES_PER_RESOURCE",            "value": "[parameters('maxRulesPerResource')]" },
+                                        { "name": "JIT_APP_REGISTRATION_OBJECT_ID",        "value": "[parameters('jitAppRegistrationObjectId')]" }
+                                    ]
+                                }
+                            }
+                        },
+                        {
+                            "type": "Microsoft.Authorization/roleAssignments",
+                            "apiVersion": "2022-04-01",
+                            "scope": "[resourceId('Microsoft.KeyVault/vaults', parameters('keyVaultName'))]",
+                            "name": "[guid(resourceId('Microsoft.KeyVault/vaults', parameters('keyVaultName')), variables('rbacKeyVaultSecretsUser'), resourceId('Microsoft.Web/sites', parameters('functionName')))]",
+                            "dependsOn": [
+                                "[resourceId('Microsoft.KeyVault/vaults', parameters('keyVaultName'))]",
+                                "[resourceId('Microsoft.Web/sites', parameters('functionName'))]"
+                            ],
+                            "properties": {
+                                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('rbacKeyVaultSecretsUser'))]",
+                                "principalId": "[reference(resourceId('Microsoft.Web/sites', parameters('functionName')), '2022-03-01', 'full').identity.principalId]",
+                                "principalType": "ServicePrincipal"
+                            }
+                        }
+                    ],
+                    "outputs": {
+                        "functionAppPrincipalId": {
+                            "type": "string",
+                            "value": "[reference(resourceId('Microsoft.Web/sites', parameters('functionName')), '2022-03-01', 'full').identity.principalId]"
+                        },
+                        "functionAppName": {
+                            "type": "string",
+                            "value": "[parameters('functionName')]"
+                        },
+                        "functionAppHostname": {
+                            "type": "string",
+                            "value": "[reference(resourceId('Microsoft.Web/sites', parameters('functionName')), '2022-03-01').defaultHostName]"
+                        }
+                    }
+                }
+            }
+        }
+    ],
+    "outputs": {
+        "functionAppPrincipalId": {
+            "type": "string",
+            "value": "[reference('jit-azaccess-resources').outputs.functionAppPrincipalId.value]"
+        },
+        "functionAppName": {
+            "type": "string",
+            "value": "[reference('jit-azaccess-resources').outputs.functionAppName.value]"
+        },
+        "functionAppHostname": {
+            "type": "string",
+            "value": "[reference('jit-azaccess-resources').outputs.functionAppHostname.value]"
+        },
+        "resourceGroupName": {
+            "type": "string",
+            "value": "[parameters('resourceGroupName')]"
+        }
+    }
+}
