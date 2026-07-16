@@ -6,7 +6,7 @@
 # The caller can only revoke rules they personally requested.
 #
 # Authorization: Bearer <AAD ARM token>; caller must hold the "JIT Requester"
-# RBAC role on the function app site resource.
+# RBAC role within the subscription the rule targets.
 
 using namespace System.Net
 
@@ -16,10 +16,8 @@ Import-Module "$PSScriptRoot/../Modules/HttpHelpers/HttpHelpers.psm1" -Force -Di
 Import-Module "$PSScriptRoot/../Modules/JITHelpers/JITHelpers.psm1"   -Force
 Import-Module "$PSScriptRoot/../Modules/JITTargets/JITTargets.psm1"   -Force
 
-$tenantId             = $env:AZURE_TENANT_ID
-$siteResourceId       = $env:JIT_SITE_RESOURCE_ID
-$jitRequesterRoleName = if ($env:JIT_REQUESTER_ROLE_NAME) { $env:JIT_REQUESTER_ROLE_NAME } else { 'JIT Requester' }
-$tableName            = if ($env:JIT_TABLE_NAME)          { $env:JIT_TABLE_NAME }          else { 'JITRules' }
+$tenantId  = Get-JitTenantId
+$tableName = if ($env:JIT_TABLE_NAME) { $env:JIT_TABLE_NAME } else { 'JITRules' }
 
 function Write-JsonResponse {
     param([HttpStatusCode]$Status, [hashtable]$Body)
@@ -46,29 +44,19 @@ if (-not $claims) {
     return
 }
 
-if (-not $siteResourceId) {
-    Write-JsonResponse -Status InternalServerError -Body @{ error = 'Function app is misconfigured: JIT_SITE_RESOURCE_ID is not set.' }
-    return
-}
-
 $callerObjectId = $claims.oid
 if (-not $callerObjectId) {
     Write-JsonResponse -Status Forbidden -Body @{ error = 'Token has no oid claim.' }
     return
 }
 
-if (-not (Test-CallerHasJitRequesterRole -CallerObjectId $callerObjectId `
-            -SiteResourceId $siteResourceId -RoleDefinitionName $jitRequesterRoleName)) {
-    Write-JsonResponse -Status Forbidden -Body @{
-        error        = "Caller does not hold the '$jitRequesterRoleName' RBAC role on this function app."
-        requiredRole = $jitRequesterRoleName
-    }
-    return
-}
-
 $requestedBy = if ($claims.upn)         { $claims.upn }
                elseif ($claims.unique_name) { $claims.unique_name }
                else                         { $claims.sub }
+
+# NB: the JIT Requester RBAC role check is deferred until after the rule is
+# looked up (region 2) — it is evaluated against the subscription the rule
+# targets, not the function app's own host subscription.
 
 #endregion
 
@@ -106,6 +94,16 @@ if (-not $row) {
 if ($row.RequestedBy -ne $requestedBy) {
     Write-JsonResponse -Status Forbidden -Body @{
         error = 'You can only revoke rules you personally requested.'
+    }
+    return
+}
+
+# Authorization — caller must hold the 'JIT Requester' RBAC role within the
+# subscription the rule targets (the same subscription they held it in to grant).
+if (-not (Test-CallerHasJitRequesterRole -CallerObjectId $callerObjectId -SubscriptionId $row.SubscriptionId)) {
+    Write-JsonResponse -Status Forbidden -Body @{
+        error        = "Caller does not hold the 'JIT Requester' RBAC role in subscription '$($row.SubscriptionId)'."
+        requiredRole = 'JIT Requester'
     }
     return
 }

@@ -1,0 +1,387 @@
+{
+  "docType": "changes",
+  "idPrefix": "CHG",
+  "nextId": 21,
+  "items": [
+    {
+      "id": "CHG-0001",
+      "title": "add designs DES-0001",
+      "state": "done",
+      "tags": [
+        "designs",
+        "add"
+      ],
+      "description": "Added 'JIT-AzAccess: sub-scoped requester role, zero-config deploy, plugin config cleanup'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "DES-0001"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-16T21:09:30Z",
+      "updated": "2026-07-16T21:09:30Z"
+    },
+    {
+      "id": "CHG-0002",
+      "title": "add todos TODO-0001",
+      "state": "done",
+      "tags": [
+        "todos",
+        "add"
+      ],
+      "description": "Added 'Function app: sub-scoped hardcoded 'JIT Requester' check'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0001"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-16T21:10:09Z",
+      "updated": "2026-07-16T21:10:09Z"
+    },
+    {
+      "id": "CHG-0003",
+      "title": "add todos TODO-0002",
+      "state": "done",
+      "tags": [
+        "todos",
+        "add"
+      ],
+      "description": "Added 'Function app: zero-config deploy via runtime derivation'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0002"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-16T21:10:10Z",
+      "updated": "2026-07-16T21:10:10Z"
+    },
+    {
+      "id": "CHG-0004",
+      "title": "add todos TODO-0003",
+      "state": "done",
+      "tags": [
+        "todos",
+        "add"
+      ],
+      "description": "Added 'Plugin: remove 'Limit to tenant IDs' option'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0003"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-16T21:10:10Z",
+      "updated": "2026-07-16T21:10:10Z"
+    },
+    {
+      "id": "CHG-0005",
+      "title": "add todos TODO-0004",
+      "state": "done",
+      "tags": [
+        "todos",
+        "add"
+      ],
+      "description": "Added 'Plugin: remove app-reg name option, self-discover via Graph'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0004"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-16T21:10:11Z",
+      "updated": "2026-07-16T21:10:11Z"
+    },
+    {
+      "id": "CHG-0006",
+      "title": "addLink todos TODO-0001",
+      "state": "done",
+      "tags": [
+        "todos",
+        "addLink"
+      ],
+      "description": "Link 'design' -> DES-0001.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0001"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-16T21:10:20Z",
+      "updated": "2026-07-16T21:10:20Z"
+    },
+    {
+      "id": "CHG-0007",
+      "title": "addLink todos TODO-0002",
+      "state": "done",
+      "tags": [
+        "todos",
+        "addLink"
+      ],
+      "description": "Link 'design' -> DES-0001.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0002"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-16T21:10:21Z",
+      "updated": "2026-07-16T21:10:21Z"
+    },
+    {
+      "id": "CHG-0008",
+      "title": "addLink todos TODO-0003",
+      "state": "done",
+      "tags": [
+        "todos",
+        "addLink"
+      ],
+      "description": "Link 'design' -> DES-0001.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0003"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-16T21:10:22Z",
+      "updated": "2026-07-16T21:10:22Z"
+    },
+    {
+      "id": "CHG-0009",
+      "title": "addLink todos TODO-0004",
+      "state": "done",
+      "tags": [
+        "todos",
+        "addLink"
+      ],
+      "description": "Link 'design' -> DES-0001.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0004"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-16T21:10:23Z",
+      "updated": "2026-07-16T21:10:23Z"
+    },
+    {
+      "id": "CHG-0010",
+      "title": "addLink designs DES-0001",
+      "state": "done",
+      "tags": [
+        "designs",
+        "addLink"
+      ],
+      "description": "Link 'todos' -> TODO-0001,TODO-0002,TODO-0003,TODO-0004.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "DES-0001"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-16T21:10:24Z",
+      "updated": "2026-07-16T21:10:24Z"
+    },
+    {
+      "id": "CHG-0011",
+      "title": "add todos TODO-0005",
+      "state": "done",
+      "tags": [
+        "todos",
+        "add"
+      ],
+      "description": "Added 'Update Test-JITAccess.ps1 for target-sub role model'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0005"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-16T21:26:14Z",
+      "updated": "2026-07-16T21:26:14Z"
+    },
+    {
+      "id": "CHG-0012",
+      "title": "addComment todos TODO-0001",
+      "state": "done",
+      "tags": [
+        "todos",
+        "addComment"
+      ],
+      "description": "Comment c1 by developer.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0001"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-16T21:26:15Z",
+      "updated": "2026-07-16T21:26:15Z"
+    },
+    {
+      "id": "CHG-0013",
+      "title": "addComment todos TODO-0004",
+      "state": "done",
+      "tags": [
+        "todos",
+        "addComment"
+      ],
+      "description": "Comment c1 by developer.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0004"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-16T21:26:16Z",
+      "updated": "2026-07-16T21:26:16Z"
+    },
+    {
+      "id": "CHG-0014",
+      "title": "addComment todos TODO-0001",
+      "state": "done",
+      "tags": [
+        "todos",
+        "addComment"
+      ],
+      "description": "Comment c2 by claude.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0001"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-16T21:29:48Z",
+      "updated": "2026-07-16T21:29:48Z"
+    },
+    {
+      "id": "CHG-0015",
+      "title": "add todos TODO-0006",
+      "state": "done",
+      "tags": [
+        "todos",
+        "add"
+      ],
+      "description": "Added 'Upgrade function app Pester tests to v5 (fix 21 environmental failures)'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0006"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-16T21:36:33Z",
+      "updated": "2026-07-16T21:36:33Z"
+    },
+    {
+      "id": "CHG-0016",
+      "title": "setState todos TODO-0001",
+      "state": "done",
+      "tags": [
+        "todos",
+        "setState"
+      ],
+      "description": "State: active -> done.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0001"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-16T21:39:58Z",
+      "updated": "2026-07-16T21:39:58Z"
+    },
+    {
+      "id": "CHG-0017",
+      "title": "setState todos TODO-0002",
+      "state": "done",
+      "tags": [
+        "todos",
+        "setState"
+      ],
+      "description": "State: active -> done.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0002"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-16T21:39:59Z",
+      "updated": "2026-07-16T21:39:59Z"
+    },
+    {
+      "id": "CHG-0018",
+      "title": "setState todos TODO-0003",
+      "state": "done",
+      "tags": [
+        "todos",
+        "setState"
+      ],
+      "description": "State: active -> done.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0003"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-16T21:40:00Z",
+      "updated": "2026-07-16T21:40:00Z"
+    },
+    {
+      "id": "CHG-0019",
+      "title": "setState todos TODO-0004",
+      "state": "done",
+      "tags": [
+        "todos",
+        "setState"
+      ],
+      "description": "State: active -> done.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0004"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-16T21:40:00Z",
+      "updated": "2026-07-16T21:40:00Z"
+    },
+    {
+      "id": "CHG-0020",
+      "title": "setState designs DES-0001",
+      "state": "done",
+      "tags": [
+        "designs",
+        "setState"
+      ],
+      "description": "State: active -> done.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "DES-0001"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-16T21:40:01Z",
+      "updated": "2026-07-16T21:40:01Z"
+    }
+  ]
+}

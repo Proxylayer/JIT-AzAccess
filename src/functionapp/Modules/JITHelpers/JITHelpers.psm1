@@ -16,10 +16,16 @@
 $script:JwksCache    = $null   # { Keys: [...], FetchedAt: [DateTime] }
 $script:JwksCacheTtl = [TimeSpan]::FromHours(1)
 
-# Cache of the JIT Requester role definition GUID. Resolved once per worker.
-$script:JitRoleDefIdCache = $null   # @{ Name; Guid }
+# The custom RBAC role a caller must hold (in the target subscription) to use
+# the JIT API. Hardcoded — deliberately NOT configurable via env var.
+$script:JitRequesterRoleName = 'JIT Requester'
 
-# Cache of per-caller authz decisions. Keyed by "{oid}|{siteResourceId}".
+# Cache of the JIT Requester role definition GUID, keyed by subscription id.
+# The GUID differs per subscription, so cache per-subscription for the
+# lifetime of the worker process.
+$script:JitRoleDefIdCache = @{}   # @{ <subscriptionId> = <guid> }
+
+# Cache of per-caller authz decisions. Keyed by "{oid}|{subscriptionId}".
 # Cap is 60 seconds for both positive and negative decisions so role
 # assignments and revocations take effect within ~1 minute without needing
 # a function-app restart, while still saving an ARM round-trip per request
@@ -243,32 +249,32 @@ function Invoke-JwtValidation {
 function Get-JitRequesterRoleDefinitionGuid {
     <#
     .SYNOPSIS
-        Resolves the GUID of the custom RBAC role definition by name (e.g. "JIT Requester").
-        Cached for the lifetime of the worker process.
+        Resolves the GUID of the 'JIT Requester' custom RBAC role definition
+        within the given subscription. Cached per subscription for the lifetime
+        of the worker process (the GUID can differ between subscriptions).
     #>
     param(
-        [Parameter(Mandatory)][string] $RoleDefinitionName,
         [Parameter(Mandatory)][string] $SubscriptionId
     )
 
-    if ($script:JitRoleDefIdCache -and $script:JitRoleDefIdCache.Name -eq $RoleDefinitionName) {
-        return $script:JitRoleDefIdCache.Guid
+    if ($script:JitRoleDefIdCache.ContainsKey($SubscriptionId)) {
+        return $script:JitRoleDefIdCache[$SubscriptionId]
     }
 
     try {
         $resp = Invoke-ArmRest `
             -Path  "/subscriptions/$SubscriptionId/providers/Microsoft.Authorization/roleDefinitions" `
-            -Query @{ '$filter' = "roleName eq '$RoleDefinitionName'" }
+            -Query @{ '$filter' = "roleName eq '$script:JitRequesterRoleName'" }
 
         if (@($resp.value).Count -gt 0) {
             # response.value[].name is the role definition GUID
             $guid = $resp.value[0].name
-            $script:JitRoleDefIdCache = @{ Name = $RoleDefinitionName; Guid = $guid }
+            $script:JitRoleDefIdCache[$SubscriptionId] = $guid
             return $guid
         }
     }
     catch {
-        Write-Warning "JIT: role definition lookup failed for '$RoleDefinitionName' in sub $SubscriptionId — $_"
+        Write-Warning "JIT: role definition lookup failed for '$script:JitRequesterRoleName' in sub $SubscriptionId — $_"
     }
 
     return $null
@@ -278,27 +284,28 @@ function Test-CallerHasJitRequesterRole {
     <#
     .SYNOPSIS
         Returns $true if the caller (identified by AAD objectId) has an active
-        assignment of the custom "JIT Requester" role at, above, or below the
-        function app's own site resource scope.
+        assignment of the custom 'JIT Requester' role within the given target
+        subscription (at the /subscriptions/<id> scope, inherited from a parent
+        management group, or on a child resource group / resource in it).
 
     .DESCRIPTION
         Uses the function app's managed identity to query ARM for role
-        assignments via the assignedTo() filter, which returns assignments
-        that apply to the principal at the given scope including those
-        inherited from parent scopes (subscription, RG).
+        assignments via the assignedTo() filter at the TARGET subscription
+        scope. The caller must hold 'JIT Requester' in the subscription they
+        are operating on — this is the subscription the request targets, NOT
+        the function app's own host subscription.
 
-        Decisions are cached per (callerObjectId, siteResourceId) for
+        Decisions are cached per (callerObjectId, subscriptionId) for
         60 seconds — long enough to absorb a burst of calls in a single
         grant/revoke flow, short enough that role assignments and
         revocations take effect within ~1 minute without a restart.
     #>
     param(
         [Parameter(Mandatory)][string] $CallerObjectId,
-        [Parameter(Mandatory)][string] $SiteResourceId,
-        [Parameter(Mandatory)][string] $RoleDefinitionName
+        [Parameter(Mandatory)][string] $SubscriptionId
     )
 
-    $cacheKey = "$CallerObjectId|$SiteResourceId"
+    $cacheKey = "$CallerObjectId|$SubscriptionId"
     $now      = [DateTime]::UtcNow
 
     if ($script:RoleCheckCache.ContainsKey($cacheKey) -and
@@ -308,27 +315,25 @@ function Test-CallerHasJitRequesterRole {
 
     # Breadcrumb so we can confirm this code is loaded and being invoked.
     # Logged as Information so it definitely flows through to Function logs.
-    Write-Host "JIT-AUTH: checking caller $CallerObjectId on $SiteResourceId for role '$RoleDefinitionName'."
+    Write-Host "JIT-AUTH: checking caller $CallerObjectId in subscription $SubscriptionId for role '$script:JitRequesterRoleName'."
 
     $allowed = $false
     try {
-        $subId       = ($SiteResourceId -split '/')[2]
-        $roleDefGuid = Get-JitRequesterRoleDefinitionGuid `
-                          -RoleDefinitionName $RoleDefinitionName `
-                          -SubscriptionId    $subId
+        $roleDefGuid = Get-JitRequesterRoleDefinitionGuid -SubscriptionId $SubscriptionId
 
         if (-not $roleDefGuid) {
-            Write-Host "JIT-AUTH: role '$RoleDefinitionName' not found in sub $subId — DENIED."
+            Write-Host "JIT-AUTH: role '$script:JitRequesterRoleName' not found in sub $SubscriptionId — DENIED."
         }
         else {
+            $scope = "/subscriptions/$SubscriptionId"
             # NB: ARM's assignedTo() takes a bare GUID. The Microsoft docs
             # render the placeholder as "{principalId}" — that's
             # documentation punctuation; wrapping in braces returns 0 results.
-            Write-Host "JIT-AUTH: querying roleAssignments at $SiteResourceId with assignedTo('$CallerObjectId')"
+            Write-Host "JIT-AUTH: querying roleAssignments at $scope with assignedTo('$CallerObjectId')"
             # Follow nextLink so a matching assignment on a later page isn't
             # missed (ARM paginates roleAssignments).
             $assignments = @()
-            $nextUrl     = "$SiteResourceId/providers/Microsoft.Authorization/roleAssignments"
+            $nextUrl     = "$scope/providers/Microsoft.Authorization/roleAssignments"
             $firstPage   = $true
             do {
                 $resp = if ($firstPage) {
@@ -363,6 +368,137 @@ function Test-CallerHasJitRequesterRole {
 
     $script:RoleCheckCache[$cacheKey] = @{ Allowed = $allowed; At = $now }
     return $allowed
+}
+
+#endregion
+
+#region ── Runtime Configuration Derivation ─────────────────────────────────────────
+# Zero-config: each of these values is derived at runtime from platform-injected
+# env vars (or IMDS / the MI token) so the function app deploys with no operational
+# configuration. In every case an explicit App Setting (env var) WINS when set,
+# so any derived value can still be overridden after deployment.
+
+# Per-worker caches — the derived values don't change during a worker's lifetime.
+$script:DerivedSubscriptionId = $null
+$script:DerivedTenantId       = $null
+
+function Get-JitInstanceMetadata {
+    <#
+    .SYNOPSIS
+        Queries the Azure Instance Metadata Service (IMDS) compute block.
+        Best-effort — returns $null if IMDS is unreachable (it is not always
+        available on App Service / Functions plans).
+    #>
+    try {
+        $resp = Invoke-RestMethod -Method Get `
+            -Uri 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' `
+            -Headers @{ Metadata = 'true' } -TimeoutSec 5 -ErrorAction Stop
+        return $resp.compute
+    }
+    catch {
+        Write-Warning "JIT: IMDS query failed — $_"
+        return $null
+    }
+}
+
+function Get-JitSubscriptionId {
+    <#
+    .SYNOPSIS
+        Returns the function app's own (host) subscription id.
+        ENV JIT_SUBSCRIPTION_ID wins; else parsed from WEBSITE_OWNER_NAME
+        (format "<subId>+<rg>-<region>webspace"); else from IMDS.
+    #>
+    if ($env:JIT_SUBSCRIPTION_ID)    { return $env:JIT_SUBSCRIPTION_ID }
+    if ($script:DerivedSubscriptionId) { return $script:DerivedSubscriptionId }
+
+    if ($env:WEBSITE_OWNER_NAME) {
+        $subId = ($env:WEBSITE_OWNER_NAME -split '\+')[0]
+        if ($subId -match '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
+            $script:DerivedSubscriptionId = $subId
+            return $subId
+        }
+    }
+
+    $compute = Get-JitInstanceMetadata
+    if ($compute -and $compute.subscriptionId) {
+        $script:DerivedSubscriptionId = $compute.subscriptionId
+        return $script:DerivedSubscriptionId
+    }
+
+    return $null
+}
+
+function Get-JitResourceGroup {
+    <#
+    .SYNOPSIS
+        Returns the function app's resource group. ENV JIT_RESOURCE_GROUP wins;
+        else the platform-injected WEBSITE_RESOURCE_GROUP.
+    #>
+    if ($env:JIT_RESOURCE_GROUP) { return $env:JIT_RESOURCE_GROUP }
+    return $env:WEBSITE_RESOURCE_GROUP
+}
+
+function Get-JitSiteName {
+    <#
+    .SYNOPSIS
+        Returns the function app's site name. ENV JIT_SITE_NAME wins; else the
+        platform-injected WEBSITE_SITE_NAME.
+    #>
+    if ($env:JIT_SITE_NAME) { return $env:JIT_SITE_NAME }
+    return $env:WEBSITE_SITE_NAME
+}
+
+function Get-JitSiteResourceId {
+    <#
+    .SYNOPSIS
+        Returns the function app's own site resource id. ENV JIT_SITE_RESOURCE_ID
+        wins; else built from the derived subscription id, resource group, and
+        site name.
+    #>
+    if ($env:JIT_SITE_RESOURCE_ID) { return $env:JIT_SITE_RESOURCE_ID }
+
+    $subId    = Get-JitSubscriptionId
+    $rg       = Get-JitResourceGroup
+    $siteName = Get-JitSiteName
+    if ($subId -and $rg -and $siteName) {
+        return "/subscriptions/$subId/resourceGroups/$rg/providers/Microsoft.Web/sites/$siteName"
+    }
+    return $null
+}
+
+function Get-JitTenantId {
+    <#
+    .SYNOPSIS
+        Returns the function app's home tenant id. ENV AZURE_TENANT_ID wins;
+        else decoded from the MI ARM token's 'tid' claim; else from IMDS.
+    #>
+    if ($env:AZURE_TENANT_ID)   { return $env:AZURE_TENANT_ID }
+    if ($script:DerivedTenantId) { return $script:DerivedTenantId }
+
+    # Decode the tid claim from the MI's own ARM token.
+    try {
+        $token = Get-ManagedIdentityToken -Resource 'https://management.azure.com/'
+        $parts = $token.Split('.')
+        if ($parts.Count -ge 2) {
+            $payload = ConvertFrom-Base64Url $parts[1] | ConvertFrom-Json
+            if ($payload.tid) {
+                $script:DerivedTenantId = $payload.tid
+                return $payload.tid
+            }
+        }
+    }
+    catch {
+        Write-Warning "JIT: could not derive tenant id from MI token — $_"
+    }
+
+    # Best-effort fallback: IMDS (compute.tenantId is not populated on all plans).
+    $compute = Get-JitInstanceMetadata
+    if ($compute -and $compute.tenantId) {
+        $script:DerivedTenantId = $compute.tenantId
+        return $script:DerivedTenantId
+    }
+
+    return $null
 }
 
 #endregion
@@ -657,6 +793,11 @@ function Get-CallerIp {
 Export-ModuleMember -Function @(
     'Invoke-JwtValidation'
     'Test-CallerHasJitRequesterRole'
+    'Get-JitSubscriptionId'
+    'Get-JitResourceGroup'
+    'Get-JitSiteName'
+    'Get-JitSiteResourceId'
+    'Get-JitTenantId'
     'Write-JITAuditEvent'
     'Get-AvailableNsgPriority'
     'Invoke-WithBlobLock'

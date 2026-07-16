@@ -16,9 +16,23 @@ Rules are automatically removed by a timer trigger when they expire (every 5 min
 The function app accepts **plain ARM-audience tokens** (`https://management.azure.com/`) issued
 by the calling user's tenant — no dedicated JIT app registration, no custom OAuth scope.
 
-Authorization is gated entirely on Azure RBAC: the caller must hold the custom
-**"JIT Requester"** role on the function app site resource (or a parent scope).
-Deploy.ps1 creates this role at subscription scope; admins assign it to end users.
+Authorization is gated on Azure RBAC for the actions that change access: to
+**request** access the caller must hold the custom **"JIT Requester"** role
+**within the subscription they are requesting access into** (evaluated against the
+`subscriptionId` in the request body), and to **revoke** a rule the caller must
+hold it in that rule's own subscription. Listing your own rules (`Get-JITRules`)
+requires only authentication — no role assignment — because callers only ever see
+the rules they personally requested. The role name is hardcoded in the app. The
+deployment scripts make this role assignable in each target subscription; admins
+assign it to end users.
+
+The function app is **zero-config**: it deploys with no operational App Settings.
+Its own subscription id, resource group, site name, and tenant id are derived at
+runtime from platform-injected environment variables (`WEBSITE_OWNER_NAME`,
+`WEBSITE_RESOURCE_GROUP`, `WEBSITE_SITE_NAME`) and the managed identity token, with
+IMDS as a fallback. Every derived value can still be overridden by setting the
+corresponding App Setting (`JIT_SUBSCRIPTION_ID`, `JIT_RESOURCE_GROUP`,
+`JIT_SITE_NAME`, `JIT_SITE_RESOURCE_ID`, `AZURE_TENANT_ID`) — env wins when set.
 
 The AzureTray plugin auto-discovers the function app URL by reading the
 **AzureTray host's** app-registration `tags` via Microsoft Graph. The
@@ -54,27 +68,31 @@ plugin-side configuration needed.
 
 1. Run the ARM template (resource group + function app + dependencies)
 2. Zip-deploy the function app code
-3. Grant the function app's MI:
-   - `JIT-AzAccess Manager` custom RBAC role on the target subscriptions (so it can write firewall rules)
+3. Grant the function app's MI, and make the requester role assignable, on the target subscriptions:
+   - `JIT-AzAccess Manager` custom RBAC role assigned to the MI (so it can write firewall rules)
+   - `JIT Requester` custom RBAC role definition made assignable in each target subscription
    - Microsoft Graph `Application.ReadWrite.OwnedBy` + ownership of the AzureTray app reg (so it can self-register its URL on cold start)
 4. Register this deployment's URL as a `jit-baseurl:<sub>=<url>` tag on the AzureTray app reg
-5. Create the `JIT Requester` custom RBAC role at subscription scope
-6. Restart the function app so `profile.ps1` self-registers its URL tag
+5. Restart the function app so `profile.ps1` self-registers its URL tag
 
 ### 2. Assign the JIT Requester role to your users
 
-The function app rejects callers who don't hold the `JIT Requester` role on its site resource.
-Assign it via the portal, az CLI, or PIM:
+The function app rejects callers who don't hold the `JIT Requester` role **in the
+subscription they are requesting access into**. Assign it (via the portal, az CLI,
+or PIM) at the target subscription scope:
 
 ```powershell
 az role assignment create `
     --assignee-object-id <user-or-group-objectId> `
     --assignee-principal-type User `
     --role "JIT Requester" `
-    --scope "/subscriptions/<subId>/resourceGroups/<rg>/providers/Microsoft.Web/sites/func-jitazaccess"
+    --scope "/subscriptions/<targetSubscriptionId>"
 ```
 
-You can scope the assignment higher (RG or subscription) — ARM inheritance applies.
+You can scope the assignment narrower (resource group within the subscription) — ARM
+inheritance applies. Listing your own rules via `Get-JITRules` needs no role
+assignment — it requires only authentication, and callers only ever see the rules
+they personally requested.
 
 ### 3. Use it from AzureTray
 
@@ -121,7 +139,6 @@ jit-azaccess/
 | `appName` | `jitazaccess` | Short lowercase alphanumeric name (3-15 chars) used to derive resource names |
 | `resourceGroupName` | `rg-jit-azaccess` | Resource group to create |
 | `azureTrayAppRegistrationName` | `AzureTray` | Display name of the host app reg the function app writes `jitBaseUrl` to |
-| `jitRequesterRoleName` | `JIT Requester` | Name of the custom RBAC role that gates access |
 | `allowedDurationsHours` | `1,4,8` | Comma-separated list of valid JIT durations in hours |
 | `nsgPriorityMin` | `1000` | Lowest NSG rule priority the JIT app may assign |
 | `nsgPriorityMax` | `3900` | Highest NSG rule priority the JIT app may assign |
@@ -143,11 +160,13 @@ Resource names are derived from `appName`:
 **Endpoint:** `POST https://func-{appName}.azurewebsites.net/api/Request-JITAccess`
 
 **Authorization:** `Bearer <ARM token>`. Token must:
-- be issued by the function app's tenant (`tid` claim matches `AZURE_TENANT_ID`)
+- be issued by the function app's tenant (`tid` claim matches the app's derived/overridden tenant id)
 - carry an ARM audience (`https://management.azure.com/`)
 
 **Authorization check:** the caller's AAD object ID (`oid` claim) must hold the
-`JIT Requester` RBAC role at, above, or below the function app site resource.
+`JIT Requester` RBAC role within the target subscription named in the request body
+(`subscriptionId`) — at the subscription scope, inherited from a parent management
+group, or on a resource group / resource inside it.
 
 **Request body:**
 
@@ -185,7 +204,7 @@ Supported `targetType` values: `nsg`, `sqlServer`, `storageAccount`, `keyVault`.
 ## Security Notes
 
 - JWT validation performs full RS256 signature verification against Azure AD's JWKS with a 1-hour in-process cache and automatic key rotation handling.
-- RBAC role assignments are looked up against ARM on every request; results are cached per-caller-per-site for 5 minutes.
+- RBAC role assignments are looked up against ARM on every request; results are cached per-caller-per-subscription for 60 seconds so assignments and revocations take effect within ~1 minute without a restart.
 - NSG priority assignment is protected by a distributed blob lease to prevent concurrent requests from colliding.
 - Audit events (`JITGranted`, `JITDenied`, `JITExpired`, `JITRemoveFailed`, `JITRevoked`) are emitted as structured JSON to stdout and surfaced in the function app's standard logs (Log stream, Kudu, `az functionapp log tail`).
 - The function app runs with a system-assigned managed identity; no credentials are stored.

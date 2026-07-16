@@ -1,0 +1,28 @@
+{
+  "docType": "designs",
+  "idPrefix": "DES",
+  "nextId": 2,
+  "items": [
+    {
+      "id": "DES-0001",
+      "title": "JIT-AzAccess: sub-scoped requester role, zero-config deploy, plugin config cleanup",
+      "state": "done",
+      "tags": [
+        "jit",
+        "functionapp",
+        "plugin",
+        "architecture"
+      ],
+      "description": "Refactor decisions (2026-07-16): (1) Requester authz is a single hardcoded custom role 'JIT Requester' (remove JIT_REQUESTER_ROLE_NAME env); on each request the function app checks the caller holds that role in the TARGET subscription from the request body (not the host site scope), then adds the caller IP to the whitelist and schedules removal at expiry. The MI-only 'JIT-AzAccess Manager' custom role is KEPT (app's own permission, not a caller role). (2) Zero-config deploy via full runtime derivation: add code fallback for ALLOWED_DURATIONS_HOURS; stop baking AZURE_TENANT_ID/JIT_SUBSCRIPTION_ID/JIT_SITE_RESOURCE_ID into ARM appSettings and derive them at runtime (MI token tid, WEBSITE_* / IMDS), each still env-overridable. (3) Plugin: remove 'Limit to tenant IDs' (allowedTenantIds) option; host per-tenant enable grid already covers it (filters Tenants/ReadyTenants, throws ArgumentException paramName tenantId on GetHttpClient). (4) Plugin: remove 'AzureTray app registration name' (appRegistrationName) option; JitUrlDiscovery self-discovers the app registration via existing GetHttpClient(tenantId)+GraphScope token by scanning Graph applications for jit-baseurl: tags. Manifest tag format UNCHANGED: 'jit-baseurl:<subscriptionId>=<https-url>'.",
+      "links": [
+        {
+          "label": "todos",
+          "ref": "TODO-0001,TODO-0002,TODO-0003,TODO-0004"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-16T21:09:30Z",
+      "updated": "2026-07-16T21:40:01Z"
+    }
+  ]
+}

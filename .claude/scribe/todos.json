@@ -1,0 +1,136 @@
+{
+  "docType": "todos",
+  "idPrefix": "TODO",
+  "nextId": 7,
+  "items": [
+    {
+      "id": "TODO-0001",
+      "title": "Function app: sub-scoped hardcoded 'JIT Requester' check",
+      "state": "done",
+      "tags": [
+        "jit",
+        "functionapp",
+        "auth"
+      ],
+      "description": "Hardcode role name 'JIT Requester' in the app; remove JIT_REQUESTER_ROLE_NAME env usage. Change Test-CallerHasJitRequesterRole (JITHelpers.psm1:~315) to derive the subscription from the request body target subscriptionId instead of the site resource ID, resolve the role by name within the TARGET subscription, and check the caller's assignment at target-sub scope. Ensure the 'JIT Requester' role definition exists in each target subscription (Deploy.ps1/Grant-JITPermissions.ps1 create it per target sub). Keep 'JIT-AzAccess Manager' MI role untouched. Existing add-IP-to-whitelist + schedule-removal flow unchanged.",
+      "links": [
+        {
+          "label": "design",
+          "ref": "DES-0001"
+        }
+      ],
+      "comments": [
+        {
+          "id": "c1",
+          "author": "developer",
+          "date": "2026-07-16T21:26:15Z",
+          "text": "Implemented. Two read endpoints had no request-body target sub, so a judgment call was made: Revoke-JITAccess checks against the rule's own subscription (row.SubscriptionId); Get-JITRules checks against the app's derived HOST subscription (it only returns the caller's own rules). Consequence: a user needs 'JIT Requester' in the host subscription to LIST rules, and in each target subscription to request/revoke there. Deploy Step 4 keeps the host sub in the role's assignableScopes so it isn't orphaned. NEEDS ARCHITECT/USER CONFIRMATION - listing one's own rules requiring a host-sub role may be undesirable."
+        },
+        {
+          "id": "c2",
+          "author": "claude",
+          "date": "2026-07-16T21:29:48Z",
+          "text": "DECISION (user, 2026-07-16): Get-JITRules should have NO role check - any authenticated caller lists only their own rules. Follow-up change: remove the Test-CallerHasJitRequesterRole gate from Get-JITRules/run.ps1 (keep JWT/caller-identity validation for filtering), and drop the host subscription from the role's assignableScopes (revert Deploy.ps1 Step 4 host-sub merge). Requester role now lives ONLY in target subscriptions. Revoke stays checked against the rule's own subscription."
+        }
+      ],
+      "created": "2026-07-16T21:10:09Z",
+      "updated": "2026-07-16T21:39:58Z"
+    },
+    {
+      "id": "TODO-0002",
+      "title": "Function app: zero-config deploy via runtime derivation",
+      "state": "done",
+      "tags": [
+        "jit",
+        "functionapp",
+        "deploy"
+      ],
+      "description": "Add code fallback for ALLOWED_DURATIONS_HOURS (Request-JITAccess/run.ps1:36-37). Remove AZURE_TENANT_ID/JIT_SUBSCRIPTION_ID/JIT_SITE_RESOURCE_ID from ARM appSettings (azuredeploy.json:179,186,187) and derive at runtime (MI token tid claim; WEBSITE_OWNER_NAME/WEBSITE_RESOURCE_GROUP/WEBSITE_SITE_NAME or IMDS), env-override wins. Verify Deploy.ps1 still functions; goal is deploy supplies nothing operational.",
+      "links": [
+        {
+          "label": "design",
+          "ref": "DES-0001"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-16T21:10:09Z",
+      "updated": "2026-07-16T21:39:59Z"
+    },
+    {
+      "id": "TODO-0003",
+      "title": "Plugin: remove 'Limit to tenant IDs' option",
+      "state": "done",
+      "tags": [
+        "jit",
+        "plugin"
+      ],
+      "description": "Remove allowedTenantIds PluginOption (JitAzAccessPlugin.cs:130,155-160) and all consumers: AllowedTenantIds, ParseTenantIds, IsTenantAllowed, the allow-list branch in OnTenantReady, and the AllowedTenantsOptionKey branch of ApplyTenantPolicy. Rely on host per-tenant enable grid. Verify tenant lifecycle still works.",
+      "links": [
+        {
+          "label": "design",
+          "ref": "DES-0001"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-16T21:10:10Z",
+      "updated": "2026-07-16T21:40:00Z"
+    },
+    {
+      "id": "TODO-0004",
+      "title": "Plugin: remove app-reg name option, self-discover via Graph",
+      "state": "done",
+      "tags": [
+        "jit",
+        "plugin"
+      ],
+      "description": "Remove appRegistrationName PluginOption (JitAzAccessPlugin.cs:131,161-166) and AzureTrayAppRegistrationName accessor and its ApplyTenantPolicy branch. Rewrite JitUrlDiscovery.DiscoverAsync to drop the appRegistrationName parameter and query Graph (via existing GetHttpClient(tenantId)+GraphScope) for applications carrying jit-baseurl: tags, merging matches. Update call sites TestDiscoveryAsync/DiscoverAndPollAsync/RetryDiscoveryAsync. Tag format stays jit-baseurl:<sub>=<https-url>. Application.Read.All already declared.",
+      "links": [
+        {
+          "label": "design",
+          "ref": "DES-0001"
+        }
+      ],
+      "comments": [
+        {
+          "id": "c1",
+          "author": "developer",
+          "date": "2026-07-16T21:26:16Z",
+          "text": "Done, builds clean. Note: src/scripts/*.ps1 (Deploy/Remove/Test) still take an AzureTrayAppRegistrationName param - that's the infra WRITER side that names which app reg to tag; legitimately separate from the plugin's now name-agnostic reader. Left as-is."
+        }
+      ],
+      "created": "2026-07-16T21:10:11Z",
+      "updated": "2026-07-16T21:40:00Z"
+    },
+    {
+      "id": "TODO-0005",
+      "title": "Update Test-JITAccess.ps1 for target-sub role model",
+      "state": "proposed",
+      "tags": [
+        "jit",
+        "functionapp",
+        "scripts"
+      ],
+      "description": "Test-JITAccess.ps1 is stale after DES-0001: it checks the 'JIT Requester' assignment at the SITE RESOURCE scope (~lines 154-181) and references the removed JIT_REQUESTER_ROLE_NAME app setting (~line 302). Update it to check role assignment at the target/host subscription scope to match the new model, and drop the removed app-setting reference.",
+      "links": [],
+      "comments": [],
+      "created": "2026-07-16T21:26:13Z",
+      "updated": "2026-07-16T21:26:13Z"
+    },
+    {
+      "id": "TODO-0006",
+      "title": "Upgrade function app Pester tests to v5 (fix 21 environmental failures)",
+      "state": "proposed",
+      "tags": [
+        "jit",
+        "functionapp",
+        "tests",
+        "tech-debt"
+      ],
+      "description": "21 pre-existing test failures are environmental, NOT product regressions: Pester 3.4.0 running under PowerShell 7.6.3. JITHelpers.Tests.ps1 has 2 'Should Throw' tests that don't throw under this runtime; Remove-ExpiredRules.Tests.ps1 (all 19) rely on Mock/Assert-MockCalled of Az cmdlets that don't work under Pester 3.4 + PS7. Fix = upgrade these test files to Pester v5 syntax and pin Pester v5 in the runner. Also: no CI runs the Pester tests (publish-plugin.yml only builds the C# plugin) - consider adding a CI job. Baseline before DES-0001 and after are identical (22/21), confirming no regression.",
+      "links": [],
+      "comments": [],
+      "created": "2026-07-16T21:36:33Z",
+      "updated": "2026-07-16T21:36:33Z"
+    }
+  ]
+}

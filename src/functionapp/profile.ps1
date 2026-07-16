@@ -11,11 +11,15 @@
 # The notes field is left untouched (humans use it for descriptions).
 
 Import-Module "$PSScriptRoot/Modules/HttpHelpers/HttpHelpers.psm1" -Force -DisableNameChecking
+Import-Module "$PSScriptRoot/Modules/JITHelpers/JITHelpers.psm1"   -Force
 
-if ($env:WEBSITE_HOSTNAME -and $env:AZURETRAY_APP_REGISTRATION_OBJECT_ID -and $env:JIT_SUBSCRIPTION_ID) {
+# Subscription id is derived at runtime (env JIT_SUBSCRIPTION_ID wins, else the
+# platform's WEBSITE_OWNER_NAME / IMDS) so no config app-setting is required.
+$subId = Get-JitSubscriptionId
+
+if ($env:WEBSITE_HOSTNAME -and $env:AZURETRAY_APP_REGISTRATION_OBJECT_ID -and $subId) {
     try {
         $appObjId   = $env:AZURETRAY_APP_REGISTRATION_OBJECT_ID
-        $subId      = $env:JIT_SUBSCRIPTION_ID
         $graphToken = Get-ManagedIdentityToken -Resource 'https://graph.microsoft.com/'
         $headers    = @{ Authorization = "Bearer $graphToken"; 'Content-Type' = 'application/json' }
         $baseUrl    = "https://$($env:WEBSITE_HOSTNAME)"
@@ -67,7 +71,7 @@ elseif ($env:WEBSITE_HOSTNAME) {
     if (-not $env:AZURETRAY_APP_REGISTRATION_OBJECT_ID) {
         Write-Warning "JIT: AZURETRAY_APP_REGISTRATION_OBJECT_ID not set — skipping URL self-register. Re-run Deploy.ps1."
     }
-    elseif (-not $env:JIT_SUBSCRIPTION_ID) {
-        Write-Warning "JIT: JIT_SUBSCRIPTION_ID not set — skipping URL self-register. Re-deploy with the latest azuredeploy.json."
+    elseif (-not $subId) {
+        Write-Warning "JIT: could not determine the function app's subscription id (WEBSITE_OWNER_NAME/IMDS unavailable and JIT_SUBSCRIPTION_ID unset) — skipping URL self-register."
     }
 }

@@ -6,17 +6,25 @@
     Runs all deployment steps in order:
       1. Deploy ARM template (resource group + function app + dependencies)
       2. Zip-deploy the function app code
-      3. Grant the function app's managed identity:
-           a. The custom "JIT-AzAccess Manager" RBAC role on each target subscription
-              (so it can write NSG/SQL/Storage/Key Vault firewall rules)
+      3. Grant the function app's managed identity, and create the requester role,
+         on each target subscription (via Grant-JITPermissions.ps1):
+           a. The custom "JIT-AzAccess Manager" RBAC role assigned to the MI on
+              each target subscription (so it can write NSG/SQL/Storage/Key Vault
+              firewall rules)
+           a2. The custom "JIT Requester" role definition made assignable on each
+               target subscription. Admins assign this role to end users in the
+               subscription they should be able to request JIT access INTO — the
+               function app checks the caller holds it in the target subscription.
            b. Graph Application.ReadWrite.OwnedBy + ownership of the AzureTray
               app registration (so it can self-register the JIT base URL on
               cold start for plugin discovery)
-      4. Create the "JIT Requester" custom RBAC role at subscription scope.
-         Admins assign this role to end users on the function app site to
-         grant them permission to call the JIT API.
-      5. Restart the function app so profile.ps1 self-registers its URL on
+      4. Restart the function app so profile.ps1 self-registers its URL on
          the AzureTray host's app registration.
+
+    The "JIT Requester" role is created/assigned ONLY in the target
+    subscriptions (via Grant-JITPermissions.ps1). It is NOT needed in the host
+    subscription: the Get-JITRules listing endpoint requires only authentication,
+    and callers only ever see their own rules.
 
     Prerequisites:
       - Azure CLI installed and logged in: az login
@@ -39,10 +47,6 @@
     Display name of the AzureTray host's app registration. The function app
     writes its URL as a `jit-baseurl:<sub>=<url>` tag on this app reg on cold
     start so the AzureTray plugin can discover it. (Default: AzureTray)
-
-.PARAMETER JitRequesterRoleName
-    Name of the custom RBAC role used to gate access to the JIT API.
-    (Default: "JIT Requester")
 
 .PARAMETER ParametersFile
     Path to an azuredeploy.parameters.json file. When supplied, individual
@@ -80,7 +84,6 @@ param(
     [string]$AppName                       = 'jitazaccess',
     [string]$ResourceGroupName             = 'rg-jit-azaccess',
     [string]$AzureTrayAppRegistrationName  = 'AzureTray',
-    [string]$JitRequesterRoleName          = 'JIT Requester',
     [string]$ParametersFile,
     [string[]]$TargetSubscriptionIds,
     [switch]$SkipGraphPermission
@@ -88,6 +91,10 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# The function app hardcodes the requester role name 'JIT Requester'; it is no
+# longer configurable, so the deployment must use exactly this name.
+$JitRequesterRoleName = 'JIT Requester'
 
 $scriptDir    = $PSScriptRoot
 $repoRoot     = Split-Path $scriptDir -Parent
@@ -166,7 +173,6 @@ else {
     $deployArgs += "resourceGroupName=$ResourceGroupName"
     $deployArgs += "azureTrayAppRegistrationName=$AzureTrayAppRegistrationName"
     $deployArgs += "azureTrayAppRegistrationObjectId=$azureTrayAppObjId"
-    $deployArgs += "jitRequesterRoleName=$JitRequesterRoleName"
 }
 
 Write-Host "Running: az $($deployArgs -join ' ')"
@@ -371,63 +377,10 @@ else {
     }
 }
 
-# ── Step 4: Create the "JIT Requester" custom RBAC role ──────────────────────
+# ── Step 4: Restart function app so profile.ps1 self-registers the URL ──────
 
 Write-Host ""
-Write-Host "=== Step 4: Create '$JitRequesterRoleName' RBAC role ===" -ForegroundColor Cyan
-
-$existingRoleJson = az role definition list --name $JitRequesterRoleName --output json
-$existingRole     = $existingRoleJson | ConvertFrom-Json | Select-Object -First 1
-
-# Use the ARM-native camelCase shape with nested permissions[]. The
-# PascalCase/flat "legacy" form works on CREATE but trips a KeyError bug
-# inside az role definition update when an Id is provided. This form is
-# exactly what `az role definition list` emits, so it round-trips cleanly.
-$assignableScopes = @("/subscriptions/$SubscriptionId")
-if ($existingRole) {
-    # Preserve existing AssignableScopes so a re-run from a different sub
-    # doesn't strip scopes we previously assigned the role on.
-    $existingScopes  = @($existingRole.assignableScopes)
-    $assignableScopes = @(($existingScopes + $assignableScopes) | Sort-Object -Unique)
-}
-
-$roleDef = [ordered]@{
-    roleName         = $JitRequesterRoleName
-    description      = "Permits the holder to call the JIT-AzAccess function app. Assigned to end users on the function app site."
-    assignableScopes = $assignableScopes
-    permissions      = @(
-        [ordered]@{
-            actions        = @()
-            notActions     = @()
-            dataActions    = @()
-            notDataActions = @()
-        }
-    )
-}
-
-# az role definition update pops 'Id' or 'id' from the body to identify the
-# role; without it, az logs "Role 'id' is missing" and does a lookup-by-name.
-# .id is the full /subscriptions/.../roleDefinitions/<guid> path (.name on the
-# returned object is the GUID alone — az wants the full path here).
-if ($existingRole) { $roleDef['id'] = $existingRole.id }
-
-$tempRolePath = Join-Path $env:TEMP 'jit-requester-role.json'
-$roleDef | ConvertTo-Json -Depth 10 | Set-Content -Path $tempRolePath -Encoding UTF8
-
-if ($existingRole) {
-    Write-Host "  Existing '$JitRequesterRoleName' role found — updating (id $($existingRole.name))."
-    az role definition update --role-definition "@$tempRolePath" --output none --only-show-errors
-}
-else {
-    Write-Host "  Creating '$JitRequesterRoleName' custom role at subscription scope."
-    az role definition create --role-definition "@$tempRolePath" --output none --only-show-errors
-}
-Write-Host "  Role definition ready." -ForegroundColor Green
-
-# ── Step 5: Restart function app so profile.ps1 self-registers the URL ──────
-
-Write-Host ""
-Write-Host "=== Step 5: Restart function app (triggers cold-start URL self-register) ===" -ForegroundColor Cyan
+Write-Host "=== Step 4: Restart function app (triggers cold-start URL self-register) ===" -ForegroundColor Cyan
 
 if (-not $azureTrayAppObjId) {
     Write-Host "  Skipped: AzureTray app reg object ID unknown — profile.ps1 would no-op."
@@ -472,9 +425,12 @@ if (-not $azureTrayAppObjId) {
     Write-Host "  then re-run Deploy.ps1 to wire up URL self-register." -ForegroundColor Yellow
 }
 Write-Host ""
-Write-Host "To grant users access, assign the '$JitRequesterRoleName' role on:"
-Write-Host "  $siteResourceId"
-Write-Host "or on a parent scope (resource group / subscription)."
+Write-Host "To grant users access, assign the '$JitRequesterRoleName' role to them in the"
+Write-Host "subscription(s) they should be able to request JIT access into, e.g.:"
+Write-Host "  /subscriptions/<targetSubscriptionId>"
+Write-Host "The function app checks the caller holds the role in the target subscription"
+Write-Host "named in each request. Listing your own rules (Get-JITRules) needs only"
+Write-Host "authentication — no role assignment is required."
 Write-Host ""
 Write-Host "Summary of created resources (resource group: $rgName):"
 Write-Host "  Storage account:  st$AppName"

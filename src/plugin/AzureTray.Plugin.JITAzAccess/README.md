@@ -23,14 +23,17 @@ Supported targets:
   timers and one-click Revoke.
 - **Post-grant ARM verification** — independently confirms the rule was written
   to the resource via ARM.
-- **Zero plugin configuration** — the function-app URL is auto-discovered from
-  the AzureTray host's app-registration tags via Microsoft Graph.
+- **Zero plugin configuration** — the function-app URL is self-discovered by
+  scanning the tags of every app registration you can read via Microsoft Graph;
+  no app-registration name or tenant list needs to be entered.
 
 ## How it works
 
 1. You sign in to your tenant in AzureTray.
-2. The plugin reads the JIT function-app URL from the AzureTray app registration's
-   `jit-baseurl:<subscriptionId>=<url>` tags.
+2. The plugin scans the app registrations you can read via Graph and collects the
+   JIT function-app URL from whichever one carries the
+   `jit-baseurl:<subscriptionId>=<url>` tags (normally the "AzureTray" app
+   registration, but the name is not assumed).
 3. Requests are sent to the function app with a plain **ARM-audience** bearer
    token (`https://management.azure.com/`). Authorization is gated on the caller
    holding the custom **"JIT Requester"** Azure RBAC role on the function app

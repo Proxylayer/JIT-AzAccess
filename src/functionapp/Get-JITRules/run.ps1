@@ -3,8 +3,10 @@
 # HTTP GET — Returns active (non-expired) JIT rules from Table Storage that the
 # caller personally requested.
 #
-# Authorization: Bearer <AAD ARM token>. Caller must hold the "JIT Requester"
-# RBAC role on the function app site resource.
+# Authorization: Bearer <AAD ARM token>. Any authenticated caller may list their
+# own active rules — no RBAC role is required. Callers only ever see the rules
+# they personally requested (filtered below), so no additional authorization is
+# needed.
 
 using namespace System.Net
 
@@ -13,10 +15,8 @@ param($Request, $TriggerMetadata)
 Import-Module "$PSScriptRoot/../Modules/HttpHelpers/HttpHelpers.psm1" -Force -DisableNameChecking
 Import-Module "$PSScriptRoot/../Modules/JITHelpers/JITHelpers.psm1"  -Force
 
-$tenantId             = $env:AZURE_TENANT_ID
-$siteResourceId       = $env:JIT_SITE_RESOURCE_ID
-$jitRequesterRoleName = if ($env:JIT_REQUESTER_ROLE_NAME) { $env:JIT_REQUESTER_ROLE_NAME } else { 'JIT Requester' }
-$tableName            = if ($env:JIT_TABLE_NAME)          { $env:JIT_TABLE_NAME }          else { 'JITRules' }
+$tenantId  = Get-JitTenantId
+$tableName = if ($env:JIT_TABLE_NAME) { $env:JIT_TABLE_NAME } else { 'JITRules' }
 
 function Write-JsonResponse {
     param([HttpStatusCode]$Status, [object]$Body, [hashtable]$ExtraHeaders = @{})
@@ -29,7 +29,7 @@ function Write-JsonResponse {
     })
 }
 
-#region ── 1. Validate token + authz ──────────────────────────────────────────
+#region ── 1. Validate token + caller identity ────────────────────────────────
 
 $authHeader = $Request.Headers['Authorization']
 if (-not $authHeader -or -not $authHeader.ToString().StartsWith('Bearer ')) {
@@ -45,23 +45,9 @@ if (-not $claims) {
     return
 }
 
-if (-not $siteResourceId) {
-    Write-JsonResponse -Status InternalServerError -Body @{ error = 'Function app is misconfigured: JIT_SITE_RESOURCE_ID is not set.' }
-    return
-}
-
 $callerObjectId = $claims.oid
 if (-not $callerObjectId) {
     Write-JsonResponse -Status Forbidden -Body @{ error = 'Token has no oid claim.' }
-    return
-}
-
-if (-not (Test-CallerHasJitRequesterRole -CallerObjectId $callerObjectId `
-            -SiteResourceId $siteResourceId -RoleDefinitionName $jitRequesterRoleName)) {
-    Write-JsonResponse -Status Forbidden -Body @{
-        error        = "Caller does not hold the '$jitRequesterRoleName' RBAC role on this function app."
-        requiredRole = $jitRequesterRoleName
-    }
     return
 }
 

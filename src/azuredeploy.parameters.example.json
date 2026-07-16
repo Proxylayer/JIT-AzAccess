@@ -17,9 +17,6 @@
         "azureTrayAppRegistrationObjectId": {
             "value": "<object ID of the AzureTray app registration — fill in or leave blank to let Deploy.ps1 resolve it>"
         },
-        "jitRequesterRoleName": {
-            "value": "JIT Requester"
-        },
         "allowedDurationsHours": {
             "value": "1,4,8"
         },
