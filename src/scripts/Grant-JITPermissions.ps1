@@ -1,7 +1,9 @@
 <#
 .SYNOPSIS
     Creates or updates a custom "JIT-AzAccess Manager" RBAC role and assigns it
-    to the JIT function app's managed identity on one or more target subscriptions.
+    to the JIT function app's managed identity on one or more target subscriptions,
+    and creates the "JIT Requester" custom role definition (assignable in each of
+    those subscriptions) that end users must hold to call the JIT API.
 
 .PARAMETER TargetSubscriptionIds
     One or more subscription IDs where the function app should manage resources.
@@ -221,8 +223,100 @@ foreach ($subId in $TargetSubscriptionIds) {
     }
 }
 
+# Create the "JIT Requester" custom role definition on each target subscription
+
+# This is the role end users must hold — in the subscription they are requesting
+# access INTO — to call the JIT API. The function app hardcodes the role name
+# 'JIT Requester', so it must not be renamed here. We create/update the
+# DEFINITION only (so it is assignable in each target subscription); assigning
+# specific users to it is an operator action (see README), not something this
+# script performs. The role grants no Azure control-plane actions by itself —
+# it is a pure access marker the function app checks for.
+
+$requesterRoleName        = 'JIT Requester'
+$requesterRoleDescription = 'Permits the holder to request JIT access in this subscription via the JIT-AzAccess function app. Assigned to end users; grants no Azure control-plane actions by itself.'
+
+Write-Host ""
+Write-Host "Creating or updating role definition '$requesterRoleName'..."
+
+$existingRequesterJson = az role definition list `
+    --name $requesterRoleName `
+    --output json
+
+$existingRequester = $null
+
+if ($existingRequesterJson -and $existingRequesterJson -ne '[]') {
+    $existingRequester = $existingRequesterJson | ConvertFrom-Json | Select-Object -First 1
+}
+
+$requesterScopes = @()
+
+foreach ($subId in $TargetSubscriptionIds) {
+    $requesterScopes += "/subscriptions/$subId"
+}
+
+if ($existingRequester) {
+
+    Write-Host "  Existing role found (id $($existingRequester.name)). Updating..."
+
+    # Merge new scopes with existing ones so re-running with a different subset
+    # of target subs doesn't drop subscriptions the role is already assignable on.
+    $existingReqScopes = @($existingRequester.assignableScopes)
+    $requesterScopes   = @(($existingReqScopes + $requesterScopes) | Sort-Object -Unique)
+
+    if ($existingReqScopes.Count -ne $requesterScopes.Count) {
+        $addedReq = $requesterScopes | Where-Object { $_ -notin $existingReqScopes }
+        Write-Host "  Adding $($addedReq.Count) new assignable scope(s): $($addedReq -join ', ')"
+    }
+}
+
+$requesterRoleDefinition = [ordered]@{
+    roleName         = $requesterRoleName
+    description      = $requesterRoleDescription
+    assignableScopes = $requesterScopes
+    permissions      = @(
+        [ordered]@{
+            actions        = @()
+            notActions     = @()
+            dataActions    = @()
+            notDataActions = @()
+        }
+    )
+}
+
+if ($existingRequester) { $requesterRoleDefinition['id'] = $existingRequester.id }
+
+$tempRequesterPath = Join-Path $env:TEMP "jit-requester-role.json"
+
+$requesterRoleDefinition |
+    ConvertTo-Json -Depth 20 |
+    Set-Content -Path $tempRequesterPath -Encoding UTF8
+
+if ($existingRequester) {
+    az role definition update `
+        --role-definition "@$tempRequesterPath" `
+        --output none `
+        --only-show-errors
+
+    Write-Host "  Role updated."
+}
+else {
+    Write-Host "  Role does not exist. Creating..."
+
+    az role definition create `
+        --role-definition "@$tempRequesterPath" `
+        --output none `
+        --only-show-errors
+
+    Write-Host "  Role created."
+}
+
 Write-Host ""
 Write-Host (
     "Done. The function app can now manage JIT IP rules on: {0}" -f
     ($TargetSubscriptionIds -join ', ')
+)
+Write-Host (
+    "The '{0}' role is now assignable to end users on: {1}" -f
+    $requesterRoleName, ($TargetSubscriptionIds -join ', ')
 )

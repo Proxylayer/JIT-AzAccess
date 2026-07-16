@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
@@ -15,22 +16,19 @@ namespace AzureTray.Plugin.JITAzAccess;
 ///
 /// Designed to "just work" once an AzureTray tenant is signed in — no separate
 /// app registration and no manual URLs. Optional settings (default/offered
-/// grant durations, a tenant allow-list, and the host app-registration name)
-/// are exposed via <see cref="IPluginConfigurable"/>:
+/// grant durations) are exposed via <see cref="IPluginConfigurable"/>:
 ///
 ///   • Token acquisition piggybacks on the host's ARM token (ArmScope).
-///   • The function app URL is discovered by reading the host's app
-///     registration notes (the JIT function app self-registers it via
-///     profile.ps1 on cold start).
+///   • The function app URL is self-discovered by scanning the tags of every
+///     app registration the signed-in user can read via Graph (the JIT function
+///     app self-registers its URL as a tag via profile.ps1 on cold start).
 ///   • Authorization at the function app is gated on the caller holding a
 ///     custom "JIT Requester" RBAC role on the function app site resource.
 ///
-/// Tray menu under a single "JIT Access" parent:
-///   • My Active Rules — server-side list with countdown timers + Revoke.
-///   • Browse Resources — the user's own ARM resources, discovered client-side.
-///   • Post-grant ARM verification — independently confirms the rule was
-///     written to the resource via ARM.
-///   • Justification prompts — shown before granting when target requires it.
+/// Multi-tenant: every ready tenant the host surfaces (already filtered to the
+/// tenants the plugin is enabled for) is tracked independently, with its own
+/// discovered URLs, targets, and active rules. The tray menu groups resources
+/// under a per-tenant header (LAPS/PIM style) and offers a per-tenant Refresh.
 /// </summary>
 public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadgeProvider, IPluginTestProvider, IPluginConfigurable, IDisposable
 {
@@ -68,7 +66,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
     /// <summary>
     /// OAuth scopes the host must hold before this plugin makes network calls.
     ///   ARM   — used by JitClient (talks to the JIT function app with an ARM token).
-    ///   Graph — used by JitUrlDiscovery (reads the AzureTray app reg tags).
+    ///   Graph — used by JitUrlDiscovery (reads app registration tags to self-discover the JIT URL).
     /// </summary>
     public IReadOnlyList<PluginPermissionRequirement> RequiredPermissions =>
         new[]
@@ -83,18 +81,18 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                 Api:         PermissionApi.MicrosoftGraph,
                 ScopeId:     "Application.Read.All",
                 ScopeName:   "Microsoft Graph Application.Read.All",
-                DisplayName: "Read AzureTray app registration tags (auto-discover JIT URL)"),
+                DisplayName: "Read app registration tags (auto-discover JIT URL)"),
         };
 
     // ── IBadgeProvider ────────────────────────────────────────────────────────
 
-    public int Count => _serverRules.Count;
+    public int Count => SnapshotAllRules().Count;
 
     public BadgeState State
     {
         get
         {
-            var rules = _serverRules;   // snapshot the reference (poll swaps it)
+            var rules = SnapshotAllRules();
             if (rules.Count == 0) return BadgeState.Normal;
             var expiresSoon = rules.Any(r => (r.ExpiresUtc - DateTime.UtcNow).TotalMinutes < 30);
             return expiresSoon ? BadgeState.Pending : BadgeState.Normal;
@@ -105,7 +103,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
     {
         get
         {
-            var rules = _serverRules;   // snapshot the reference
+            var rules = SnapshotAllRules();
             var count = rules.Count;
             if (count == 0) return null;
             var expiring = rules.Count(r => (r.ExpiresUtc - DateTime.UtcNow).TotalMinutes < 30);
@@ -115,102 +113,24 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         }
     }
 
-    // ── IPluginTestProvider ───────────────────────────────────────────────────
-
-    public IReadOnlyList<PluginTest> Tests => new[]
+    // Flat snapshot of active rules across every tracked tenant.
+    private List<JitServerRule> SnapshotAllRules()
     {
-        new PluginTest(
-            Name:        "Discover JIT function app URL",
-            Description: "Reads the AzureTray app registration tags via Graph to confirm the JIT URL is discoverable.",
-            Run:         TestDiscoveryAsync),
-
-        new PluginTest(
-            Name:        "JIT Function App connectivity",
-            Description: "Probes Get-JITRules. Any HTTP response (including 403) confirms the URL is reachable.",
-            Run:         TestConnectivityAsync),
-    };
-
-    private async Task<PluginTestResult> TestDiscoveryAsync(CancellationToken ct)
-    {
-        if (_discovery is null || string.IsNullOrWhiteSpace(_tenantId))
-            return PluginTestResult.Fail("Plugin not initialised or no active tenant.");
-
-        _context?.Logger.LogInformation("JIT: discovery test invoked for tenant {TenantId}.", _tenantId);
-
-        var result = await _discovery.DiscoverAsync(_tenantId, AzureTrayAppRegistrationName, ct).ConfigureAwait(false);
-        if (result.IsEmpty)
-        {
-            return PluginTestResult.Fail(
-                "No JIT function app URL found in AzureTray app reg tags. Ensure the function app has been deployed and started at least once.");
-        }
-
-        var urls = result.AllUrls.ToList();
-        return PluginTestResult.Pass(
-            $"Discovered {urls.Count} URL(s): {string.Join(", ", urls)}");
-    }
-
-    private async Task<PluginTestResult> TestConnectivityAsync(CancellationToken ct)
-    {
-        if (_client is null || string.IsNullOrWhiteSpace(_tenantId) || _urls.IsEmpty)
-            return PluginTestResult.Fail("Plugin not initialised, no active tenant, or URL not yet discovered.");
-
-        _context?.Logger.LogInformation(
-            "JIT: connectivity test invoked (tenant={TenantId}, urls={Urls}).",
-            _tenantId, string.Join(", ", _urls.AllUrls));
-
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(TimeSpan.FromSeconds(10));
-
-        // Probe Get-JITRules on each function-app URL — any HTTP response
-        // (including 403) means the host is reachable and your token was
-        // accepted by the runtime. Targets aren't fetched from the function
-        // app anymore (they come from ARM Resource Graph directly).
-        var report  = new List<string>();
-        var anyFail = false;
-        foreach (var url in _urls.AllUrls)
-        {
-            try
-            {
-                var result = await _client.GetActiveRulesAsync(_tenantId, url, timeoutCts.Token)
-                    .ConfigureAwait(false);
-                report.Add($"{url}: {result.Rules.Count} active rule(s)");
-            }
-            catch (JitHttpException ex)
-            {
-                // Any HTTP status came back — the host is up, even if it
-                // refused us. That's a successful connectivity result.
-                report.Add($"{url}: HTTP {ex.StatusCode}");
-            }
-            catch (OperationCanceledException)
-            {
-                report.Add($"{url}: timed out");
-                anyFail = true;
-            }
-            catch (Exception ex)
-            {
-                report.Add($"{url}: {ex.Message}");
-                anyFail = true;
-            }
-        }
-
-        var summary = string.Join("; ", report);
-        return anyFail ? PluginTestResult.Fail(summary) : PluginTestResult.Pass(summary);
+        var all = new List<JitServerRule>();
+        foreach (var state in _tenants.Values)
+            lock (state.Lock) all.AddRange(state.ServerRules);
+        return all;
     }
 
     // ── IPluginConfigurable ───────────────────────────────────────────────────
 
     private const string DefaultDurationOptionKey  = "defaultDurationHours";
     private const string AllowedDurationsOptionKey = "allowedDurations";
-    private const string AllowedTenantsOptionKey   = "allowedTenantIds";
-    private const string AppRegistrationOptionKey  = "appRegistrationName";
 
     // Defaults applied before the user changes anything (and the fallback when
     // a stored value is blank or malformed).
     private const int    DefaultDurationHoursValue = 4;
     private const string DefaultAllowedDurations   = "1,2,4,8";
-    // displayName of the AzureTray host's per-tenant app registration whose
-    // tags carry the jit-baseurl:<sub>=<url> entries. Matches the host default.
-    private const string DefaultAppRegistrationName = "AzureTray";
 
     public IReadOnlyList<PluginOption> Options { get; } = new[]
     {
@@ -226,18 +146,6 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
             Kind:         PluginOptionKind.Text,
             Description:  "Comma-separated durations offered in the grant prompt (e.g. 1,2,4,8). Used when a resource doesn't specify its own.",
             DefaultValue: DefaultAllowedDurations),
-        new PluginOption(
-            Key:          AllowedTenantsOptionKey,
-            Label:        "Limit to tenant IDs",
-            Kind:         PluginOptionKind.Text,
-            Description:  "Comma-separated tenant (directory) GUIDs this plugin may operate on. Leave blank to allow every signed-in tenant. (The host's per-tenant enable grid still applies on top of this.)",
-            DefaultValue: ""),
-        new PluginOption(
-            Key:          AppRegistrationOptionKey,
-            Label:        "AzureTray app registration name",
-            Kind:         PluginOptionKind.Text,
-            Description:  "Display name of the host app registration whose tags carry the JIT function-app URLs. Change only if your AzureTray app registration uses a non-default name.",
-            DefaultValue: DefaultAppRegistrationName),
     };
 
     // Seeded with every option's default so the keys exist before the host
@@ -247,8 +155,6 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
     {
         [DefaultDurationOptionKey]  = DefaultDurationHoursValue,
         [AllowedDurationsOptionKey] = DefaultAllowedDurations,
-        [AllowedTenantsOptionKey]   = string.Empty,
-        [AppRegistrationOptionKey]  = DefaultAppRegistrationName,
     };
 
     public IReadOnlyDictionary<string, object?> Values => _optionValues;
@@ -260,12 +166,9 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         _optionValues[key] = value;
         ValuesChanged?.Invoke();
 
-        // React to the changes that have side effects beyond the next read:
-        // a tenant allow-list change can orphan the active tenant, and an
-        // app-registration rename invalidates the discovered URLs.
-        if (key is AllowedTenantsOptionKey or AppRegistrationOptionKey)
-            ApplyTenantPolicy(key);
-
+        // The remaining options (default/offered durations) are read fresh on
+        // every grant prompt, so a change has no side effects beyond the next
+        // menu build.
         MenuChanged?.Invoke();
     }
 
@@ -284,66 +187,15 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
     private int[] OfferedDurations =>
         ParseDurations(_optionValues.GetValueOrDefault(AllowedDurationsOptionKey) as string);
 
-    // displayName of the AzureTray host app registration used for URL discovery.
-    private string AzureTrayAppRegistrationName
-    {
-        get
-        {
-            var s = _optionValues.GetValueOrDefault(AppRegistrationOptionKey) as string;
-            return string.IsNullOrWhiteSpace(s) ? DefaultAppRegistrationName : s.Trim();
-        }
-    }
-
-    // Tenant GUIDs the plugin may bind to. Empty set = no restriction.
-    private HashSet<string> AllowedTenantIds =>
-        ParseTenantIds(_optionValues.GetValueOrDefault(AllowedTenantsOptionKey) as string);
-
-    private bool IsTenantAllowed(string tenantId)
-    {
-        var allowed = AllowedTenantIds;
-        return allowed.Count == 0 || allowed.Contains(tenantId);
-    }
-
-    // Re-evaluates which tenant the plugin is bound to after an options change.
-    // Drops the active tenant if the allow-list now excludes it, then binds to
-    // the first allowed ready tenant; re-runs discovery if the app reg changed.
-    private void ApplyTenantPolicy(string changedKey)
-    {
-        var context = _context;
-        if (context is null) return;   // options seeded before init — nothing to do yet
-
-        if (!string.IsNullOrWhiteSpace(_tenantId) && !IsTenantAllowed(_tenantId))
-        {
-            context.Logger.LogInformation(
-                "JIT: active tenant {TenantId} excluded by the allow-list; unbinding.", _tenantId);
-            ClearActiveTenant();
-        }
-
-        if (string.IsNullOrWhiteSpace(_tenantId))
-        {
-            var pick = context.ReadyTenants.FirstOrDefault(t => IsTenantAllowed(t.TenantId));
-            if (pick is not null)
-                _ = ApplyTenantAndDiscoverAsync(pick, CancellationToken.None);
-        }
-        else if (changedKey == AppRegistrationOptionKey)
-        {
-            context.Logger.LogInformation(
-                "JIT: app registration name changed to '{Name}'; re-running URL discovery.",
-                AzureTrayAppRegistrationName);
-            _urls = JitUrlDiscoveryResult.Empty;
-            _ = RetryDiscoveryAsync();
-        }
-    }
-
     private static bool TryToInt(object? value, out int result)
     {
         switch (value)
         {
-            case int i:                                       result = i;                     return true;
-            case long l:                                      result = (int)l;                return true;
-            case double d:                                    result = (int)Math.Round(d);    return true;
-            case string s when int.TryParse(s, out var p):    result = p;                     return true;
-            default:                                          result = 0;                     return false;
+            case int i:                                    result = i;                  return true;
+            case long l:                                   result = (int)l;             return true;
+            case double d:                                 result = (int)Math.Round(d); return true;
+            case string s when int.TryParse(s, out var p): result = p;                  return true;
+            default:                                       result = 0;                  return false;
         }
     }
 
@@ -360,19 +212,101 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         return parsed.Length > 0 ? parsed : new[] { 1, 2, 4, 8 };
     }
 
-    private static HashSet<string> ParseTenantIds(string? csv)
+    // ── IPluginTestProvider ───────────────────────────────────────────────────
+
+    public IReadOnlyList<PluginTest> Tests => new[]
     {
-        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        if (!string.IsNullOrWhiteSpace(csv))
+        new PluginTest(
+            Name:        "Discover JIT function app URL",
+            Description: "Scans readable app registration tags via Graph for each tracked tenant.",
+            Run:         TestDiscoveryAsync),
+
+        new PluginTest(
+            Name:        "JIT Function App connectivity",
+            Description: "Probes Get-JITRules on each discovered URL. Any HTTP response (including 403) confirms reachability.",
+            Run:         TestConnectivityAsync),
+    };
+
+    private async Task<PluginTestResult> TestDiscoveryAsync(CancellationToken ct)
+    {
+        if (_discovery is null) return PluginTestResult.Fail("Plugin not initialised.");
+
+        var states = _tenants.Values.ToArray();
+        if (states.Length == 0) return PluginTestResult.Fail("No active tenant.");
+
+        var lines    = new List<string>();
+        var anyFound = false;
+        foreach (var state in states)
         {
-            foreach (var t in csv.Split(
-                         new[] { ',', ';', ' ', '\t', '\r', '\n' },
-                         StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            var result = await _discovery.DiscoverAsync(state.Tenant.TenantId, ct)
+                .ConfigureAwait(false);
+            if (!result.IsEmpty)
             {
-                set.Add(t);
+                anyFound = true;
+                lines.Add($"{state.Tenant.DisplayName}: {result.AllUrls.Count()} URL(s)");
+            }
+            else
+            {
+                lines.Add($"{state.Tenant.DisplayName}: none");
             }
         }
-        return set;
+
+        var summary = string.Join("; ", lines);
+        return anyFound ? PluginTestResult.Pass(summary) : PluginTestResult.Fail(summary);
+    }
+
+    private async Task<PluginTestResult> TestConnectivityAsync(CancellationToken ct)
+    {
+        if (_client is null) return PluginTestResult.Fail("Plugin not initialised.");
+
+        var states = _tenants.Values.ToArray();
+        if (states.Length == 0) return PluginTestResult.Fail("No active tenant.");
+
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(TimeSpan.FromSeconds(10));
+
+        var report  = new List<string>();
+        var anyFail = false;
+        foreach (var state in states)
+        {
+            JitUrlDiscoveryResult urls;
+            lock (state.Lock) urls = state.Urls;
+            if (urls.IsEmpty)
+            {
+                report.Add($"{state.Tenant.DisplayName}: no URL discovered");
+                anyFail = true;
+                continue;
+            }
+
+            foreach (var url in urls.AllUrls)
+            {
+                try
+                {
+                    var result = await _client.GetActiveRulesAsync(state.Tenant.TenantId, url, timeoutCts.Token)
+                        .ConfigureAwait(false);
+                    report.Add($"{url}: {result.Rules.Count} active rule(s)");
+                }
+                catch (JitHttpException ex)
+                {
+                    // Any HTTP status came back — the host is up, even if it
+                    // refused us. That's a successful connectivity result.
+                    report.Add($"{url}: HTTP {ex.StatusCode}");
+                }
+                catch (OperationCanceledException)
+                {
+                    report.Add($"{url}: timed out");
+                    anyFail = true;
+                }
+                catch (Exception ex)
+                {
+                    report.Add($"{url}: {ex.Message}");
+                    anyFail = true;
+                }
+            }
+        }
+
+        var summary = string.Join("; ", report);
+        return anyFail ? PluginTestResult.Fail(summary) : PluginTestResult.Pass(summary);
     }
 
     // ── Internal state ────────────────────────────────────────────────────────
@@ -385,44 +319,24 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
     private ResourceDiscovery? _resources;
     private FavoritesStore?    _favorites;
 
-    private string _tenantId = string.Empty;
+    // One state object per tracked tenant. A single poll timer fans out across
+    // all of them; each carries its own lock, discovered URLs, targets, rules,
+    // and auth/suspended flags.
+    private readonly ConcurrentDictionary<string, TenantState> _tenants =
+        new(StringComparer.OrdinalIgnoreCase);
 
-    // All discovered function-app URLs for this tenant. Per-subscription map
-    // plus the legacy single URL fallback.
-    private JitUrlDiscoveryResult _urls = JitUrlDiscoveryResult.Empty;
-
-    private List<JitTarget>     _targets     = new();
-    private List<JitServerRule> _serverRules = new();
-    private DateTime            _targetsAt   = DateTime.MinValue;
-
-    // The caller's current public IP as the function app sees it (from the
-    // Get-JITRules X-JIT-Caller-IP header). Used to flag resources whose
-    // firewall already permanently allows this IP so we don't re-request.
-    private volatile string?    _callerIp;
-
-    // Re-entrancy guard for PollAsync. The 90s timer plus the many manual
-    // `_ = PollAsync()` triggers (refresh, post-grant, post-revoke, retry) could
-    // otherwise overlap and race the shared _serverRules/_targets/_*At state.
-    private int _polling;
-    private DateTime            _rulesAt     = DateTime.MinValue;
-
+    // Busy keys are tenant-scoped: "{tenantId}|{type}|{sub}|{rg}|{name}|{hours}".
     private readonly object          _busyLock = new();
     private readonly HashSet<string> _busyKeys = new(StringComparer.Ordinal);
 
     private Timer? _pollTimer;
-    private bool   _pollSuspended;
 
-    // Authentication/authorization state — set when polls return 401/403,
-    // cleared on the next successful response. Used to (a) surface a status
-    // line in the menu, (b) push a one-shot toast so the user notices, and
-    // (c) suppress repeat toasts until the status code changes.
-    private bool _authBlocked;
-    private int  _authBlockedStatus;
     private static readonly TimeSpan TargetsTtl = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan RulesTtl   = TimeSpan.FromSeconds(90);
 
-    private bool IsReady =>
-        !string.IsNullOrWhiteSpace(_tenantId) && !_urls.IsEmpty;
+    // Display string mentioned in the menu when auth is blocked. The actual
+    // role name comes from the server; this is purely a hint to the user.
+    private const string JitRequesterRoleNameDefault = "JIT Requester";
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -441,45 +355,18 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         context.TenantReady   += OnTenantReady;
         context.TenantRemoved += OnTenantRemoved;
 
-        // Auto-select the first already-signed-in tenant the allow-list permits.
-        // (At init the allow-list is still at its default — empty = all allowed.
-        // The host hydrates the stored value right after this via SetValue, which
-        // re-applies the policy and unbinds the tenant if it's now excluded.)
-        var initial = context.ReadyTenants.FirstOrDefault(t => IsTenantAllowed(t.TenantId));
-        if (initial is not null)
-            _ = ApplyTenantAndDiscoverAsync(initial, cancellationToken);
+        // Track every already-signed-in tenant the host surfaces. The host has
+        // already filtered ReadyTenants to the tenants this plugin is enabled
+        // for, so there's nothing more to gate on here.
+        foreach (var tenant in context.ReadyTenants)
+            OnTenantReady(tenant);
 
         return Task.CompletedTask;
     }
 
-    private async Task ApplyTenantAndDiscoverAsync(PluginTenant tenant, CancellationToken ct)
-    {
-        var context   = _context;
-        var discovery = _discovery;
-        if (context is null || discovery is null) return;
-
-        _tenantId = tenant.TenantId;
-        context.Logger.LogInformation(
-            "JIT: using tenant {TenantId} ({DisplayName}).", tenant.TenantId, tenant.DisplayName);
-
-        _urls = await discovery.DiscoverAsync(_tenantId, AzureTrayAppRegistrationName, ct)
-            .ConfigureAwait(false);
-
-        if (_urls.IsEmpty)
-        {
-            context.Logger.LogWarning(
-                "JIT: could not discover any function app URL — plugin will display 'not deployed' state.");
-            MenuChanged?.Invoke();
-            return;
-        }
-
-        StartPollTimer();
-        MenuChanged?.Invoke();
-    }
-
     private void StartPollTimer()
     {
-        _pollTimer ??= new Timer(_ => _ = PollAsync(), null,
+        _pollTimer ??= new Timer(_ => _ = PollAllAsync(), null,
             TimeSpan.Zero, TimeSpan.FromSeconds(90));
     }
 
@@ -499,6 +386,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
             _context.TenantRemoved -= OnTenantRemoved;
         }
 
+        _tenants.Clear();
         _context = null;
         _client  = null;
     }
@@ -518,148 +406,266 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         }
     }
 
-    // ── Background polling ────────────────────────────────────────────────────
+    // ── Tenant lifecycle ──────────────────────────────────────────────────────
 
-    private async Task PollAsync()
+    private void OnTenantReady(PluginTenant tenant)
     {
-        var context = _context;
-        var client  = _client;
-        if (context is null || client is null || !IsReady || _pollSuspended) return;
+        var added = false;
+        var state = _tenants.GetOrAdd(tenant.TenantId, _ =>
+        {
+            added = true;
+            return new TenantState(tenant);
+        });
 
-        // Skip if a poll is already running — overlapping runs race the shared
-        // _serverRules/_targets/_*At state (last-writer-wins). Cheap CAS guard.
-        if (Interlocked.Exchange(ref _polling, 1) == 1) return;
-        try
+        // Only kick off discovery on first sight of the tenant; a re-fire while
+        // the tenant is already tracked is a no-op (the poll timer keeps it fresh).
+        if (added)
         {
-            await PollCoreAsync(context, client).ConfigureAwait(false);
-        }
-        finally
-        {
-            Interlocked.Exchange(ref _polling, 0);
+            _context?.Logger.LogInformation(
+                "JIT: tracking tenant {TenantId} ({DisplayName}).", tenant.TenantId, tenant.DisplayName);
+            _ = DiscoverAndPollAsync(state);
         }
     }
 
-    private async Task PollCoreAsync(IPluginContext context, JitClient client)
+    private void OnTenantRemoved(string tenantId)
     {
-        var now     = DateTime.UtcNow;
-        var changed = false;
-        var urls    = _urls.AllUrls.ToList();
-
-        if (now - _targetsAt > TargetsTtl && _resources is not null)
-        {
-            // Targets are discovered client-side from ARM Resource Graph using
-            // the user's own token. One call returns every NSG / SQL server /
-            // storage account / Key Vault the user has ARM read access to
-            // across all visible subscriptions — no need for the function app
-            // to serve a curated manifest.
-            try
-            {
-                var targets = await _resources
-                    .DiscoverAsync(_tenantId, CancellationToken.None)
-                    .ConfigureAwait(false);
-                _targets   = targets;
-                _targetsAt = now;
-                changed    = true;
-                context.Logger.LogDebug("JIT: discovered {Count} target(s) via Resource Graph.", targets.Count);
-            }
-            catch (ArgumentException ex) when (IsTenantNotEnabled(ex))
-            {
-                SuspendForTenantMismatch("resource discovery");
-                return;
-            }
-            catch (Exception ex)
-            {
-                context.Logger.LogWarning(ex, "JIT: resource discovery failed.");
-            }
-        }
-
-        if (now - _rulesAt > RulesTtl)
-        {
-            var allRules = new List<JitServerRule>();
-            var anySucceeded = false;
-
-            foreach (var url in urls)
-            {
-                try
-                {
-                    var result = await client
-                        .GetActiveRulesAsync(_tenantId, url, CancellationToken.None)
-                        .ConfigureAwait(false);
-                    // Tag each rule with the URL it came from so Revoke can route correctly.
-                    foreach (var rule in result.Rules)
-                        allRules.Add(rule with { SourceFunctionAppUrl = url });
-                    // Cache the caller IP the function reported so BuildTargetItem
-                    // can flag resources whose firewall already allows it.
-                    if (!string.IsNullOrEmpty(result.CallerIp))
-                        _callerIp = result.CallerIp;
-                    anySucceeded = true;
-                    context.Logger.LogDebug("JIT: refreshed {Count} active rule(s) from {Url}.", result.Rules.Count, url);
-                }
-                catch (ArgumentException ex) when (IsTenantNotEnabled(ex))
-                {
-                    SuspendForTenantMismatch("rules refresh");
-                    return;
-                }
-                catch (JitHttpException ex) when (ex.StatusCode is 401 or 403)
-                {
-                    NotifyAuthBlocked(ex, url);
-                }
-                catch (Exception ex)
-                {
-                    context.Logger.LogWarning(ex, "JIT: rules refresh failed for {Url}.", url);
-                }
-            }
-
-            if (anySucceeded)
-            {
-                _serverRules = allRules;
-                _rulesAt     = now;
-                changed      = true;
-                ClearAuthBlocked();
-            }
-        }
-
-        if (changed)
+        if (_tenants.TryRemove(tenantId, out _))
         {
             BadgeChanged?.Invoke();
             MenuChanged?.Invoke();
+            _context?.Logger.LogWarning(
+                "JIT: tenant {TenantId} signed out — untracked.", tenantId);
+        }
+    }
+
+    // Discover this tenant's function-app URLs, then start polling. Safe to call
+    // repeatedly (e.g. on a manual discovery retry).
+    private async Task DiscoverAndPollAsync(TenantState state)
+    {
+        var context   = _context;
+        var discovery = _discovery;
+        if (context is null || discovery is null) return;
+
+        var tenantId = state.Tenant.TenantId;
+        context.Logger.LogInformation(
+            "JIT: discovering function app URL(s) for tenant {TenantId} ({DisplayName}).",
+            tenantId, state.Tenant.DisplayName);
+
+        JitUrlDiscoveryResult urls;
+        try
+        {
+            urls = await discovery.DiscoverAsync(tenantId, CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            context.Logger.LogWarning(ex, "JIT: URL discovery failed for tenant {TenantId}.", tenantId);
+            urls = JitUrlDiscoveryResult.Empty;
+        }
+
+        lock (state.Lock) state.Urls = urls;
+
+        if (urls.IsEmpty)
+        {
+            context.Logger.LogWarning(
+                "JIT: could not discover any function app URL for tenant {TenantId} — " +
+                "menu will show 'not deployed' state.", tenantId);
+            MenuChanged?.Invoke();
+            return;
+        }
+
+        StartPollTimer();
+        MenuChanged?.Invoke();
+        await PollTenantAsync(state).ConfigureAwait(false);
+    }
+
+    private async Task RetryDiscoveryAsync(TenantState state)
+    {
+        var context   = _context;
+        var discovery = _discovery;
+        if (context is null || discovery is null) return;
+
+        context.Logger.LogDebug("JIT: manual discovery retry for tenant {TenantId}.", state.Tenant.TenantId);
+        var result = await discovery.DiscoverAsync(state.Tenant.TenantId, CancellationToken.None)
+            .ConfigureAwait(false);
+
+        if (!result.IsEmpty)
+        {
+            lock (state.Lock)
+            {
+                state.Urls          = result;
+                state.PollSuspended = false;
+                state.TargetsAt     = DateTime.MinValue;
+                state.RulesAt       = DateTime.MinValue;
+            }
+            StartPollTimer();
+            await PollTenantAsync(state).ConfigureAwait(false);
+        }
+        MenuChanged?.Invoke();
+    }
+
+    // ── Background polling ────────────────────────────────────────────────────
+
+    private async Task PollAllAsync()
+    {
+        var states = _tenants.Values.ToArray();
+        if (states.Length == 0) return;
+        await Task.WhenAll(states.Select(PollTenantAsync)).ConfigureAwait(false);
+    }
+
+    private async Task PollTenantAsync(TenantState state)
+    {
+        var context   = _context;
+        var client    = _client;
+        var resources = _resources;
+        if (context is null || client is null) return;
+
+        bool suspended;
+        JitUrlDiscoveryResult urls;
+        lock (state.Lock)
+        {
+            suspended = state.PollSuspended;
+            urls      = state.Urls;
+        }
+        if (suspended || urls.IsEmpty) return;
+
+        // Skip if a poll for this tenant is already running — overlapping runs
+        // race the shared per-tenant state (last-writer-wins). Cheap CAS guard.
+        if (Interlocked.Exchange(ref state.Polling, 1) == 1) return;
+        try
+        {
+            var now      = DateTime.UtcNow;
+            var changed  = false;
+            var tenantId = state.Tenant.TenantId;
+
+            DateTime targetsAt;
+            lock (state.Lock) targetsAt = state.TargetsAt;
+            if (now - targetsAt > TargetsTtl && resources is not null)
+            {
+                // Targets are discovered client-side from ARM Resource Graph
+                // using the user's own token. One call returns every NSG / SQL
+                // server / storage account / Key Vault the user has ARM read
+                // access to across all visible subscriptions.
+                try
+                {
+                    var targets = await resources
+                        .DiscoverAsync(tenantId, CancellationToken.None)
+                        .ConfigureAwait(false);
+                    lock (state.Lock) { state.Targets = targets; state.TargetsAt = now; }
+                    changed = true;
+                    context.Logger.LogDebug(
+                        "JIT: discovered {Count} target(s) for tenant {TenantId}.", targets.Count, tenantId);
+                }
+                catch (ArgumentException ex) when (IsTenantNotEnabled(ex))
+                {
+                    SuspendForTenantMismatch(state, "resource discovery");
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    context.Logger.LogWarning(ex, "JIT: resource discovery failed for tenant {TenantId}.", tenantId);
+                }
+            }
+
+            DateTime rulesAt;
+            lock (state.Lock) rulesAt = state.RulesAt;
+            if (now - rulesAt > RulesTtl)
+            {
+                var allRules     = new List<JitServerRule>();
+                var anySucceeded = false;
+                string? callerIp = null;
+
+                foreach (var url in urls.AllUrls)
+                {
+                    try
+                    {
+                        var result = await client
+                            .GetActiveRulesAsync(tenantId, url, CancellationToken.None)
+                            .ConfigureAwait(false);
+                        // Tag each rule with the URL it came from so Revoke can route correctly.
+                        foreach (var rule in result.Rules)
+                            allRules.Add(rule with { SourceFunctionAppUrl = url });
+                        if (!string.IsNullOrEmpty(result.CallerIp))
+                            callerIp = result.CallerIp;
+                        anySucceeded = true;
+                        context.Logger.LogDebug(
+                            "JIT: refreshed {Count} active rule(s) from {Url}.", result.Rules.Count, url);
+                    }
+                    catch (ArgumentException ex) when (IsTenantNotEnabled(ex))
+                    {
+                        SuspendForTenantMismatch(state, "rules refresh");
+                        return;
+                    }
+                    catch (JitHttpException ex) when (ex.StatusCode is 401 or 403)
+                    {
+                        NotifyAuthBlocked(state, ex, url);
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Logger.LogWarning(ex, "JIT: rules refresh failed for {Url}.", url);
+                    }
+                }
+
+                if (anySucceeded)
+                {
+                    lock (state.Lock)
+                    {
+                        state.ServerRules = allRules;
+                        state.RulesAt     = now;
+                        if (callerIp is not null) state.CallerIp = callerIp;
+                    }
+                    changed = true;
+                    ClearAuthBlocked(state);
+                }
+            }
+
+            if (changed)
+            {
+                BadgeChanged?.Invoke();
+                MenuChanged?.Invoke();
+            }
+        }
+        finally
+        {
+            Interlocked.Exchange(ref state.Polling, 0);
         }
     }
 
     private static bool IsTenantNotEnabled(ArgumentException ex) =>
         ex.ParamName == "tenantId" || ex.Message.Contains("is not enabled for plugin");
 
-    private void SuspendForTenantMismatch(string operation)
+    private void SuspendForTenantMismatch(TenantState state, string operation)
     {
-        _pollSuspended = true;
-        _pollTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+        lock (state.Lock) state.PollSuspended = true;
         _context?.Logger.LogError(
             "JIT: tenant {TenantId} is not enabled for this plugin (operation: {Operation}). " +
-            "Enable the plugin for that tenant in AzureTray settings. Polling suspended.",
-            _tenantId, operation);
+            "Enable the plugin for that tenant in AzureTray settings. Polling suspended for it.",
+            state.Tenant.TenantId, operation);
         MenuChanged?.Invoke();
     }
 
     /// <summary>
-    /// Called when a poll returns 401/403. Sets the auth-blocked state and
-    /// pushes a one-shot toast. Subsequent failures don't repeat the toast
-    /// until <see cref="ClearAuthBlocked"/> resets the state.
+    /// Called when a poll returns 401/403 for a tenant. Sets the auth-blocked
+    /// state and pushes a one-shot toast. Subsequent failures don't repeat the
+    /// toast until <see cref="ClearAuthBlocked"/> resets the state.
     /// </summary>
-    private void NotifyAuthBlocked(JitHttpException ex, string url)
+    private void NotifyAuthBlocked(TenantState state, JitHttpException ex, string url)
     {
         var context = _context;
         if (context is null) return;
 
         // Suppress repeat toasts when the status hasn't changed.
-        if (_authBlocked && _authBlockedStatus == ex.StatusCode)
+        lock (state.Lock)
         {
-            context.Logger.LogDebug(
-                "JIT: still auth-blocked ({Status}) on {Url} — suppressing duplicate toast.", ex.StatusCode, url);
-            return;
+            if (state.AuthBlocked && state.AuthBlockedStatus == ex.StatusCode)
+            {
+                context.Logger.LogDebug(
+                    "JIT: still auth-blocked ({Status}) on {Url} — suppressing duplicate toast.", ex.StatusCode, url);
+                return;
+            }
+            state.AuthBlocked       = true;
+            state.AuthBlockedStatus = ex.StatusCode;
         }
-
-        _authBlocked       = true;
-        _authBlockedStatus = ex.StatusCode;
 
         var (title, body) = ex.StatusCode switch
         {
@@ -682,6 +688,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                 Severity = NotificationSeverity.Warning,
                 Details  = new[]
                 {
+                    new NotificationDetail("Tenant",   state.Tenant.DisplayName),
                     new NotificationDetail("Status",   ex.StatusCode.ToString()),
                     new NotificationDetail("Endpoint", url),
                     new NotificationDetail("Server",   ex.ServerError ?? ex.Message),
@@ -692,13 +699,17 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         MenuChanged?.Invoke();
     }
 
-    /// <summary>Clears the auth-blocked state after a successful poll.</summary>
-    private void ClearAuthBlocked()
+    /// <summary>Clears a tenant's auth-blocked state after a successful poll.</summary>
+    private void ClearAuthBlocked(TenantState state)
     {
-        if (!_authBlocked) return;
-        _authBlocked       = false;
-        _authBlockedStatus = 0;
-        _context?.Logger.LogInformation("JIT: authorization restored — polls succeeding again.");
+        lock (state.Lock)
+        {
+            if (!state.AuthBlocked) return;
+            state.AuthBlocked       = false;
+            state.AuthBlockedStatus = 0;
+        }
+        _context?.Logger.LogInformation(
+            "JIT: authorization restored for tenant {TenantId} — polls succeeding again.", state.Tenant.TenantId);
         MenuChanged?.Invoke();
     }
 
@@ -706,12 +717,23 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
 
     public IReadOnlyList<PluginMenuItem> GetMenuItems()
     {
-        // Top-level label reflects current state: count of active rules, plus
-        // any error indicators. Single item — no Active / Browse split.
-        var label = _pollSuspended || _authBlocked
+        var states = _tenants.Values.ToArray();
+
+        var total = 0;
+        var warn  = false;
+        foreach (var s in states)
+        {
+            lock (s.Lock)
+            {
+                total += s.ServerRules.Count;
+                if (s.PollSuspended || s.AuthBlocked) warn = true;
+            }
+        }
+
+        var label = warn
             ? "🔑  JIT Access  ⚠"
-            : _serverRules.Count > 0
-                ? $"🔑  JIT Access  ({_serverRules.Count})"
+            : total > 0
+                ? $"🔑  JIT Access  ({total})"
                 : "🔑  JIT Access";
 
         return new[] {
@@ -723,133 +745,158 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
     }
 
     /// <summary>
-    /// Single source of truth for the menu body. Handles every state: no tenant,
-    /// no URL, loading, no targets, no matches, auth-blocked, and the normal
-    /// list-of-targets case. Active rules surface inline on each target row.
+    /// Single source of truth for the menu body. Groups rows under a per-tenant
+    /// header (when more than one tenant is tracked) and handles every state:
+    /// no tenant, no URL, loading, no targets, no matches, auth-blocked, and the
+    /// normal list-of-targets case.
     /// </summary>
     private IReadOnlyList<PluginMenuItem> BuildSearchItems(string query)
     {
-        var items = new List<PluginMenuItem>();
+        var states = _tenants.Values
+            .OrderBy(s => s.Tenant.DisplayName, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
 
-        if (string.IsNullOrWhiteSpace(_tenantId))
-        {
-            items.Add(new PluginMenuItem("⚙ Sign in to a tenant to enable JIT access.", IsEnabled: false));
-            return items;
-        }
+        if (states.Length == 0)
+            return new[] { new PluginMenuItem("⚙ Sign in to a tenant to enable JIT access.", IsEnabled: false) };
 
-        if (_urls.IsEmpty)
-        {
-            items.Add(new PluginMenuItem("⚠ JIT function app URL not yet discovered.",  IsEnabled: false));
-            items.Add(new PluginMenuItem("  Deploy the JIT function app in this tenant.", IsEnabled: false));
-            items.Add(PluginMenuItem.Separator);
-            items.Add(new PluginMenuItem(
-                Text:         "↻ Retry discovery",
-                Invoke:       () => _ = RetryDiscoveryAsync(),
-                Icon:         "↻",
-                KeepMenuOpen: true));
-            return items;
-        }
+        var multiTenant = states.Length > 1;
+        var items       = new List<PluginMenuItem>();
 
-        if (_authBlocked)
-        {
-            items.Add(new PluginMenuItem(
-                $"⚠ Missing '{JitRequesterRoleNameDefault}' role — see notification.", IsEnabled: false));
-            items.Add(PluginMenuItem.Separator);
-        }
+        foreach (var state in states)
+            AppendTenantItems(items, state, query, multiTenant);
 
-        if (_pollSuspended)
-        {
-            items.Add(new PluginMenuItem(
-                $"⚠ Tenant {_tenantId} not enabled for this plugin.", IsEnabled: false));
-            items.Add(PluginMenuItem.Separator);
-        }
-
-        if (_targets.Count == 0 && _targetsAt == DateTime.MinValue)
-        {
-            items.Add(new PluginMenuItem("  Loading targets…", IsEnabled: false));
-            return items;
-        }
-
-        if (_targets.Count == 0)
-        {
-            items.Add(new PluginMenuItem(
-                "  No Azure resources found that you have access to request.",
-                IsEnabled: false));
-            return items;
-        }
-
-        var filtered = string.IsNullOrWhiteSpace(query)
-            ? _targets
-            : _targets.Where(t =>
-                t.DisplayName.Contains(query, StringComparison.OrdinalIgnoreCase) ||
-                t.ResourceName.Contains(query, StringComparison.OrdinalIgnoreCase) ||
-                (t.Environment?.Contains(query, StringComparison.OrdinalIgnoreCase) ?? false) ||
-                t.TargetType.Contains(query, StringComparison.OrdinalIgnoreCase)).ToList();
-
-        if (filtered.Count == 0)
-        {
+        if (items.Count == 0)
             items.Add(new PluginMenuItem("  No matching resources.", IsEnabled: false));
-            return items;
-        }
-
-        // Favorites float to the top. Within each group (favorites / rest)
-        // sort by environment then display name.
-        items.AddRange(filtered
-            .OrderByDescending(t => _favorites?.IsFavorite(t.Id) ?? false)
-            .ThenBy(t => t.Environment)
-            .ThenBy(t => t.DisplayName)
-            .Select(BuildTargetItem));
-
-        items.Add(PluginMenuItem.Separator);
-        items.Add(new PluginMenuItem(
-            Text:         "↻ Refresh",
-            Invoke:       () =>
-            {
-                _context?.Logger.LogDebug("JIT: manual refresh requested from menu.");
-                _targetsAt = DateTime.MinValue;
-                _rulesAt   = DateTime.MinValue;
-                _          = PollAsync();
-            },
-            Icon:         "↻",
-            KeepMenuOpen: true));
 
         return items;
     }
 
-    // Display string mentioned in the menu when auth is blocked. The actual
-    // role name comes from the server; this is purely a hint to the user.
-    private const string JitRequesterRoleNameDefault = "JIT Requester";
-
-    private async Task RetryDiscoveryAsync()
+    // Renders one tenant's section into <paramref name="items"/>. In multi-tenant
+    // setups each section is bracketed by a "— DisplayName —" header and a
+    // trailing separator; single-tenant setups stay flat. A tenant with nothing
+    // to show during an active search is skipped entirely (header included).
+    private void AppendTenantItems(List<PluginMenuItem> items, TenantState state, string query, bool multiTenant)
     {
-        if (_context is null || _discovery is null || string.IsNullOrWhiteSpace(_tenantId)) return;
-
-        _context.Logger.LogDebug("JIT: manual discovery retry requested.");
-        var result = await _discovery.DiscoverAsync(_tenantId, AzureTrayAppRegistrationName, CancellationToken.None)
-            .ConfigureAwait(false);
-
-        if (!result.IsEmpty)
+        JitUrlDiscoveryResult urls;
+        List<JitTarget>       targets;
+        List<JitServerRule>   rules;
+        DateTime              targetsAt;
+        string?               callerIp;
+        bool                  authBlocked, pollSuspended;
+        lock (state.Lock)
         {
-            _urls           = result;
-            _pollSuspended  = false;
-            _targetsAt      = DateTime.MinValue;
-            _rulesAt        = DateTime.MinValue;
-            StartPollTimer();
+            urls          = state.Urls;
+            targets       = state.Targets;
+            rules         = state.ServerRules;
+            targetsAt     = state.TargetsAt;
+            callerIp      = state.CallerIp;
+            authBlocked   = state.AuthBlocked;
+            pollSuspended = state.PollSuspended;
         }
-        MenuChanged?.Invoke();
+
+        var hasQuery = !string.IsNullOrWhiteSpace(query);
+        var indent   = multiTenant ? "    " : string.Empty;
+
+        // Build the tenant body first so we only emit a header when there's
+        // something under it (important while searching).
+        var body = new List<PluginMenuItem>();
+
+        if (urls.IsEmpty)
+        {
+            if (!hasQuery)
+            {
+                body.Add(new PluginMenuItem($"{indent}⚠ JIT function app URL not yet discovered.",  IsEnabled: false));
+                body.Add(new PluginMenuItem($"{indent}  Deploy the JIT function app in this tenant.", IsEnabled: false));
+                body.Add(new PluginMenuItem(
+                    Text:         $"{indent}Retry discovery",
+                    Invoke:       () => _ = RetryDiscoveryAsync(state),
+                    Icon:         "↻",
+                    KeepMenuOpen: true));
+            }
+        }
+        else
+        {
+            if (authBlocked && !hasQuery)
+                body.Add(new PluginMenuItem(
+                    $"{indent}⚠ Missing '{JitRequesterRoleNameDefault}' role — see notification.", IsEnabled: false));
+
+            if (pollSuspended && !hasQuery)
+                body.Add(new PluginMenuItem(
+                    $"{indent}⚠ Tenant not enabled for this plugin.", IsEnabled: false));
+
+            if (targets.Count == 0 && targetsAt == DateTime.MinValue)
+            {
+                if (!hasQuery) body.Add(new PluginMenuItem($"{indent}  Loading targets…", IsEnabled: false));
+            }
+            else
+            {
+                var filtered = hasQuery
+                    ? targets.Where(t => MatchesQuery(t, query)).ToList()
+                    : targets;
+
+                if (filtered.Count > 0)
+                {
+                    // Favorites float to the top. Within each group sort by
+                    // environment then display name.
+                    body.AddRange(filtered
+                        .OrderByDescending(t => _favorites?.IsFavorite(t.Id) ?? false)
+                        .ThenBy(t => t.Environment)
+                        .ThenBy(t => t.DisplayName)
+                        .Select(t => BuildTargetItem(state, t, rules, callerIp, indent)));
+                }
+                else if (!hasQuery)
+                {
+                    body.Add(new PluginMenuItem(
+                        $"{indent}  No Azure resources found that you have access to request.", IsEnabled: false));
+                }
+            }
+
+            // Per-tenant refresh — hidden during search to keep results tight.
+            if (!hasQuery)
+                body.Add(new PluginMenuItem(
+                    Text:         $"{indent}Refresh",
+                    Invoke:       () => RefreshTenant(state),
+                    Icon:         "↻",
+                    KeepMenuOpen: true));
+        }
+
+        if (body.Count == 0) return;   // nothing to show for this tenant
+
+        if (multiTenant)
+            items.Add(new PluginMenuItem($"— {state.Tenant.DisplayName} —", IsEnabled: false));
+        items.AddRange(body);
+        if (multiTenant)
+            items.Add(PluginMenuItem.Separator);
+    }
+
+    private static bool MatchesQuery(JitTarget t, string query) =>
+        t.DisplayName.Contains(query, StringComparison.OrdinalIgnoreCase) ||
+        t.ResourceName.Contains(query, StringComparison.OrdinalIgnoreCase) ||
+        (t.Environment?.Contains(query, StringComparison.OrdinalIgnoreCase) ?? false) ||
+        t.TargetType.Contains(query, StringComparison.OrdinalIgnoreCase);
+
+    private void RefreshTenant(TenantState state)
+    {
+        _context?.Logger.LogDebug("JIT: manual refresh requested for tenant {TenantId}.", state.Tenant.TenantId);
+        lock (state.Lock)
+        {
+            state.TargetsAt = DateTime.MinValue;
+            state.RulesAt   = DateTime.MinValue;
+        }
+        _ = PollTenantAsync(state);
     }
 
     // ── Target row ────────────────────────────────────────────────────────────
 
-    private PluginMenuItem BuildTargetItem(JitTarget target)
+    private PluginMenuItem BuildTargetItem(
+        TenantState state, JitTarget target, IReadOnlyList<JitServerRule> rules, string? callerIp, string indent)
     {
         var envBadge   = string.IsNullOrEmpty(target.Environment) ? string.Empty : $"[{target.Environment.ToUpper()}] ";
         var isFavorite = _favorites?.IsFavorite(target.Id) ?? false;
 
         // Toggled by the host when the user clicks the row's favorite star.
         // Persists to the local store; the host flips the glyph in place, so we
-        // don't raise MenuChanged here (the open target submenu wouldn't be
-        // refreshed by it anyway — only the next open re-sorts favorites up).
+        // don't raise MenuChanged here.
         void ToggleFavorite()
         {
             var now = _favorites?.Toggle(target.Id);
@@ -858,7 +905,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                 now == true ? "added" : "removed", target.ResourceName, target.Id);
         }
 
-        var activeRule = _serverRules.FirstOrDefault(r =>
+        var activeRule = rules.FirstOrDefault(r =>
             string.Equals(r.SubscriptionId, target.SubscriptionId, StringComparison.OrdinalIgnoreCase) &&
             string.Equals(r.ResourceGroup,  target.ResourceGroup,  StringComparison.OrdinalIgnoreCase) &&
             string.Equals(r.ResourceName,   target.ResourceName,   StringComparison.OrdinalIgnoreCase));
@@ -867,11 +914,10 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         {
             var r         = activeRule;
             var remaining = r.ExpiresUtc - DateTime.UtcNow;
-            // Greyed-out row with the "active" suffix + countdown. The favorite
-            // star sits on the right (toggled via OnToggleFavorite); right-click
-            // reveals Copy rule ID and Revoke (no hover-expanding submenu).
+            // Greyed-out row with the "active" suffix + countdown. Right-click
+            // reveals Copy rule ID and Revoke.
             return new PluginMenuItem(
-                Text:             $"  ✓ {envBadge}{target.DisplayName}  — active ({FormatTimeRemaining(remaining)})",
+                Text:             $"{indent}  ✓ {envBadge}{target.DisplayName}  — active ({FormatTimeRemaining(remaining)})",
                 IsEnabled:        false,
                 Icon:             remaining.TotalMinutes < 30 ? "⚠" : "✓",
                 IsFavorite:       isFavorite,
@@ -885,40 +931,34 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                     PluginMenuItem.Separator,
                     new PluginMenuItem(
                         Text:   "  🗑 Revoke access",
-                        Invoke: () => _ = ConfirmRevokeAsync(r)),
+                        Invoke: () => _ = ConfirmRevokeAsync(state, r)),
                 });
         }
 
         // Already permanently whitelisted? If the caller's current IP is an
         // exact match for an existing firewall entry on this resource, there's
-        // nothing to request — show it greyed like an active rule. Exact match
-        // only (ip or ip/32); no CIDR-coverage evaluation.
-        var callerIp = _callerIp;
+        // nothing to request — show it greyed like an active rule.
         if (!string.IsNullOrEmpty(callerIp) &&
             (target.WhitelistedIps.Contains(callerIp) || target.WhitelistedIps.Contains(callerIp + "/32")))
         {
             return new PluginMenuItem(
-                Text:             $"  ✓ {envBadge}{target.DisplayName}  — IP already allowed",
+                Text:             $"{indent}  ✓ {envBadge}{target.DisplayName}  — IP already allowed",
                 IsEnabled:        false,
                 Icon:             "✓",
                 IsFavorite:       isFavorite,
                 OnToggleFavorite: ToggleFavorite);
         }
 
-        // Single-click target rows. Duration is asked via a ChoiceRequest
-        // popup (same pattern as the PIM plugin's activation duration prompt).
-        // The favorite star sits on the right of the row (toggled via
-        // OnToggleFavorite) — no submenu, so a click on the row name goes
-        // straight to the grant prompt.
-        var targetPrefix = $"{target.TargetType}|{target.SubscriptionId}|{target.ResourceGroup}|{target.ResourceName}|";
+        // Single-click target rows. Duration is asked via a ChoiceRequest popup.
+        var targetPrefix = $"{state.Tenant.TenantId}|{target.TargetType}|{target.SubscriptionId}|{target.ResourceGroup}|{target.ResourceName}|";
         bool isBusy;
         lock (_busyLock) isBusy = _busyKeys.Any(k => k.StartsWith(targetPrefix, StringComparison.Ordinal));
 
         var isProd = string.Equals(target.Environment, "prod", StringComparison.OrdinalIgnoreCase);
         return new PluginMenuItem(
-            Text:             $"  {envBadge}{target.DisplayName}",
+            Text:             $"{indent}  {envBadge}{target.DisplayName}",
             Icon:             isProd ? "⚠" : null,
-            Invoke:           isBusy ? null : () => _ = PromptAndGrantAsync(target),
+            Invoke:           isBusy ? null : () => _ = PromptAndGrantAsync(state, target),
             IsEnabled:        !isBusy,
             IsBusy:           isBusy,
             KeepMenuOpen:     false,
@@ -927,11 +967,10 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
     }
 
     /// <summary>
-    /// Single-click entry point on a target row. Pops a ChoiceRequest asking
-    /// for the grant duration (same pattern as the PIM plugin's activation
-    /// flow), then hands off to the existing grant flow.
+    /// Single-click entry point on a target row. Pops a ChoiceRequest asking for
+    /// the grant duration, then hands off to the grant flow.
     /// </summary>
-    private async Task PromptAndGrantAsync(JitTarget target)
+    private async Task PromptAndGrantAsync(TenantState state, JitTarget target)
     {
         var context = _context;
         if (context is null) return;
@@ -961,23 +1000,24 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         if (idx < 0 || idx >= durations.Length)
         {
             context.Logger.LogWarning(
-                "JIT: unknown duration choice '{Choice}' for {ResourceName}.",
-                picked, target.ResourceName);
+                "JIT: unknown duration choice '{Choice}' for {ResourceName}.", picked, target.ResourceName);
             return;
         }
 
         var hours      = durations[idx];
-        var requestKey = $"{target.TargetType}|{target.SubscriptionId}|{target.ResourceGroup}|{target.ResourceName}|{hours}";
-        await GrantFromTargetAsync(target, hours, requestKey).ConfigureAwait(false);
+        var requestKey = $"{state.Tenant.TenantId}|{target.TargetType}|{target.SubscriptionId}|{target.ResourceGroup}|{target.ResourceName}|{hours}";
+        await GrantFromTargetAsync(state, target, hours, requestKey).ConfigureAwait(false);
     }
 
     // ── Grant flow ───────────────────────────────────────────────────────────
 
-    private async Task GrantFromTargetAsync(JitTarget target, int durationHours, string requestKey)
+    private async Task GrantFromTargetAsync(TenantState state, JitTarget target, int durationHours, string requestKey)
     {
         var context = _context;
         var client  = _client;
         if (context is null || client is null) return;
+
+        var tenantId = state.Tenant.TenantId;
 
         string? justification = null;
         if (target.RequiresJustification)
@@ -1026,7 +1066,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         // Route the grant to the function app responsible for this target's
         // subscription. Falls back to the legacy single URL if no per-sub
         // entry exists (single-deploy setups).
-        var grantUrl = _urls.UrlForSubscription(target.SubscriptionId);
+        var grantUrl = state.Urls.UrlForSubscription(target.SubscriptionId);
         if (string.IsNullOrEmpty(grantUrl))
         {
             context.Logger.LogError(
@@ -1054,12 +1094,12 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                 justification);
 
             var response = await client
-                .RequestAccessAsync(_tenantId, grantUrl, request, CancellationToken.None)
+                .RequestAccessAsync(tenantId, grantUrl, request, CancellationToken.None)
                 .ConfigureAwait(false);
 
             _localStore?.Add(new ActiveRule(
                 RuleId:         response.RuleId,
-                TenantId:       _tenantId,
+                TenantId:       tenantId,
                 TargetType:     response.TargetType,
                 SubscriptionId: target.SubscriptionId,
                 ResourceGroup:  target.ResourceGroup,
@@ -1081,7 +1121,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                 { Severity = NotificationSeverity.Success },
                 CancellationToken.None);
 
-            _ = VerifyAndNotifyAsync(response, context);
+            _ = VerifyAndNotifyAsync(response, context, tenantId);
         }
         catch (Exception ex)
         {
@@ -1099,14 +1139,14 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         finally
         {
             lock (_busyLock) _busyKeys.Remove(requestKey);
-            _rulesAt = DateTime.MinValue;
-            _ = PollAsync();
+            lock (state.Lock) state.RulesAt = DateTime.MinValue;
+            _ = PollTenantAsync(state);
         }
     }
 
     // ── Revoke flow ───────────────────────────────────────────────────────────
 
-    private async Task ConfirmRevokeAsync(JitServerRule rule)
+    private async Task ConfirmRevokeAsync(TenantState state, JitServerRule rule)
     {
         var context = _context;
         var client  = _client;
@@ -1127,12 +1167,11 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         }
 
         // Route the revoke to the function app the rule was originally fetched
-        // from. SourceFunctionAppUrl is tagged during PollAsync; fall back to
-        // the per-sub map (then legacy) if it's somehow missing (e.g. a rule
-        // from local-store fallback).
+        // from. SourceFunctionAppUrl is tagged during the poll; fall back to the
+        // per-sub map if it's somehow missing.
         var revokeUrl = !string.IsNullOrEmpty(rule.SourceFunctionAppUrl)
             ? rule.SourceFunctionAppUrl
-            : _urls.UrlForSubscription(rule.SubscriptionId);
+            : state.Urls.UrlForSubscription(rule.SubscriptionId);
 
         if (string.IsNullOrEmpty(revokeUrl))
         {
@@ -1151,7 +1190,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         try
         {
             await client
-                .RevokeAsync(_tenantId, revokeUrl, rule.RuleId, CancellationToken.None)
+                .RevokeAsync(state.Tenant.TenantId, revokeUrl, rule.RuleId, CancellationToken.None)
                 .ConfigureAwait(false);
 
             context.Logger.LogInformation("JIT rule revoked: {RuleId} via {Url}.", rule.RuleId, revokeUrl);
@@ -1178,18 +1217,18 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         }
         finally
         {
-            _rulesAt = DateTime.MinValue;
-            _ = PollAsync();
+            lock (state.Lock) state.RulesAt = DateTime.MinValue;
+            _ = PollTenantAsync(state);
         }
     }
 
     // ── ARM post-grant verification ───────────────────────────────────────────
 
-    private async Task VerifyAndNotifyAsync(JitGrantResponse grant, IPluginContext context)
+    private async Task VerifyAndNotifyAsync(JitGrantResponse grant, IPluginContext context, string tenantId)
     {
         if (_verifier is null) return;
 
-        var result = await _verifier.VerifyAsync(grant, _tenantId).ConfigureAwait(false);
+        var result = await _verifier.VerifyAsync(grant, tenantId).ConfigureAwait(false);
 
         switch (result)
         {
@@ -1228,63 +1267,6 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         }
     }
 
-    // ── Tenant lifecycle ──────────────────────────────────────────────────────
-
-    private void OnTenantReady(PluginTenant tenant)
-    {
-        if (!IsTenantAllowed(tenant.TenantId))
-        {
-            _context?.Logger.LogInformation(
-                "JIT: TenantReady fired for {TenantId} ({DisplayName}); excluded by the allow-list — ignored.",
-                tenant.TenantId, tenant.DisplayName);
-            return;
-        }
-
-        if (string.IsNullOrWhiteSpace(_tenantId))
-        {
-            _context?.Logger.LogInformation(
-                "JIT: TenantReady fired for {TenantId} ({DisplayName}); applying.",
-                tenant.TenantId, tenant.DisplayName);
-            _ = ApplyTenantAndDiscoverAsync(tenant, CancellationToken.None);
-        }
-        else
-        {
-            _context?.Logger.LogDebug(
-                "JIT: TenantReady fired for {TenantId} ({DisplayName}); already using {Active} — ignored.",
-                tenant.TenantId, tenant.DisplayName, _tenantId);
-        }
-    }
-
-    private void OnTenantRemoved(string tenantId)
-    {
-        if (string.Equals(_tenantId, tenantId, StringComparison.OrdinalIgnoreCase))
-        {
-            ClearActiveTenant();
-            _context?.Logger.LogWarning(
-                "JIT: active tenant {TenantId} signed out. Plugin suspended until another tenant is ready.", tenantId);
-        }
-    }
-
-    // Unbinds the active tenant and resets all per-tenant state. Used when the
-    // tenant signs out and when an options change excludes the current tenant.
-    private void ClearActiveTenant()
-    {
-        _pollTimer?.Change(Timeout.Infinite, Timeout.Infinite);
-        // Reassign new empty lists rather than .Clear() — a concurrent poll
-        // / menu build / badge read enumerates these, and clearing in place
-        // can throw "collection modified". Reference swap is atomic.
-        _serverRules   = new();
-        _targets       = new();
-        _targetsAt     = DateTime.MinValue;
-        _rulesAt       = DateTime.MinValue;
-        _callerIp      = null;
-        _tenantId      = string.Empty;
-        _urls          = JitUrlDiscoveryResult.Empty;
-        _pollSuspended = false;
-        BadgeChanged?.Invoke();
-        MenuChanged?.Invoke();
-    }
-
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static string FormatTimeRemaining(TimeSpan remaining)
@@ -1313,4 +1295,30 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
             .ToArray();
     }
 
+    // ── Per-tenant state ────────────────────────────────────────────────────────
+
+    // Mutated on poll completion and read while the menu/badge build; callers
+    // lock around compound reads/writes. Reference swaps for the lists are
+    // atomic, but the flags/timestamps travel together so we guard them too.
+    private sealed class TenantState
+    {
+        public TenantState(PluginTenant tenant) { Tenant = tenant; }
+
+        public PluginTenant Tenant { get; }
+        public object       Lock   { get; } = new();
+
+        public JitUrlDiscoveryResult Urls        { get; set; } = JitUrlDiscoveryResult.Empty;
+        public List<JitTarget>       Targets     { get; set; } = new();
+        public List<JitServerRule>   ServerRules { get; set; } = new();
+        public DateTime              TargetsAt   { get; set; } = DateTime.MinValue;
+        public DateTime              RulesAt     { get; set; } = DateTime.MinValue;
+        public string?               CallerIp    { get; set; }
+
+        public bool PollSuspended     { get; set; }
+        public bool AuthBlocked       { get; set; }
+        public int  AuthBlockedStatus { get; set; }
+
+        // Re-entrancy guard for PollTenantAsync (Interlocked — must be a field).
+        public int Polling;
+    }
 }

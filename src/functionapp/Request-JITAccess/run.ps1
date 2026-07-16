@@ -15,10 +15,10 @@
 # }
 #
 # Authorization: Bearer <AAD ARM token>
-#   Token must match AZURE_TENANT_ID and carry an ARM audience.
+#   Token must be issued by the app's tenant and carry an ARM audience.
 #   Caller's AAD objectId must hold the "JIT Requester" custom RBAC role
-#   at or above the function app site resource (controlled by
-#   JIT_SITE_RESOURCE_ID / JIT_REQUESTER_ROLE_NAME env vars).
+#   (hardcoded role name) WITHIN the target subscription named in the request
+#   body — i.e. the subscription the caller is requesting access into.
 
 using namespace System.Net
 
@@ -30,10 +30,9 @@ Import-Module "$PSScriptRoot/../Modules/JITTargets/JITTargets.psm1"   -Force
 
 #region ── Configuration ──────────────────────────────────────────────────────
 
-$tenantId            = $env:AZURE_TENANT_ID
-$siteResourceId      = $env:JIT_SITE_RESOURCE_ID
-$jitRequesterRoleName = if ($env:JIT_REQUESTER_ROLE_NAME) { $env:JIT_REQUESTER_ROLE_NAME } else { 'JIT Requester' }
-$allowedDurations = ($env:ALLOWED_DURATIONS_HOURS -split ',') |
+$tenantId            = Get-JitTenantId
+$allowedDurationsRaw = if ($env:ALLOWED_DURATIONS_HOURS) { $env:ALLOWED_DURATIONS_HOURS } else { '1,4,8' }
+$allowedDurations    = ($allowedDurationsRaw -split ',') |
                         ForEach-Object { [int]$_.Trim() }
 $tableName           = if ($env:JIT_TABLE_NAME)            { $env:JIT_TABLE_NAME }            else { 'JITRules' }
 $priorityMin         = if ($env:JIT_NSG_PRIORITY_MIN)      { [int]$env:JIT_NSG_PRIORITY_MIN }  else { 1000 }
@@ -84,14 +83,6 @@ $oDataRequestedBy = $requestedBy -replace "'", "''"
 
 Write-Host "JIT request from: $requestedBy (oid: $($claims.oid))"
 
-# ── Require the JIT Requester custom RBAC role on the function app site ─────
-if (-not $siteResourceId) {
-    Write-JsonResponse -Status InternalServerError -Body @{
-        error = 'Function app is misconfigured: JIT_SITE_RESOURCE_ID is not set.'
-    }
-    return
-}
-
 $callerObjectId = $claims.oid
 if (-not $callerObjectId) {
     Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp 'unknown' `
@@ -100,16 +91,9 @@ if (-not $callerObjectId) {
     return
 }
 
-if (-not (Test-CallerHasJitRequesterRole -CallerObjectId $callerObjectId `
-            -SiteResourceId $siteResourceId -RoleDefinitionName $jitRequesterRoleName)) {
-    Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp 'unknown' `
-        -DenyReason 'MissingJitRequesterRole' -Extra @{ requiredRole = $jitRequesterRoleName }
-    Write-JsonResponse -Status Forbidden -Body @{
-        error        = "Caller does not hold the '$jitRequesterRoleName' RBAC role on this function app."
-        requiredRole = $jitRequesterRoleName
-    }
-    return
-}
+# NB: the JIT Requester RBAC role check is deferred to region 2b — it is
+# evaluated against the TARGET subscription parsed from the request body, not
+# the function app's own host subscription.
 
 #endregion
 
@@ -195,6 +179,25 @@ if ($port -and $port -notmatch '^\d{1,5}(-\d{1,5})?$') {
 
 if ($justification -and $justification.Length -gt 500) {
     Write-JsonResponse -Status BadRequest -Body @{ error = 'Justification must be 500 characters or fewer.' }
+    return
+}
+
+#endregion
+
+#region ── 2b. Authorize caller in the target subscription ─────────────────────
+
+# The caller must hold the 'JIT Requester' custom RBAC role in the subscription
+# they are requesting access INTO — evaluated against the request body's
+# subscriptionId, not the function app's own host subscription. The role
+# definition must exist and be assigned to the caller within that subscription.
+if (-not (Test-CallerHasJitRequesterRole -CallerObjectId $callerObjectId -SubscriptionId $subscriptionId)) {
+    Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp 'unknown' `
+        -SubscriptionId $subscriptionId -DenyReason 'MissingJitRequesterRole' `
+        -Extra @{ requiredRole = 'JIT Requester' }
+    Write-JsonResponse -Status Forbidden -Body @{
+        error        = "Caller does not hold the 'JIT Requester' RBAC role in subscription '$subscriptionId'."
+        requiredRole = 'JIT Requester'
+    }
     return
 }
 

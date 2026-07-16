@@ -33,13 +33,6 @@
                 "description": "Object ID (NOT appId/clientId) of the AzureTray host app registration. Used by the function app to PATCH its jit-baseurl:<sub>=<url> tag onto the app reg on cold start. Required because the function app's MI holds Application.ReadWrite.OwnedBy, which permits reading/writing the specific app you own but not listing /applications. Deploy.ps1 resolves and supplies this automatically."
             }
         },
-        "jitRequesterRoleName": {
-            "type": "string",
-            "defaultValue": "JIT Requester",
-            "metadata": {
-                "description": "Name of the custom RBAC role that gates access to the function app. Callers must hold this role on the function app site (or a parent scope) to request JIT access."
-            }
-        },
         "allowedDurationsHours": {
             "type": "string",
             "defaultValue": "1,4,8",
@@ -97,7 +90,6 @@
                     "functionName":                 { "value": "[variables('functionName')]" },
                     "azureTrayAppRegistrationName":     { "value": "[parameters('azureTrayAppRegistrationName')]" },
                     "azureTrayAppRegistrationObjectId": { "value": "[parameters('azureTrayAppRegistrationObjectId')]" },
-                    "jitRequesterRoleName":             { "value": "[parameters('jitRequesterRoleName')]" },
                     "allowedDurationsHours":        { "value": "[parameters('allowedDurationsHours')]" },
                     "nsgPriorityMin":               { "value": "[parameters('nsgPriorityMin')]" },
                     "nsgPriorityMax":               { "value": "[parameters('nsgPriorityMax')]" },
@@ -114,7 +106,6 @@
                         "functionName":                 { "type": "string" },
                         "azureTrayAppRegistrationName":     { "type": "string" },
                         "azureTrayAppRegistrationObjectId": { "type": "string" },
-                        "jitRequesterRoleName":             { "type": "string" },
                         "allowedDurationsHours":        { "type": "string" },
                         "nsgPriorityMin":               { "type": "string" },
                         "nsgPriorityMax":               { "type": "string" },
@@ -176,16 +167,12 @@
                                         },
                                         { "name": "FUNCTIONS_EXTENSION_VERSION",           "value": "~4" },
                                         { "name": "FUNCTIONS_WORKER_RUNTIME",              "value": "powershell" },
-                                        { "name": "AZURE_TENANT_ID",                       "value": "[subscription().tenantId]" },
                                         { "name": "ALLOWED_DURATIONS_HOURS",               "value": "[parameters('allowedDurationsHours')]" },
                                         { "name": "JIT_TABLE_NAME",                        "value": "JITRules" },
                                         { "name": "JIT_NSG_PRIORITY_MIN",                  "value": "[parameters('nsgPriorityMin')]" },
                                         { "name": "JIT_NSG_PRIORITY_MAX",                  "value": "[parameters('nsgPriorityMax')]" },
                                         { "name": "JIT_MAX_RULES_PER_CALLER",              "value": "[parameters('maxRulesPerCaller')]" },
                                         { "name": "JIT_MAX_RULES_PER_RESOURCE",            "value": "[parameters('maxRulesPerResource')]" },
-                                        { "name": "JIT_SITE_RESOURCE_ID",                  "value": "[resourceId('Microsoft.Web/sites', parameters('functionName'))]" },
-                                        { "name": "JIT_SUBSCRIPTION_ID",                   "value": "[subscription().subscriptionId]" },
-                                        { "name": "JIT_REQUESTER_ROLE_NAME",                 "value": "[parameters('jitRequesterRoleName')]" },
                                         { "name": "AZURETRAY_APP_REGISTRATION_NAME",         "value": "[parameters('azureTrayAppRegistrationName')]" },
                                         { "name": "AZURETRAY_APP_REGISTRATION_OBJECT_ID",    "value": "[parameters('azureTrayAppRegistrationObjectId')]" }
                                     ]
