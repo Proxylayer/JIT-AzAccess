@@ -286,3 +286,88 @@ Describe 'Remove-JITNsgRule' {
         Assert-MockCalled -ModuleName JITTargets Set-AzNetworkSecurityGroup -Exactly -Times 0 -Scope It
     }
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# postgresqlFlexibleServer dispatch (FEAT-0001)
+#
+# These tests target the CURRENT run.ps1 data path, which reads/writes the rules
+# table via Get-JITTableName / Get-JITTableRows / Remove-JITTableRow (all backed
+# by Invoke-TableRest) — NOT the Az.Table cmdlets. They deliberately mock those
+# current helpers plus the JITTargets remove-handlers and Write-JITAuditEvent, so
+# no network or Az.* dependency is exercised. (The neighbouring "Remove-ExpiredRules
+# timer trigger" Describe still mocks the removed Get-JITCloudTable/Get-AzTableRow
+# commands and is stale — that is tracked separately as TODO-0006 and left untouched.)
+# ─────────────────────────────────────────────────────────────────────────────
+Describe 'Remove-ExpiredRules postgresqlFlexibleServer dispatch' {
+
+    BeforeEach {
+        # Suppress run.ps1's own Import-Module calls; the real modules are already
+        # imported at the top of this file, so the functions below exist to be mocked.
+        Mock Import-Module { }
+
+        # Mock the ACTUAL table-access helpers run.ps1 calls (Invoke-TableRest-backed),
+        # so nothing touches storage. Get-JITTableRows is overridden per test.
+        Mock Get-JITTableName  { return 'JITRules' }
+        Mock Get-JITTableRows  { return @() }
+        Mock Remove-JITTableRow { }
+        Mock Write-JITAuditEvent { }
+
+        # Mock every dispatch handler so we can assert exactly which one fires.
+        Mock Remove-JITPostgresFirewallRule { }
+        Mock Remove-JITNsgRule              { }
+        Mock Remove-JITSqlFirewallRule      { }
+        Mock Remove-JITStorageNetworkRule   { }
+        Mock Remove-JITKeyVaultNetworkRule  { }
+
+        $Timer = [PSCustomObject]@{ IsPastDue = $false }
+    }
+
+    # ── Happy path ────────────────────────────────────────────────────────────
+
+    It 'calls Remove-JITPostgresFirewallRule exactly once for an expired postgresqlFlexibleServer rule' {
+        Mock Get-JITTableRows { return @(New-ExpiredRow -TargetType 'postgresqlFlexibleServer') }
+        . $script:RunScript
+        Assert-MockCalled Remove-JITPostgresFirewallRule -Exactly -Times 1 -Scope It
+    }
+
+    It 'does not invoke other remove handlers for a postgresqlFlexibleServer rule' {
+        Mock Get-JITTableRows { return @(New-ExpiredRow -TargetType 'postgresqlFlexibleServer') }
+        . $script:RunScript
+        Assert-MockCalled Remove-JITNsgRule             -Exactly -Times 0 -Scope It
+        Assert-MockCalled Remove-JITSqlFirewallRule     -Exactly -Times 0 -Scope It
+        Assert-MockCalled Remove-JITStorageNetworkRule  -Exactly -Times 0 -Scope It
+        Assert-MockCalled Remove-JITKeyVaultNetworkRule -Exactly -Times 0 -Scope It
+    }
+
+    It 'deletes the table row after a successful postgresqlFlexibleServer removal' {
+        Mock Get-JITTableRows { return @(New-ExpiredRow -TargetType 'postgresqlFlexibleServer') }
+        . $script:RunScript
+        Assert-MockCalled Remove-JITTableRow -Exactly -Times 1 -Scope It
+    }
+
+    It 'writes a JITExpired audit event on successful postgresqlFlexibleServer removal' {
+        Mock Get-JITTableRows { return @(New-ExpiredRow -TargetType 'postgresqlFlexibleServer') }
+        . $script:RunScript
+        Assert-MockCalled Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter {
+            $EventType -eq 'JITExpired'
+        }
+    }
+
+    # ── Failure path — row preserved for retry ────────────────────────────────
+
+    It 'does NOT delete the table row when Remove-JITPostgresFirewallRule throws' {
+        Mock Get-JITTableRows               { return @(New-ExpiredRow -TargetType 'postgresqlFlexibleServer') }
+        Mock Remove-JITPostgresFirewallRule { throw 'ARM async operation failed' }
+        . $script:RunScript
+        Assert-MockCalled Remove-JITTableRow -Exactly -Times 0 -Scope It
+    }
+
+    It 'writes a JITRemoveFailed audit event when Remove-JITPostgresFirewallRule throws' {
+        Mock Get-JITTableRows               { return @(New-ExpiredRow -TargetType 'postgresqlFlexibleServer') }
+        Mock Remove-JITPostgresFirewallRule { throw 'ARM async operation failed' }
+        . $script:RunScript
+        Assert-MockCalled Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter {
+            $EventType -eq 'JITRemoveFailed'
+        }
+    }
+}

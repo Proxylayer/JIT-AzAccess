@@ -1,7 +1,7 @@
 {
   "docType": "todos",
   "idPrefix": "TODO",
-  "nextId": 7,
+  "nextId": 11,
   "items": [
     {
       "id": "TODO-0001",
@@ -118,7 +118,7 @@
     },
     {
       "id": "TODO-0006",
-      "title": "Upgrade function app Pester tests to v5 (fix 21 environmental failures)",
+      "title": "Fix stale mocks in Remove-ExpiredRules.Tests.ps1 (19 failing tests)",
       "state": "proposed",
       "tags": [
         "jit",
@@ -126,11 +126,85 @@
         "tests",
         "tech-debt"
       ],
-      "description": "21 pre-existing test failures are environmental, NOT product regressions: Pester 3.4.0 running under PowerShell 7.6.3. JITHelpers.Tests.ps1 has 2 'Should Throw' tests that don't throw under this runtime; Remove-ExpiredRules.Tests.ps1 (all 19) rely on Mock/Assert-MockCalled of Az cmdlets that don't work under Pester 3.4 + PS7. Fix = upgrade these test files to Pester v5 syntax and pin Pester v5 in the runner. Also: no CI runs the Pester tests (publish-plugin.yml only builds the C# plugin) - consider adding a CI job. Baseline before DES-0001 and after are identical (22/21), confirming no regression.",
+      "description": "CORRECTED ROOT CAUSE (verified 2026-07-21): the 19 failing Remove-ExpiredRules.Tests.ps1 tests are NOT a Pester 3.4/PS7 incompatibility. Plain Pester 3.4 Mock/Assert-MockCalled works fine under PS7 (the 6 new postgres tests pass). The real cause: the stale BeforeEach mocks commands that no longer exist in the code (Get-JITCloudTable, Get-AzTableRow, Remove-AzTableRow) - Pester 3 cannot mock a nonexistent command, so every test in those Describes fails at setup with 'Could not find Command Get-JITCloudTable'. FIX: repoint those mocks to the current JITHelpers functions Get-JITTableName/Get-JITTableRows/Remove-JITTableRow (as the new postgres Describe already does) - NOT a Pester upgrade. SEPARATE/UNVERIFIED: the 2 JITHelpers.Tests.ps1 'Should Throw' failures were not re-diagnosed and may be a distinct issue. No CI runs these tests (publish-plugin.yml only builds the C# plugin).",
+      "links": [],
+      "comments": [
+        {
+          "id": "c1",
+          "author": "developer",
+          "date": "2026-07-21T23:07:28Z",
+          "text": "Additional finding (2026-07-21): Remove-ExpiredRules.Tests.ps1 mocks are also STALE vs implementation - they mock Get-AzTableRow/Remove-AzTableRow/Get-JITCloudTable, but current run.ps1 uses Get-JITTableRows/Remove-JITTableRow via Invoke-TableRest (not Az.Table). So the dispatch/retry assertions there never hit the real flow. The Pester-v5 upgrade should ALSO rewrite these mocks to the current JITHelpers functions."
+        }
+      ],
+      "created": "2026-07-16T21:36:33Z",
+      "updated": "2026-07-21T23:12:48Z"
+    },
+    {
+      "id": "TODO-0007",
+      "title": "PowerShell script: configure Azure PIM (permanent eligibility) for JIT-Requester across subscriptions",
+      "state": "done",
+      "tags": [
+        "jit",
+        "scripts",
+        "pim"
+      ],
+      "description": "New src/scripts script. Params: -Subscriptions (list of sub IDs), -ActiveAssignment (Entra group display name -> permanent ACTIVE assignment), -EligibleAssignment (Entra group display name -> permanent ELIGIBLE assignment), -RoleName (default 'JIT-Requester'). Per subscription: resolve role def + group object IDs, relax the role management policy to ALLOW permanent eligibility (and permanent active), then create permanent (NoExpiration) eligible + active PIM assignments. PIM for Azure resources (ARM roleEligibilityScheduleRequests / roleAssignmentScheduleRequests). Idempotent, -WhatIf, per-sub summary. Requires PIM P2 licensing.",
+      "links": [],
+      "comments": [
+        {
+          "id": "c1",
+          "author": "developer",
+          "date": "2026-07-18T00:21:02Z",
+          "text": "Implemented as src/scripts/Set-JITPim.ps1 (Az.Accounts+Az.Resources; PIM for Azure resources). Verified cmdlet shapes vs MS Learn (azps-16.1.0). Policy relaxation: mutate EffectiveRule entries Expiration_Admin_Eligibility + Expiration_Admin_Assignment IsExpirationRequired=false. Permanent = -ExpirationType NoExpiration + -RequestType AdminAssign on New-AzRoleEligibilityScheduleRequest / New-AzRoleAssignmentScheduleRequest. Idempotent via Get-AzRoleEligibilitySchedule/Get-AzRoleAssignmentSchedule + conflict-catch; 3x15s retry for policy propagation. Syntax PARSE OK. LIVE EXECUTION NOT PERFORMED (no Az.Resources locally; needs P2 + Azure). First-run caveat: policy property assumed $policy.EffectiveRule - if the installed module differs the relaxation step errors clearly per-sub."
+        }
+      ],
+      "created": "2026-07-18T00:14:31Z",
+      "updated": "2026-07-18T00:21:03Z"
+    },
+    {
+      "id": "TODO-0008",
+      "title": "Enrich all JIT error messages with tenantId, subscription, and caller UPN",
+      "state": "proposed",
+      "tags": [
+        "jit",
+        "functionapp",
+        "plugin",
+        "observability"
+      ],
+      "description": "Function app: extend Write-JITAuditEvent (JITHelpers.psm1:508-546) with a tenantId field; thread $claims.tid; add tenantId/UPN/subscription to HTTP error bodies (centralize the 3 per-endpoint Write-JsonResponse copies); add the MISSING audit event on the Revoke role-denial (Revoke-JITAccess/run.ps1:104-107). Server already has UPN as $claims.upn. Plugin: add tenantId+subscription+resource to error toast/log Details (in scope at grant/revoke sites GrantFromTargetAsync ~1126, ConfirmRevokeAsync ~1205); put context in Details not the visible Message per INotifier guidance. OPEN DECISION: caller UPN is NOT available in the plugin (host exposes only TenantId+DisplayName; DisplayName is friendly name, not UPN). Options: server includes UPN in error bodies (covers 403 + server errors) and/or plugin fetches Graph GET /me per tenant (cached) for client-side-only errors. Note: expiry/timer path has no live token, so tenantId there needs persisting on the table row at grant time.",
       "links": [],
       "comments": [],
-      "created": "2026-07-16T21:36:33Z",
-      "updated": "2026-07-16T21:36:33Z"
+      "created": "2026-07-18T00:15:47Z",
+      "updated": "2026-07-18T00:15:47Z"
+    },
+    {
+      "id": "TODO-0009",
+      "title": "Plugin: retry-with-backoff on 403 role-denied grant (NOT token refresh)",
+      "state": "proposed",
+      "tags": [
+        "jit",
+        "plugin"
+      ],
+      "description": "User asked to 'refresh token and retry' on the 403 'caller does not hold JIT-Requester'. FINDING: token refresh is (a) IMPOSSIBLE via Contracts 1.3.0 - IPluginHttpClient.SendAsync has no forceRefresh, IPluginContext has no cache-invalidation, host overwrites auth header with a cached token; and (b) INEFFECTIVE anyway - server checks RBAC by the caller's stable oid via ARM at call time, not from token claims, so a fresh token changes nothing for a directly-assigned role; the real cause is RBAC propagation delay (~up to 5 min). EFFECTIVE FIX: bounded retry-with-backoff (2-3 attempts, short delay) on JitHttpException.StatusCode==403 inside GrantFromTargetAsync (wraps RequestAccessAsync ~JitAzAccessPlugin.cs:1096-1098); keep total under ~30-45s so the busy row doesn't hang. Branch on status code, not message text (plugin doesn't parse the message). GROUP-assignment edge case genuinely needs a fresh interactive login (host-owned) - only remedy is a re-sign-in guidance toast, or a Contracts enhancement request to host (IPluginContext.InvalidateToken -> existing CredentialFactory.Invalidate). OPEN DECISION: retry+re-sign-in hint vs retry-only vs retry+file host enhancement.",
+      "links": [],
+      "comments": [],
+      "created": "2026-07-18T00:15:48Z",
+      "updated": "2026-07-18T00:15:48Z"
+    },
+    {
+      "id": "TODO-0010",
+      "title": "Reconcile AppName mismatch between Deploy.ps1 and Test-JITAccess.ps1",
+      "state": "proposed",
+      "tags": [
+        "jit",
+        "scripts",
+        "bug"
+      ],
+      "description": "Deploy.ps1 uses $AppName='pgjitazaccess' while Test-JITAccess.ps1 defaults $AppName='jitazaccess'. These derive DIFFERENT resource names, so Test-JITAccess may target the wrong (non-existent) function app after a Deploy. Reconcile to a single source of truth.",
+      "links": [],
+      "comments": [],
+      "created": "2026-07-18T00:21:04Z",
+      "updated": "2026-07-18T00:21:04Z"
     }
   ]
 }

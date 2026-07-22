@@ -5,7 +5,7 @@
 # Removes an active JIT rule before its natural expiry.
 # The caller can only revoke rules they personally requested.
 #
-# Authorization: Bearer <AAD ARM token>; caller must hold the "JIT Requester"
+# Authorization: Bearer <AAD ARM token>; caller must hold the "JIT-Requester"
 # RBAC role within the subscription the rule targets.
 
 using namespace System.Net
@@ -54,7 +54,7 @@ $requestedBy = if ($claims.upn)         { $claims.upn }
                elseif ($claims.unique_name) { $claims.unique_name }
                else                         { $claims.sub }
 
-# NB: the JIT Requester RBAC role check is deferred until after the rule is
+# NB: the JIT-Requester RBAC role check is deferred until after the rule is
 # looked up (region 2) — it is evaluated against the subscription the rule
 # targets, not the function app's own host subscription.
 
@@ -98,12 +98,12 @@ if ($row.RequestedBy -ne $requestedBy) {
     return
 }
 
-# Authorization — caller must hold the 'JIT Requester' RBAC role within the
+# Authorization — caller must hold the 'JIT-Requester' RBAC role within the
 # subscription the rule targets (the same subscription they held it in to grant).
 if (-not (Test-CallerHasJitRequesterRole -CallerObjectId $callerObjectId -SubscriptionId $row.SubscriptionId)) {
     Write-JsonResponse -Status Forbidden -Body @{
-        error        = "Caller does not hold the 'JIT Requester' RBAC role in subscription '$($row.SubscriptionId)'."
-        requiredRole = 'JIT Requester'
+        error        = "Caller does not hold the 'JIT-Requester' RBAC role in subscription '$($row.SubscriptionId)'."
+        requiredRole = 'JIT-Requester'
     }
     return
 }
@@ -114,10 +114,11 @@ if (-not (Test-CallerHasJitRequesterRole -CallerObjectId $callerObjectId -Subscr
 
 try {
     switch ($row.TargetType) {
-        'nsg'            { Remove-JITNsgRule            -Row $row }
-        'sqlServer'      { Remove-JITSqlFirewallRule     -Row $row }
-        'storageAccount' { Remove-JITStorageNetworkRule  -Row $row }
-        'keyVault'       { Remove-JITKeyVaultNetworkRule -Row $row }
+        'nsg'                      { Remove-JITNsgRule              -Row $row }
+        'sqlServer'                { Remove-JITSqlFirewallRule      -Row $row }
+        'postgresqlFlexibleServer' { Remove-JITPostgresFirewallRule -Row $row }
+        'storageAccount'           { Remove-JITStorageNetworkRule   -Row $row }
+        'keyVault'                 { Remove-JITKeyVaultNetworkRule  -Row $row }
         default {
             Write-Warning "Unknown targetType '$($row.TargetType)' — skipping resource removal."
         }

@@ -18,9 +18,9 @@ $script:JwksCacheTtl = [TimeSpan]::FromHours(1)
 
 # The custom RBAC role a caller must hold (in the target subscription) to use
 # the JIT API. Hardcoded — deliberately NOT configurable via env var.
-$script:JitRequesterRoleName = 'JIT Requester'
+$script:JitRequesterRoleName = 'JIT-Requester'
 
-# Cache of the JIT Requester role definition GUID, keyed by subscription id.
+# Cache of the JIT-Requester role definition GUID, keyed by subscription id.
 # The GUID differs per subscription, so cache per-subscription for the
 # lifetime of the worker process.
 $script:JitRoleDefIdCache = @{}   # @{ <subscriptionId> = <guid> }
@@ -106,7 +106,7 @@ function Invoke-JwtValidation {
         commercial Azure; override via the EXPECTED_AUDIENCES env var for sovereign
         clouds, comma-separated).
 
-        Authorization (the JIT Requester role check) is performed by the caller
+        Authorization (the JIT-Requester role check) is performed by the caller
         via Test-CallerHasJitRequesterRole — keep this function focused on
         authentication only.
 
@@ -249,7 +249,7 @@ function Invoke-JwtValidation {
 function Get-JitRequesterRoleDefinitionGuid {
     <#
     .SYNOPSIS
-        Resolves the GUID of the 'JIT Requester' custom RBAC role definition
+        Resolves the GUID of the 'JIT-Requester' custom RBAC role definition
         within the given subscription. Cached per subscription for the lifetime
         of the worker process (the GUID can differ between subscriptions).
     #>
@@ -284,14 +284,14 @@ function Test-CallerHasJitRequesterRole {
     <#
     .SYNOPSIS
         Returns $true if the caller (identified by AAD objectId) has an active
-        assignment of the custom 'JIT Requester' role within the given target
+        assignment of the custom 'JIT-Requester' role within the given target
         subscription (at the /subscriptions/<id> scope, inherited from a parent
         management group, or on a child resource group / resource in it).
 
     .DESCRIPTION
         Uses the function app's managed identity to query ARM for role
         assignments via the assignedTo() filter at the TARGET subscription
-        scope. The caller must hold 'JIT Requester' in the subscription they
+        scope. The caller must hold 'JIT-Requester' in the subscription they
         are operating on — this is the subscription the request targets, NOT
         the function app's own host subscription.
 

@@ -185,10 +185,10 @@ Describe 'Test-CallerHasJitRequesterRole' {
     AfterEach  { Reset-DerivationState }
 
     # Full authorization against live ARM is covered by integration testing; here
-    # we only assert the cheap fail-closed path: if the 'JIT Requester' role
+    # we only assert the cheap fail-closed path: if the 'JIT-Requester' role
     # definition GUID cannot be resolved in the target subscription, access is
     # denied without ever querying role assignments.
-    It 'denies when the JIT Requester role GUID cannot be resolved in the subscription' {
+    It 'denies when the JIT-Requester role GUID cannot be resolved in the subscription' {
         Mock -ModuleName JITHelpers Get-JitRequesterRoleDefinitionGuid { $null }
         Test-CallerHasJitRequesterRole `
             -CallerObjectId '00000000-0000-0000-0000-0000000000aa' `

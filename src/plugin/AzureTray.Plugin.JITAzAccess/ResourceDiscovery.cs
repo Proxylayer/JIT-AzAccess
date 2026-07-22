@@ -15,8 +15,8 @@ namespace AzureTray.Plugin.JITAzAccess;
 /// <summary>
 /// Discovers JIT-eligible resources by querying ARM Resource Graph using the
 /// signed-in user's ARM token. Returns one <see cref="JitTarget"/> per
-/// resource of the four supported types (NSG, SQL Server, Storage Account,
-/// Key Vault) across every subscription the user can see.
+/// resource of the supported types (NSG, SQL Server, Storage Account,
+/// Key Vault, PostgreSQL Flexible Server) across every subscription the user can see.
 ///
 /// One Resource Graph query covers all subscriptions — no per-sub fan-out.
 /// The user only sees resources they themselves have ARM read access to,
@@ -37,7 +37,8 @@ Resources
     'microsoft.network/networksecuritygroups',
     'microsoft.sql/servers',
     'microsoft.storage/storageaccounts',
-    'microsoft.keyvault/vaults')
+    'microsoft.keyvault/vaults',
+    'microsoft.dbforpostgresql/flexibleservers')
 | extend jitFw = case(
     type =~ 'microsoft.storage/storageaccounts', properties.networkAcls.ipRules,
     type =~ 'microsoft.keyvault/vaults', properties.networkAcls.ipRules,
@@ -135,6 +136,7 @@ Resources
             "microsoft.sql/servers"                   => "sqlServer",
             "microsoft.storage/storageaccounts"       => "storageAccount",
             "microsoft.keyvault/vaults"               => "keyVault",
+            "microsoft.dbforpostgresql/flexibleservers" => "postgresqlFlexibleServer",
             _                                         => null,
         };
         if (targetType is null) return null;

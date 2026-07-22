@@ -2,7 +2,7 @@
 .SYNOPSIS
     Creates or updates a custom "JIT-AzAccess Manager" RBAC role and assigns it
     to the JIT function app's managed identity on one or more target subscriptions,
-    and creates the "JIT Requester" custom role definition (assignable in each of
+    and creates the "JIT-Requester" custom role definition (assignable in each of
     those subscriptions) that end users must hold to call the JIT API.
 
 .PARAMETER TargetSubscriptionIds
@@ -49,7 +49,7 @@ if (
 
 $roleName = 'JIT-AzAccess Manager'
 
-$roleDescription = 'Manages temporary IP allowlist entries on NSGs, SQL servers, storage accounts, and key vaults for JIT-AzAccess.'
+$roleDescription = 'Manages temporary IP allowlist entries on NSGs, SQL servers, PostgreSQL flexible servers, storage accounts, and key vaults for JIT-AzAccess.'
 
 $roleActions = @(
     'Microsoft.Network/networkSecurityGroups/read'
@@ -63,13 +63,18 @@ $roleActions = @(
     'Microsoft.Sql/servers/firewallRules/write'
     'Microsoft.Sql/servers/firewallRules/delete'
 
+    'Microsoft.DBforPostgreSQL/flexibleServers/read'
+    'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules/read'
+    'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules/write'
+    'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules/delete'
+
     'Microsoft.Storage/storageAccounts/read'
     'Microsoft.Storage/storageAccounts/write'
 
     'Microsoft.KeyVault/vaults/read'
     'Microsoft.KeyVault/vaults/write'
 
-    # Required by the function app to evaluate the JIT Requester RBAC role
+    # Required by the function app to evaluate the JIT-Requester RBAC role
     # assignment of each caller before granting access.
     'Microsoft.Authorization/roleAssignments/read'
     'Microsoft.Authorization/roleDefinitions/read'
@@ -107,8 +112,6 @@ foreach ($subId in $TargetSubscriptionIds) {
     $assignableScopes += "/subscriptions/$subId"
 }
 
-$tempRolePath = Join-Path $env:TEMP "jitrole.json"
-
 Write-Host ""
 Write-Host "Creating or updating role definition '$roleName'..."
 
@@ -138,52 +141,48 @@ if ($existingRole) {
     }
 }
 
-# Use the ARM-native camelCase shape with nested permissions[]. The legacy
-# PascalCase/flat form works on CREATE but trips a KeyError bug inside
-# az role definition update when an Id is provided. This shape is exactly
-# what `az role definition list` emits, so it round-trips cleanly through
-# create or update.
-$roleDefinition = [ordered]@{
-    roleName         = $roleName
-    description      = $roleDescription
-    assignableScopes = $assignableScopes
-    permissions      = @(
-        [ordered]@{
-            actions        = $roleActions
-            notActions     = @()
-            dataActions    = @()
-            notDataActions = @()
-        }
-    )
+# Build the role definition as a flat, PascalCase object and pipe it to az via
+# STDIN ("@-"). This is the shape `az role definition create/update` actually
+# accepts (it matches the official az docs example); the previous camelCase form
+# with a nested permissions[] array, written to a temp file, did not create the
+# role reliably in practice.
+$roleDefinition = @{
+    Name             = $roleName
+    Description      = $roleDescription
+    IsCustom         = $true
+    Actions          = $roleActions
+    NotActions       = @()
+    DataActions      = @()
+    NotDataActions   = @()
+    AssignableScopes = $assignableScopes
 }
 
-# For update, include the existing role's full ARM path under 'id'.
-# az role definition update pops 'Id' or 'id' from the body to identify the
-# role; without it, az logs "Role 'id' is missing" and falls back to a
-# lookup-by-name. The .name on the existing object is the GUID alone, but
-# az wants the full /subscriptions/.../roleDefinitions/<guid> path, which
-# is what .id holds.
-if ($existingRole) { $roleDefinition['id'] = $existingRole.id }
-
-$roleDefinition |
-    ConvertTo-Json -Depth 20 |
-    Set-Content -Path $tempRolePath -Encoding UTF8
-
 if ($existingRole) {
-    az role definition update `
-        --role-definition "@$tempRolePath" `
-        --output none `
-        --only-show-errors
+
+    # For update, include the existing role's full ARM path under 'Id' so az can
+    # identify the role. The .name on the existing object is the bare GUID; az
+    # needs the full /subscriptions/.../roleDefinitions/<guid> path, which .id
+    # holds.
+    $roleDefinition['Id'] = $existingRole.id
+
+    $roleDefinition |
+        ConvertTo-Json -Depth 10 -Compress |
+        az role definition update `
+            --role-definition "@-" `
+            --output none `
+            --only-show-errors
 
     Write-Host "  Role updated."
 }
 else {
     Write-Host "  Role does not exist. Creating..."
 
-    az role definition create `
-        --role-definition "@$tempRolePath" `
-        --output none `
-        --only-show-errors
+    $roleDefinition |
+        ConvertTo-Json -Depth 10 -Compress |
+        az role definition create `
+            --role-definition "@-" `
+            --output none `
+            --only-show-errors
 
     Write-Host "  Role created."
 }
@@ -223,17 +222,17 @@ foreach ($subId in $TargetSubscriptionIds) {
     }
 }
 
-# Create the "JIT Requester" custom role definition on each target subscription
+# Create the "JIT-Requester" custom role definition on each target subscription
 
 # This is the role end users must hold — in the subscription they are requesting
 # access INTO — to call the JIT API. The function app hardcodes the role name
-# 'JIT Requester', so it must not be renamed here. We create/update the
+# 'JIT-Requester', so it must not be renamed here. We create/update the
 # DEFINITION only (so it is assignable in each target subscription); assigning
 # specific users to it is an operator action (see README), not something this
 # script performs. The role grants no Azure control-plane actions by itself —
 # it is a pure access marker the function app checks for.
 
-$requesterRoleName        = 'JIT Requester'
+$requesterRoleName        = 'JIT-Requester'
 $requesterRoleDescription = 'Permits the holder to request JIT access in this subscription via the JIT-AzAccess function app. Assigned to end users; grants no Azure control-plane actions by itself.'
 
 Write-Host ""
@@ -270,43 +269,43 @@ if ($existingRequester) {
     }
 }
 
-$requesterRoleDefinition = [ordered]@{
-    roleName         = $requesterRoleName
-    description      = $requesterRoleDescription
-    assignableScopes = $requesterScopes
-    permissions      = @(
-        [ordered]@{
-            actions        = @()
-            notActions     = @()
-            dataActions    = @()
-            notDataActions = @()
-        }
-    )
+# Same flat, PascalCase + STDIN ("@-") shape as the manager role above. The
+# requester role grants no Azure actions, so Actions is empty.
+$requesterRoleDefinition = @{
+    Name             = $requesterRoleName
+    Description      = $requesterRoleDescription
+    IsCustom         = $true
+    Actions          = @()
+    NotActions       = @()
+    DataActions      = @()
+    NotDataActions   = @()
+    AssignableScopes = $requesterScopes
 }
 
-if ($existingRequester) { $requesterRoleDefinition['id'] = $existingRequester.id }
-
-$tempRequesterPath = Join-Path $env:TEMP "jit-requester-role.json"
-
-$requesterRoleDefinition |
-    ConvertTo-Json -Depth 20 |
-    Set-Content -Path $tempRequesterPath -Encoding UTF8
-
 if ($existingRequester) {
-    az role definition update `
-        --role-definition "@$tempRequesterPath" `
-        --output none `
-        --only-show-errors
+
+    # Full ARM path under 'Id' so az can identify the role on update (see note
+    # on the manager role above).
+    $requesterRoleDefinition['Id'] = $existingRequester.id
+
+    $requesterRoleDefinition |
+        ConvertTo-Json -Depth 10 -Compress |
+        az role definition update `
+            --role-definition "@-" `
+            --output none `
+            --only-show-errors
 
     Write-Host "  Role updated."
 }
 else {
     Write-Host "  Role does not exist. Creating..."
 
-    az role definition create `
-        --role-definition "@$tempRequesterPath" `
-        --output none `
-        --only-show-errors
+    $requesterRoleDefinition |
+        ConvertTo-Json -Depth 10 -Compress |
+        az role definition create `
+            --role-definition "@-" `
+            --output none `
+            --only-show-errors
 
     Write-Host "  Role created."
 }

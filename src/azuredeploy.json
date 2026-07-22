@@ -13,10 +13,10 @@
         },
         "appName": {
             "type": "string",
-            "defaultValue": "jitazaccess",
+            "defaultValue": "pgjitazaccess",
             "maxLength": 15,
             "metadata": {
-                "description": "Short lowercase alphanumeric identifier (3-15 chars, no hyphens) used to derive all resource names. E.g. 'jitazaccess' produces func-jitazaccess, key-jitazaccess, etc."
+                "description": "Short lowercase alphanumeric identifier (3-15 chars, no hyphens) used to derive all resource names. E.g. 'pgjitazaccess' produces func-pgjitazaccess, key-pgjitazaccess, etc."
             }
         },
         "azureTrayAppRegistrationName": {

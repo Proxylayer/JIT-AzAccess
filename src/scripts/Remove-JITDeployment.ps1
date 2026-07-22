@@ -15,11 +15,11 @@
       3. Remove the function app MI from the AzureTray app reg's owners list.
       4. Revoke the Graph 'Application.ReadWrite.OwnedBy' app role assignment
          from the function app MI.
-      5. Remove all role assignments of the 'JIT Requester' role at the
+      5. Remove all role assignments of the 'JIT-Requester' role at the
          function app site scope.
       6. Remove all role assignments of the 'JIT-AzAccess Manager' role from
          the function app MI on each target subscription.
-      7. Delete the 'JIT Requester' and 'JIT-AzAccess Manager' custom role
+      7. Delete the 'JIT-Requester' and 'JIT-AzAccess Manager' custom role
          definitions (only when no assignments remain).
       8. Delete the resource group (cascades storage, plan, function app, MI).
       9. Optionally delete the legacy 'JIT-AzAccess' API app registration that
@@ -32,7 +32,7 @@
     Subscription that hosts the function app / where the role definitions live.
 
 .PARAMETER AppName
-    Short lowercase alphanumeric name used to derive resource names. Default: jitazaccess
+    Short lowercase alphanumeric name used to derive resource names. Default: pgjitazaccess
 
 .PARAMETER ResourceGroupName
     Resource group to delete. Default: rg-jit-azaccess
@@ -42,7 +42,7 @@
     we clean up). Default: AzureTray
 
 .PARAMETER JitRequesterRoleName
-    Name of the custom RBAC role that gates user access. Default: "JIT Requester"
+    Name of the custom RBAC role that gates user access. Default: "JIT-Requester"
 
 .PARAMETER JitManagerRoleName
     Name of the function app MI's custom RBAC role. Default: "JIT-AzAccess Manager"
@@ -90,10 +90,10 @@ param(
     [Parameter(Mandatory)]
     [string]$SubscriptionId,
 
-    [string]   $AppName                       = 'jitazaccess',
+    [string]   $AppName                       = 'pgjitazaccess',
     [string]   $ResourceGroupName             = 'rg-jit-azaccess',
     [string]   $AzureTrayAppRegistrationName  = 'AzureTray',
-    [string]   $JitRequesterRoleName          = 'JIT Requester',
+    [string]   $JitRequesterRoleName          = 'JIT-Requester',
     [string]   $JitManagerRoleName            = 'JIT-AzAccess Manager',
     [string[]] $TargetSubscriptionIds,
     [string]   $LegacyJitAppRegistrationName  = 'JIT-AzAccess',
@@ -309,7 +309,7 @@ elseif ($principalId) {
     }
 }
 
-# ── Step 5: Remove all role assignments for JIT Requester (any scope) ────────
+# ── Step 5: Remove all role assignments for JIT-Requester (any scope) ────────
 
 Step "Step 5: Remove all '$JitRequesterRoleName' role assignments"
 

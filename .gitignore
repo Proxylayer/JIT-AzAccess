@@ -13,6 +13,7 @@
 # NuGet
 *.nupkg
 *.snupkg
+NuGet/
 
 # PowerShell local Az context
 .azure/

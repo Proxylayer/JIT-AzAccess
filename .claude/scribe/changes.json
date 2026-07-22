@@ -1,7 +1,7 @@
 {
   "docType": "changes",
   "idPrefix": "CHG",
-  "nextId": 21,
+  "nextId": 33,
   "items": [
     {
       "id": "CHG-0001",
@@ -382,6 +382,234 @@
       "comments": [],
       "created": "2026-07-16T21:40:01Z",
       "updated": "2026-07-16T21:40:01Z"
+    },
+    {
+      "id": "CHG-0021",
+      "title": "add todos TODO-0007",
+      "state": "done",
+      "tags": [
+        "todos",
+        "add"
+      ],
+      "description": "Added 'PowerShell script: configure Azure PIM (permanent eligibility) for JIT-Requester across subscriptions'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0007"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-18T00:14:31Z",
+      "updated": "2026-07-18T00:14:31Z"
+    },
+    {
+      "id": "CHG-0022",
+      "title": "add todos TODO-0008",
+      "state": "done",
+      "tags": [
+        "todos",
+        "add"
+      ],
+      "description": "Added 'Enrich all JIT error messages with tenantId, subscription, and caller UPN'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0008"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-18T00:15:47Z",
+      "updated": "2026-07-18T00:15:47Z"
+    },
+    {
+      "id": "CHG-0023",
+      "title": "add todos TODO-0009",
+      "state": "done",
+      "tags": [
+        "todos",
+        "add"
+      ],
+      "description": "Added 'Plugin: retry-with-backoff on 403 role-denied grant (NOT token refresh)'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0009"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-18T00:15:48Z",
+      "updated": "2026-07-18T00:15:48Z"
+    },
+    {
+      "id": "CHG-0024",
+      "title": "addComment todos TODO-0007",
+      "state": "done",
+      "tags": [
+        "todos",
+        "addComment"
+      ],
+      "description": "Comment c1 by developer.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0007"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-18T00:21:02Z",
+      "updated": "2026-07-18T00:21:02Z"
+    },
+    {
+      "id": "CHG-0025",
+      "title": "setState todos TODO-0007",
+      "state": "done",
+      "tags": [
+        "todos",
+        "setState"
+      ],
+      "description": "State: active -> done.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0007"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-18T00:21:03Z",
+      "updated": "2026-07-18T00:21:03Z"
+    },
+    {
+      "id": "CHG-0026",
+      "title": "add todos TODO-0010",
+      "state": "done",
+      "tags": [
+        "todos",
+        "add"
+      ],
+      "description": "Added 'Reconcile AppName mismatch between Deploy.ps1 and Test-JITAccess.ps1'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0010"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-18T00:21:04Z",
+      "updated": "2026-07-18T00:21:04Z"
+    },
+    {
+      "id": "CHG-0027",
+      "title": "add features FEAT-0001",
+      "state": "done",
+      "tags": [
+        "features",
+        "add"
+      ],
+      "description": "Added 'Add PostgreSQL Flexible Server as a JIT whitelist targetType'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "FEAT-0001"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-21T22:59:10Z",
+      "updated": "2026-07-21T22:59:10Z"
+    },
+    {
+      "id": "CHG-0028",
+      "title": "addComment todos TODO-0006",
+      "state": "done",
+      "tags": [
+        "todos",
+        "addComment"
+      ],
+      "description": "Comment c1 by developer.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0006"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-21T23:07:28Z",
+      "updated": "2026-07-21T23:07:28Z"
+    },
+    {
+      "id": "CHG-0029",
+      "title": "addComment features FEAT-0001",
+      "state": "done",
+      "tags": [
+        "features",
+        "addComment"
+      ],
+      "description": "Comment c1 by developer.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "FEAT-0001"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-21T23:07:30Z",
+      "updated": "2026-07-21T23:07:30Z"
+    },
+    {
+      "id": "CHG-0030",
+      "title": "update todos TODO-0006",
+      "state": "done",
+      "tags": [
+        "todos",
+        "update"
+      ],
+      "description": "Updated title, description.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0006"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-21T23:12:48Z",
+      "updated": "2026-07-21T23:12:48Z"
+    },
+    {
+      "id": "CHG-0031",
+      "title": "addComment features FEAT-0001",
+      "state": "done",
+      "tags": [
+        "features",
+        "addComment"
+      ],
+      "description": "Comment c2 by testcase.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "FEAT-0001"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-21T23:12:48Z",
+      "updated": "2026-07-21T23:12:48Z"
+    },
+    {
+      "id": "CHG-0032",
+      "title": "setState features FEAT-0001",
+      "state": "done",
+      "tags": [
+        "features",
+        "setState"
+      ],
+      "description": "State: active -> done.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "FEAT-0001"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-21T23:12:49Z",
+      "updated": "2026-07-21T23:12:49Z"
     }
   ]
 }

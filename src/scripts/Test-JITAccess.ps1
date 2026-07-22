@@ -7,13 +7,13 @@
     Runs the following checks against the deployment in -SubscriptionId. Each
     failure is reported but the script keeps going so you see the whole picture.
 
-      1. JIT Requester custom RBAC role exists at subscription scope.
-      2. The signed-in user holds the JIT Requester role at, above, or below
+      1. JIT-Requester custom RBAC role exists at subscription scope.
+      2. The signed-in user holds the JIT-Requester role at, above, or below
          the function app site (ARM's assignedTo() filter — includes inherited).
       3. JIT-AzAccess Manager role DEFINITION exists AND its Actions list
          contains every ARM action the function app actually needs at runtime
          (NSG / SQL / Storage / Key Vault rule management, plus the
-         Microsoft.Authorization read actions used by the JIT Requester
+         Microsoft.Authorization read actions used by the JIT-Requester
          role check).
       4. Function app's managed identity holds JIT-AzAccess Manager on every
          -TargetSubscriptionIds.
@@ -43,7 +43,7 @@
     Defaults to the deployment subscription.
 
 .PARAMETER JitRequesterRoleName
-    Name of the user-facing RBAC role. Default: "JIT Requester"
+    Name of the user-facing RBAC role. Default: "JIT-Requester"
 
 .PARAMETER JitManagerRoleName
     Name of the MI's RBAC role. Default: "JIT-AzAccess Manager"
@@ -63,7 +63,7 @@ param(
     [string]   $ResourceGroupName             = 'rg-jit-azaccess',
     [string]   $SubscriptionId,
     [string[]] $TargetSubscriptionIds,
-    [string]   $JitRequesterRoleName          = 'JIT Requester',
+    [string]   $JitRequesterRoleName          = 'JIT-Requester',
     [string]   $JitManagerRoleName            = 'JIT-AzAccess Manager',
     [string]   $AzureTrayAppRegistrationName  = 'AzureTray'
 )
@@ -122,7 +122,7 @@ $hostname = Trim-Or-Empty (az functionapp show `
     --name $functionAppName --resource-group $ResourceGroupName --subscription $SubscriptionId `
     --query defaultHostName --output tsv 2>$null)
 
-# ── Check 1: 'JIT Requester' role definition exists ──────────────────────────
+# ── Check 1: 'JIT-Requester' role definition exists ──────────────────────────
 
 Step "Check 1: '$JitRequesterRoleName' role definition"
 
@@ -136,7 +136,7 @@ if ($requesterDef.Count -eq 0) {
     Pass "Role exists (assignable on: $scopes)."
 }
 
-# ── Check 2: signed-in user holds JIT Requester ──────────────────────────────
+# ── Check 2: signed-in user holds JIT-Requester ──────────────────────────────
 
 Step "Check 2: '$JitRequesterRoleName' assignment for the signed-in caller"
 
@@ -200,6 +200,10 @@ $requiredManagerActions = @(
     'Microsoft.Sql/servers/firewallRules/read'
     'Microsoft.Sql/servers/firewallRules/write'
     'Microsoft.Sql/servers/firewallRules/delete'
+    'Microsoft.DBforPostgreSQL/flexibleServers/read'
+    'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules/read'
+    'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules/write'
+    'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules/delete'
     'Microsoft.Storage/storageAccounts/read'
     'Microsoft.Storage/storageAccounts/write'
     'Microsoft.KeyVault/vaults/read'

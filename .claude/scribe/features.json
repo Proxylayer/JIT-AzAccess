@@ -1,6 +1,36 @@
 {
   "docType": "features",
   "idPrefix": "FEAT",
-  "nextId": 1,
-  "items": []
+  "nextId": 2,
+  "items": [
+    {
+      "id": "FEAT-0001",
+      "title": "Add PostgreSQL Flexible Server as a JIT whitelist targetType",
+      "state": "done",
+      "tags": [
+        "jit",
+        "functionapp",
+        "plugin",
+        "postgres"
+      ],
+      "description": "New targetType token 'postgresqlFlexibleServer' (camelCase, like sqlServer). ARM provider Microsoft.DBforPostgreSQL/flexibleServers; Resource Graph type lowercase 'microsoft.dbforpostgresql/flexibleservers'. Firewall child path .../flexibleServers/{name}/firewallRules/{ruleName}, api-version 2024-08-01, body {properties:{startIpAddress,endIpAddress}} (same as SQL). DECISIONS: (1) create AND delete are async 202+Azure-AsyncOperation -> POLL to completion (honor Retry-After, bounded timeout); a failed/timed-out expiry delete must NOT delete the table row (retries next cycle) and must audit. (2) PRE-FLIGHT REJECT private-access/VNet-integrated servers (they have no firewall rules) with a clear denial. Stored rule shape unchanged. Touchpoints: JITTargets.psm1 (new Add/Remove-JITPostgresFirewallRule + LRO poll helper + exports); Request-JITAccess run.ps1 (header, supportedTypes L133, dispatch L330-334); Revoke run.ps1 switch; Remove-ExpiredRules run.ps1 (supportedTypes L45, switch); Manager role in 3 synced places (JIT-AzAccess-Manager.json, Grant-JITPermissions.ps1, Test-JITAccess.ps1) add flexibleServers read + firewallRules read/write/delete + descriptions; plugin ResourceDiscovery.cs KQL+map, ArmVerifier.cs const+switch+VerifyPostgresRuleAsync, JitAzAccessPlugin.cs TargetTypeLabel, JitTarget.cs doc; README L184; new dispatch test in Remove-ExpiredRules.Tests.ps1.",
+      "links": [],
+      "comments": [
+        {
+          "id": "c1",
+          "author": "developer",
+          "date": "2026-07-21T23:07:30Z",
+          "text": "Implemented both halves (function app + plugin), builds/parses clean. Function app: Invoke-ArmRestRaw added to expose 202 headers; Wait-JITArmAsyncOperation LRO poller (Retry-After, 180s cap); Add/Remove-JITPostgresFirewallRule; private-access pre-flight -> 409 + JITDenied via PRIVATE_SERVER_REJECTED sentinel; role synced in 3 places; Remove-Expired preserves row on delete failure. Plugin: ResourceDiscovery KQL+map (lowercase key), ArmVerifier PostgresApi+VerifyPostgresRuleAsync, TargetTypeLabel 'PostgreSQL', JitTarget doc. Pending: testcase pass for dispatch tests. NOT committed."
+        },
+        {
+          "id": "c2",
+          "author": "testcase",
+          "date": "2026-07-21T23:12:48Z",
+          "text": "Testcase pass: added 6 postgres dispatch tests to Remove-ExpiredRules.Tests.ps1 (happy path: Remove-JITPostgresFirewallRule called once, others 0, row deleted, JITExpired audit; failure path: row preserved, JITRemoveFailed audit). All 6 PASS under Pester 3.4/PS7. Mocked current functions (Get-JITTableRows/Remove-JITTableRow/Write-JITAuditEvent), not stale Az.* mocks."
+        }
+      ],
+      "created": "2026-07-21T22:59:10Z",
+      "updated": "2026-07-21T23:12:49Z"
+    }
+  ]
 }

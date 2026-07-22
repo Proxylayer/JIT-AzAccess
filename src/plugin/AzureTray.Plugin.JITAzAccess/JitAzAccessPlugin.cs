@@ -23,7 +23,7 @@ namespace AzureTray.Plugin.JITAzAccess;
 ///     app registration the signed-in user can read via Graph (the JIT function
 ///     app self-registers its URL as a tag via profile.ps1 on cold start).
 ///   • Authorization at the function app is gated on the caller holding a
-///     custom "JIT Requester" RBAC role on the function app site resource.
+///     custom "JIT-Requester" RBAC role on the function app site resource.
 ///
 /// Multi-tenant: every ready tenant the host surfaces (already filtered to the
 /// tenants the plugin is enabled for) is tracked independently, with its own
@@ -336,7 +336,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
 
     // Display string mentioned in the menu when auth is blocked. The actual
     // role name comes from the server; this is purely a hint to the user.
-    private const string JitRequesterRoleNameDefault = "JIT Requester";
+    private const string JitRequesterRoleNameDefault = "JIT-Requester";
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -1283,6 +1283,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         "sqlServer"      => "SQL",
         "storageAccount" => "Storage",
         "keyVault"       => "Key Vault",
+        "postgresqlFlexibleServer" => "PostgreSQL",
         _                => targetType,
     };
 
