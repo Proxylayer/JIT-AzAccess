@@ -42,7 +42,7 @@ Write-Host "JIT cleanup: found $($expired.Count) expired rule(s) to remove."
 
 #region ── Remove each expired rule ──────────────────────────────────────────
 
-$supportedTypes = @('nsg', 'sqlServer', 'storageAccount', 'keyVault')
+$supportedTypes = @('nsg', 'sqlServer', 'postgresqlFlexibleServer', 'storageAccount', 'keyVault')
 
 foreach ($row in $expired) {
     $label = "'$($row.RuleIdentifier)' ($($row.TargetType)) on '$($row.ResourceName)' (expired $($row.ExpiryUtc))"
@@ -60,10 +60,11 @@ foreach ($row in $expired) {
     $removed = $false
     try {
         switch ($row.TargetType) {
-            'nsg'            { Remove-JITNsgRule            -Row $row }
-            'sqlServer'      { Remove-JITSqlFirewallRule     -Row $row }
-            'storageAccount' { Remove-JITStorageNetworkRule  -Row $row }
-            'keyVault'       { Remove-JITKeyVaultNetworkRule -Row $row }
+            'nsg'                      { Remove-JITNsgRule              -Row $row }
+            'sqlServer'                { Remove-JITSqlFirewallRule      -Row $row }
+            'postgresqlFlexibleServer' { Remove-JITPostgresFirewallRule -Row $row }
+            'storageAccount'           { Remove-JITStorageNetworkRule   -Row $row }
+            'keyVault'                 { Remove-JITKeyVaultNetworkRule  -Row $row }
         }
         Write-Host "  Removed $label"
         Write-JITAuditEvent -EventType JITExpired `

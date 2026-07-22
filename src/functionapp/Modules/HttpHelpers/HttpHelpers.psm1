@@ -120,6 +120,89 @@ function Invoke-ArmRest {
     Invoke-RestMethod @params -ErrorAction Stop
 }
 
+function Invoke-ArmRestRaw {
+    <#
+    .SYNOPSIS
+        Same request shape as Invoke-ArmRest, but returns the raw HTTP response
+        so callers can inspect the status code and response headers. Needed for
+        asynchronous (long-running) ARM operations that reply 202 Accepted with
+        `Azure-AsyncOperation` / `Location` / `Retry-After` headers that must be
+        polled to completion — information Invoke-RestMethod discards.
+
+        Returns a hashtable:
+            @{ StatusCode = <int>; Headers = <hashtable>; Content = <string> }
+
+    .PARAMETER Path
+        Either an absolute URL (https://management.azure.com/...) or a path
+        starting with "/subscriptions/..." which gets prefixed with the ARM host.
+        Async-operation poll URLs from a 202 response are absolute and pass
+        through unchanged.
+
+    .PARAMETER ApiVersion
+        Defaults to "2022-04-01". Pass a per-resource api-version when needed.
+        Ignored when the URL already carries an api-version (e.g. LRO poll URLs).
+
+    .PARAMETER Body
+        Either a hashtable (will be JSON-serialized) or a pre-serialized string.
+
+    .PARAMETER Query
+        Optional hashtable of additional query parameters appended to the URL.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [string]    $Method     = 'GET',
+        [string]    $ApiVersion = '2022-04-01',
+        $Body                   = $null,
+        [hashtable] $Query      = @{}
+    )
+
+    $token = Get-ManagedIdentityToken -Resource 'https://management.azure.com/'
+
+    $uri = if ($Path -like 'http*') { $Path } else { "https://management.azure.com$Path" }
+
+    $qs = @()
+    if ($uri -notmatch 'api-version=') { $qs += "api-version=$ApiVersion" }
+    foreach ($k in $Query.Keys) {
+        $qs += ("{0}={1}" -f [Uri]::EscapeDataString($k), [Uri]::EscapeDataString([string]$Query[$k]))
+    }
+    if ($qs.Count -gt 0) {
+        $sep = if ($uri.Contains('?')) { '&' } else { '?' }
+        $uri = "$uri$sep$($qs -join '&')"
+    }
+
+    $params = @{
+        Method  = $Method
+        Uri     = $uri
+        Headers = @{ Authorization = "Bearer $token" }
+    }
+    if ($null -ne $Body) {
+        $params.ContentType = 'application/json'
+        $params.Body = if ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Depth 20 -Compress }
+    }
+
+    # Invoke-WebRequest (unlike Invoke-RestMethod) surfaces StatusCode and the
+    # full response Headers. A non-2xx still throws (caught by callers via
+    # Get-StatusFromError), preserving the existing 404-swallow behavior.
+    $resp = Invoke-WebRequest @params -ErrorAction Stop
+
+    # Normalize headers into a plain hashtable of single string values. PS7's
+    # response headers are string[]; collapse arrays to a comma-joined string.
+    $headers = @{}
+    if ($resp.Headers) {
+        foreach ($h in $resp.Headers.GetEnumerator()) {
+            $val = $h.Value
+            if ($val -is [System.Array]) { $val = ($val -join ',') }
+            $headers[[string]$h.Key] = [string]$val
+        }
+    }
+
+    return @{
+        StatusCode = [int]$resp.StatusCode
+        Headers    = $headers
+        Content    = [string]$resp.Content
+    }
+}
+
 #endregion
 
 #region ── Storage shared-key signing ───────────────────────────────────────────
@@ -508,6 +591,7 @@ function Invoke-TableRest {
 Export-ModuleMember -Function @(
     'Get-ManagedIdentityToken'
     'Invoke-ArmRest'
+    'Invoke-ArmRestRaw'
     'Invoke-BlobRest'
     'Test-BlobExists'
     'Test-ContainerExists'

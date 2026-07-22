@@ -23,6 +23,7 @@ internal sealed class ArmVerifier
     private const string SqlApi          = "2021-11-01";
     private const string StorageApi      = "2023-01-01";
     private const string KeyVaultApi     = "2023-07-01";
+    private const string PostgresApi     = "2024-08-01";
     private const string ArmBase         = "https://management.azure.com";
 
     private static readonly JsonSerializerOptions JsonOpts = new()
@@ -61,6 +62,7 @@ internal sealed class ArmVerifier
                 "sqlServer"      => await VerifySqlRuleAsync(grant, tenantId, linked.Token),
                 "storageAccount" => await VerifyStorageRuleAsync(grant, tenantId, linked.Token),
                 "keyVault"       => await VerifyKeyVaultRuleAsync(grant, tenantId, linked.Token),
+                "postgresqlFlexibleServer" => await VerifyPostgresRuleAsync(grant, tenantId, linked.Token),
                 _                => VerificationResult.Skipped,
             };
 
@@ -106,6 +108,19 @@ internal sealed class ArmVerifier
         var url = $"{ArmBase}/subscriptions/{grant.SubscriptionId}/resourceGroups/{grant.ResourceGroup}" +
                   $"/providers/Microsoft.Sql/servers/{grant.ResourceName}" +
                   $"/firewallRules/{grant.RuleId}?api-version={SqlApi}";
+
+        var response = await ArmGetAsync(tenantId, url, ct).ConfigureAwait(false);
+        return response.IsSuccessStatusCode ? VerificationResult.Confirmed : VerificationResult.NotFound;
+    }
+
+    // ── Azure Database for PostgreSQL Flexible Server — check firewall rule by name ──
+
+    private async Task<VerificationResult> VerifyPostgresRuleAsync(
+        JitGrantResponse grant, string tenantId, CancellationToken ct)
+    {
+        var url = $"{ArmBase}/subscriptions/{grant.SubscriptionId}/resourceGroups/{grant.ResourceGroup}" +
+                  $"/providers/Microsoft.DBforPostgreSQL/flexibleServers/{grant.ResourceName}" +
+                  $"/firewallRules/{grant.RuleId}?api-version={PostgresApi}";
 
         var response = await ArmGetAsync(tenantId, url, ct).ConfigureAwait(false);
         return response.IsSuccessStatusCode ? VerificationResult.Confirmed : VerificationResult.NotFound;

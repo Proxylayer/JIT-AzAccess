@@ -2,7 +2,7 @@
 #
 # HTTP POST — Grants a caller's IP address temporary access on a supported target resource.
 #
-# Supported targetType values:  nsg | sqlServer | storageAccount | keyVault
+# Supported targetType values:  nsg | sqlServer | postgresqlFlexibleServer | storageAccount | keyVault
 #
 # Minimum request body:
 # {
@@ -16,7 +16,7 @@
 #
 # Authorization: Bearer <AAD ARM token>
 #   Token must be issued by the app's tenant and carry an ARM audience.
-#   Caller's AAD objectId must hold the "JIT Requester" custom RBAC role
+#   Caller's AAD objectId must hold the "JIT-Requester" custom RBAC role
 #   (hardcoded role name) WITHIN the target subscription named in the request
 #   body — i.e. the subscription the caller is requesting access into.
 
@@ -91,7 +91,7 @@ if (-not $callerObjectId) {
     return
 }
 
-# NB: the JIT Requester RBAC role check is deferred to region 2b — it is
+# NB: the JIT-Requester RBAC role check is deferred to region 2b — it is
 # evaluated against the TARGET subscription parsed from the request body, not
 # the function app's own host subscription.
 
@@ -130,7 +130,7 @@ $durationHours  = [int]$body.durationHours
 $port           = $body.port          # NSG only — null means any port
 $justification  = $body.justification # Optional free-text reason; required when target.requiresJustification = true
 
-$supportedTypes = @('nsg', 'sqlServer', 'storageAccount', 'keyVault')
+$supportedTypes = @('nsg', 'sqlServer', 'postgresqlFlexibleServer', 'storageAccount', 'keyVault')
 
 if ($targetType -notin $supportedTypes) {
     Write-JsonResponse -Status BadRequest -Body @{
@@ -186,17 +186,17 @@ if ($justification -and $justification.Length -gt 500) {
 
 #region ── 2b. Authorize caller in the target subscription ─────────────────────
 
-# The caller must hold the 'JIT Requester' custom RBAC role in the subscription
+# The caller must hold the 'JIT-Requester' custom RBAC role in the subscription
 # they are requesting access INTO — evaluated against the request body's
 # subscriptionId, not the function app's own host subscription. The role
 # definition must exist and be assigned to the caller within that subscription.
 if (-not (Test-CallerHasJitRequesterRole -CallerObjectId $callerObjectId -SubscriptionId $subscriptionId)) {
     Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp 'unknown' `
         -SubscriptionId $subscriptionId -DenyReason 'MissingJitRequesterRole' `
-        -Extra @{ requiredRole = 'JIT Requester' }
+        -Extra @{ requiredRole = 'JIT-Requester' }
     Write-JsonResponse -Status Forbidden -Body @{
-        error        = "Caller does not hold the 'JIT Requester' RBAC role in subscription '$subscriptionId'."
-        requiredRole = 'JIT Requester'
+        error        = "Caller does not hold the 'JIT-Requester' RBAC role in subscription '$subscriptionId'."
+        requiredRole = 'JIT-Requester'
     }
     return
 }
@@ -328,9 +328,10 @@ try {
     }
     else {
         $result = switch ($targetType) {
-            'sqlServer'      { Add-JITSqlFirewallRule     @addParams }
-            'storageAccount' { Add-JITStorageNetworkRule  @addParams }
-            'keyVault'       { Add-JITKeyVaultNetworkRule @addParams }
+            'sqlServer'                { Add-JITSqlFirewallRule      @addParams }
+            'postgresqlFlexibleServer' { Add-JITPostgresFirewallRule @addParams }
+            'storageAccount'           { Add-JITStorageNetworkRule   @addParams }
+            'keyVault'                 { Add-JITKeyVaultNetworkRule  @addParams }
         }
     }
 
@@ -340,6 +341,22 @@ try {
         -Extra @{ expiresUtc = $expiry.ToString('o'); port = $portVal; durationHours = $durationHours; justification = $justification }
 }
 catch {
+    # A PostgreSQL flexible server on private/VNet networking has no firewall to
+    # write to. Add-JITPostgresFirewallRule throws a sentinel-prefixed message so
+    # we can surface a clean 409 denial (+ JITDenied audit) instead of a generic
+    # 500. Keep this literal in sync with $script:PostgresPrivateRejectPrefix in
+    # Modules/JITTargets/JITTargets.psm1.
+    $errMsg = $_.Exception.Message
+    if ($errMsg -like 'PRIVATE_SERVER_REJECTED:*') {
+        $clientMsg = ($errMsg -replace '^PRIVATE_SERVER_REJECTED:\s*', '')
+        Write-Error "JIT target modification denied (private server): $clientMsg"
+        Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp $callerIp `
+            -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
+            -SubscriptionId $subscriptionId -RuleId $ruleId -DenyReason 'PrivateServerNotSupported'
+        Write-JsonResponse -Status Conflict -Body @{ error = $clientMsg }
+        return
+    }
+
     Write-Error "JIT target modification failed: $_"
     Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp $callerIp `
         -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `

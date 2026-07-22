@@ -11,7 +11,7 @@
            a. The custom "JIT-AzAccess Manager" RBAC role assigned to the MI on
               each target subscription (so it can write NSG/SQL/Storage/Key Vault
               firewall rules)
-           a2. The custom "JIT Requester" role definition made assignable on each
+           a2. The custom "JIT-Requester" role definition made assignable on each
                target subscription. Admins assign this role to end users in the
                subscription they should be able to request JIT access INTO — the
                function app checks the caller holds it in the target subscription.
@@ -21,7 +21,7 @@
       4. Restart the function app so profile.ps1 self-registers its URL on
          the AzureTray host's app registration.
 
-    The "JIT Requester" role is created/assigned ONLY in the target
+    The "JIT-Requester" role is created/assigned ONLY in the target
     subscriptions (via Grant-JITPermissions.ps1). It is NOT needed in the host
     subscription: the Get-JITRules listing endpoint requires only authentication,
     and callers only ever see their own rules.
@@ -38,7 +38,7 @@
     Azure region (e.g. eastus, westeurope).
 
 .PARAMETER AppName
-    Short lowercase alphanumeric name used to derive resource names (default: jitazaccess).
+    Short lowercase alphanumeric name used to derive resource names (default: pgjitazaccess).
 
 .PARAMETER ResourceGroupName
     Resource group to create (default: rg-jit-azaccess).
@@ -81,7 +81,7 @@ param(
     [string]$SubscriptionId,
 
     [string]$Location,
-    [string]$AppName                       = 'jitazaccess',
+    [string]$AppName                       = 'pgjitazaccess',
     [string]$ResourceGroupName             = 'rg-jit-azaccess',
     [string]$AzureTrayAppRegistrationName  = 'AzureTray',
     [string]$ParametersFile,
@@ -92,9 +92,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# The function app hardcodes the requester role name 'JIT Requester'; it is no
+# The function app hardcodes the requester role name 'JIT-Requester'; it is no
 # longer configurable, so the deployment must use exactly this name.
-$JitRequesterRoleName = 'JIT Requester'
+$JitRequesterRoleName = 'JIT-Requester'
 
 $scriptDir    = $PSScriptRoot
 $repoRoot     = Split-Path $scriptDir -Parent

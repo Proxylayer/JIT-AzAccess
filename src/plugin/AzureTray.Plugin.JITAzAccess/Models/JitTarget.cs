@@ -16,7 +16,7 @@ public sealed record JitTarget
     [JsonPropertyName("displayName")]
     public string DisplayName { get; init; } = string.Empty;
 
-    /// <summary>nsg | sqlServer | storageAccount | keyVault</summary>
+    /// <summary>nsg | sqlServer | storageAccount | keyVault | postgresqlFlexibleServer</summary>
     [JsonPropertyName("targetType")]
     public string TargetType { get; init; } = string.Empty;
 

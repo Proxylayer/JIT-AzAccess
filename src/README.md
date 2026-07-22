@@ -17,7 +17,7 @@ The function app accepts **plain ARM-audience tokens** (`https://management.azur
 by the calling user's tenant — no dedicated JIT app registration, no custom OAuth scope.
 
 Authorization is gated on Azure RBAC for the actions that change access: to
-**request** access the caller must hold the custom **"JIT Requester"** role
+**request** access the caller must hold the custom **"JIT-Requester"** role
 **within the subscription they are requesting access into** (evaluated against the
 `subscriptionId` in the request body), and to **revoke** a rule the caller must
 hold it in that rule's own subscription. Listing your own rules (`Get-JITRules`)
@@ -70,14 +70,14 @@ plugin-side configuration needed.
 2. Zip-deploy the function app code
 3. Grant the function app's MI, and make the requester role assignable, on the target subscriptions:
    - `JIT-AzAccess Manager` custom RBAC role assigned to the MI (so it can write firewall rules)
-   - `JIT Requester` custom RBAC role definition made assignable in each target subscription
+   - `JIT-Requester` custom RBAC role definition made assignable in each target subscription
    - Microsoft Graph `Application.ReadWrite.OwnedBy` + ownership of the AzureTray app reg (so it can self-register its URL on cold start)
 4. Register this deployment's URL as a `jit-baseurl:<sub>=<url>` tag on the AzureTray app reg
 5. Restart the function app so `profile.ps1` self-registers its URL tag
 
-### 2. Assign the JIT Requester role to your users
+### 2. Assign the JIT-Requester role to your users
 
-The function app rejects callers who don't hold the `JIT Requester` role **in the
+The function app rejects callers who don't hold the `JIT-Requester` role **in the
 subscription they are requesting access into**. Assign it (via the portal, az CLI,
 or PIM) at the target subscription scope:
 
@@ -85,7 +85,7 @@ or PIM) at the target subscription scope:
 az role assignment create `
     --assignee-object-id <user-or-group-objectId> `
     --assignee-principal-type User `
-    --role "JIT Requester" `
+    --role "JIT-Requester" `
     --scope "/subscriptions/<targetSubscriptionId>"
 ```
 
@@ -164,7 +164,7 @@ Resource names are derived from `appName`:
 - carry an ARM audience (`https://management.azure.com/`)
 
 **Authorization check:** the caller's AAD object ID (`oid` claim) must hold the
-`JIT Requester` RBAC role within the target subscription named in the request body
+`JIT-Requester` RBAC role within the target subscription named in the request body
 (`subscriptionId`) — at the subscription scope, inherited from a parent management
 group, or on a resource group / resource inside it.
 
@@ -181,8 +181,15 @@ group, or on a resource group / resource inside it.
 }
 ```
 
-Supported `targetType` values: `nsg`, `sqlServer`, `storageAccount`, `keyVault`.
+Supported `targetType` values: `nsg`, `sqlServer`, `postgresqlFlexibleServer`, `storageAccount`, `keyVault`.
 `port` is NSG-only (omit for any-port; supports ranges like `8080-8090`).
+
+> **PostgreSQL flexible servers** must be **public-access**: a private/VNet-integrated
+> server (public network access disabled, or delegated to a subnet) has no firewall to
+> write to, so such a request is rejected with `409 Conflict`. Firewall-rule create and
+> delete on flexible servers are **asynchronous** (long-running) operations — JIT polls
+> the operation to completion before confirming the grant, and the expiry timer preserves
+> the record for retry if a delete has not yet completed.
 
 **Success response (200):**
 

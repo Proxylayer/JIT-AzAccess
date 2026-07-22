@@ -36,7 +36,7 @@ Supported targets:
    registration, but the name is not assumed).
 3. Requests are sent to the function app with a plain **ARM-audience** bearer
    token (`https://management.azure.com/`). Authorization is gated on the caller
-   holding the custom **"JIT Requester"** Azure RBAC role on the function app
+   holding the custom **"JIT-Requester"** Azure RBAC role on the function app
    site resource.
 4. The function app's managed identity writes the firewall rule and a timer
    trigger removes it when it expires.
@@ -46,7 +46,7 @@ Supported targets:
 - AzureTray host (the plugin is loaded into the host's collectible
   `AssemblyLoadContext`).
 - A deployed JIT-AzAccess function app in your tenant.
-- The **JIT Requester** RBAC role assigned to your account on the function app
+- The **JIT-Requester** RBAC role assigned to your account on the function app
   (or a parent scope).
 
 ## License

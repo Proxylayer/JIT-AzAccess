@@ -17,7 +17,7 @@ namespace AzureTray.Plugin.JITAzAccess;
 /// Typed HTTP client for the JIT-AzAccess function app endpoints.
 ///
 /// The function app accepts ARM-audience bearer tokens (no custom scope), and
-/// gates authorization on the caller's "JIT Requester" custom RBAC role
+/// gates authorization on the caller's "JIT-Requester" custom RBAC role
 /// assignment on the function app site resource.  So the plugin uses the host's
 /// ARM named client + ArmScope — exactly what other plugins (e.g. PIM) use.
 /// </summary>
