@@ -147,13 +147,20 @@ function Invoke-ArmRestRaw {
 
     .PARAMETER Query
         Optional hashtable of additional query parameters appended to the URL.
+
+    .PARAMETER ExtraHeaders
+        Optional hashtable of additional request headers merged over the
+        Authorization header. Used for conditional writes — the ETag
+        read-modify-write helper sends `If-Match` here to get optimistic
+        concurrency (a stale write fails 412 instead of clobbering).
     #>
     param(
         [Parameter(Mandatory)][string] $Path,
-        [string]    $Method     = 'GET',
-        [string]    $ApiVersion = '2022-04-01',
-        $Body                   = $null,
-        [hashtable] $Query      = @{}
+        [string]    $Method       = 'GET',
+        [string]    $ApiVersion   = '2022-04-01',
+        $Body                     = $null,
+        [hashtable] $Query        = @{},
+        [hashtable] $ExtraHeaders = @{}
     )
 
     $token = Get-ManagedIdentityToken -Resource 'https://management.azure.com/'
@@ -170,10 +177,13 @@ function Invoke-ArmRestRaw {
         $uri = "$uri$sep$($qs -join '&')"
     }
 
+    $reqHeaders = @{ Authorization = "Bearer $token" }
+    foreach ($k in $ExtraHeaders.Keys) { $reqHeaders[$k] = $ExtraHeaders[$k] }
+
     $params = @{
         Method  = $Method
         Uri     = $uri
-        Headers = @{ Authorization = "Bearer $token" }
+        Headers = $reqHeaders
     }
     if ($null -ne $Body) {
         $params.ContentType = 'application/json'

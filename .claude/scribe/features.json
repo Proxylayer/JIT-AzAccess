@@ -1,7 +1,7 @@
 {
   "docType": "features",
   "idPrefix": "FEAT",
-  "nextId": 2,
+  "nextId": 4,
   "items": [
     {
       "id": "FEAT-0001",
@@ -31,6 +31,66 @@
       ],
       "created": "2026-07-21T22:59:10Z",
       "updated": "2026-07-21T23:12:49Z"
+    },
+    {
+      "id": "FEAT-0002",
+      "title": "Add 12 more JIT whitelist asset types + plugin asset-type selector",
+      "state": "done",
+      "tags": [
+        "jit",
+        "functionapp",
+        "plugin",
+        "postgres",
+        "assets"
+      ],
+      "description": "Add 12 asset types (decision: 'everything viable'): child firewallRules -> mysqlFlexibleServer (Microsoft.DBforMySQL/flexibleServers), redis (Microsoft.Cache/Redis, SYNC, body uses startIP/endIP), synapse (Microsoft.Synapse/workspaces). Array-on-resource (read-modify-write parent, ETag/If-Match + 412 retry) -> cosmosDb (DocumentDB/databaseAccounts ipRules{ipAddressOrRange}, LRO slow), containerRegistry (ContainerRegistry/registries networkRuleSet.ipRules, Premium-only, defaultAction Deny), aiSearch (Search/searchServices networkRuleSet.ipRules{value}), cognitiveServices (CognitiveServices/accounts networkAcls.ipRules{value}, covers OpenAI, defaultAction Deny), kusto (Kusto/clusters allowedIpRangeList bare string[]), iotHub (Devices/IotHubs networkRuleSets.ipRules{filterName,action,ipMask}, whole-resource PUT), signalR (SignalRService/signalR networkACLs.ipRules, preserve sibling ACLs). Child-singleton array (PUT networkRuleSets/default) -> eventHub (EventHub/namespaces, Std/Premium), serviceBus (ServiceBus/namespaces, Std/Premium). EXCLUDED: App Service (priority-ordered site-config model, separate effort), App Configuration (no ipRules - unsupported). Cross-cutting: one canonical type table drives ResourceDiscovery KQL + MapToTarget + config option list; shared ETag read-modify-write helper for array types; Manager role RBAC actions added in Grant/Test scripts. PLUGIN config: Boolean checkbox per asset type + an 'All' checkbox (host renders Boolean/Text/Number only; NO Select/WPF), select-all logic in SetValue, gating ResourceDiscovery ('All'/unset = no filter). Verify per-type api-version/RBAC/LRO against MS Learn during impl (researcher flagged gaps).",
+      "links": [],
+      "comments": [
+        {
+          "id": "c1",
+          "author": "developer",
+          "date": "2026-07-22T17:31:11Z",
+          "text": "Function-app half DONE (12 handlers + ETag RMW helper Invoke-JITArmReadModifyWrite w/ If-Match+412 retry+skip-when-open; Invoke-ArmRestRaw gained -ExtraHeaders). Corrections vs plan: aiSearch has NO PATCH -> whole-resource PUT (sync); poller now handles BOTH 202 and 200+Azure-AsyncOperation header (ACR/Cosmos/Cognitive/IoTHub). Redis body confirmed startIP/endIP. Wiring/role/README done; parse+export+tests baseline (62/41/21). Plugin half DONE separately (AssetTypeCatalog + checkbox selector + gating + verifiers, builds 0/0). LOW-CONFIDENCE to spot-check at deploy: CognitiveServices networkAcls.ipRules[].value field name; ServiceBus sync-vs-LRO (poll-if-header handles either)."
+        },
+        {
+          "id": "c2",
+          "author": "testcase",
+          "date": "2026-07-22T17:38:37Z",
+          "text": "Testcase pass: +35 tests all passing (28 dispatch covering all 12 new tokens + 7 Invoke-JITArmReadModifyWrite unit tests: If-Match=ETag, 412->re-GET->converge, skip-when-open no write, LRO poll on 202 and 200+Azure-AsyncOperation). Suite 62/41/21 -> 97/76/21; 21 failures unchanged (pre-existing stale mocks, TODO-0006). No regressions."
+        }
+      ],
+      "created": "2026-07-22T17:06:53Z",
+      "updated": "2026-07-22T17:38:38Z"
+    },
+    {
+      "id": "FEAT-0003",
+      "title": "JIT batch: App Service + AKS targets, mandatory justification, single notification, idempotent add, remove-cleanup, audit table",
+      "state": "done",
+      "tags": [
+        "jit",
+        "functionapp",
+        "plugin",
+        "assets",
+        "audit"
+      ],
+      "description": "SIX items. (1) NEW TARGETS: appService (Microsoft.Web/sites ipSecurityRestrictions on config/web, PATCH sync, NSG-style priority, MAIN+SCM per decision; GUARD: only add if site already restricted - never lock down an open site; RBAC Microsoft.Web/sites/config/{read,write}; api 2024-04-01) and aks (Microsoft.ContainerService/managedClusters apiServerAccessProfile.authorizedIPRanges string[], PUT full-body LRO; REJECT private clusters; SAFETY: NEVER write empty array on remove = would open API server to internet; RBAC managedClusters/{read,write}; api 2025-05-01). (2) JUSTIFICATION REQUIRED by default for ALL requests; opt-out only if app-reg tag 'JustificationRequired:false' present. Server-authoritative in Request-JITAccess (read app-reg tags via MI Graph token Get-ManagedIdentityToken + GET /applications/{AZURETRAY_APP_REGISTRATION_OBJECT_ID}?=tags; FAIL-SAFE to required if unreadable); 400 if missing+required. Plugin: read marker from already-fetched JitUrlDiscovery tags, invert prompt gate, keep empty-reject, add 400 branch. (3) SINGLE notification: plugin shows only ONE success toast on CONFIRMED - delete premature toast JitAzAccessPlugin.cs:1211-1217; make VerifyAndNotifyAsync own all 5 VerificationResult outcomes (green only on Confirmed; Skipped/Timeout/Error/NotFound get one non-green toast); handle _verifier null. (4) ALREADY-WHITELISTED: before add, detect caller IP already present -> no duplicate; success. Manage-if-ours: if existing JITRules row tracks this IP+resource refresh expiry; if external (no row) leave untouched + no removal scheduled. (5) REMOVE CLEANUP: if IP/rule not found on remove (manual deletion), treat as success and STILL delete the JITRules table row (all handlers + Revoke + Remove-ExpiredRules). (6) AUDIT TABLE 'JITRulesAudit' (no hyphen - Azure table constraint), FULL LIFECYCLE: append a row on grant AND on remove/expire with action/event + timestamp columns.",
+      "links": [],
+      "comments": [
+        {
+          "id": "c1",
+          "author": "developer",
+          "date": "2026-07-24T02:37:26Z",
+          "text": "ALL 6 items implemented (function app + plugin), builds/parses clean, test.ps1 baseline 97/76/21 (no regressions). Item1: appService (main+SCM, add-only-if-restricted) + aks (PUT/LRO, reject private, never write empty array) handlers + wiring + role + JSON + plugin catalog. Item2: server justification required unless app-reg tag 'JustificationRequired:false' (fail-safe required; cached; 400+audit) + plugin UX (marker read, gate invert, 400 branch). Item3: single toast (green only on Confirmed; VerifyAndNotifyAsync owns all 5 outcomes). Item4: Add Status Created/AlreadyPresent/SkippedOpen; per-mechanism dup detection (Test-JITFirewallRuleCoversIp for child, array membership, appService by IP, NSG exact-match best-effort); Request branches manage-if-ours (Extend via new Update-JITTableRow MERGE) / AlreadyExternal / SkippedOpen. Item5: Remove Status Removed/NotFound/Refused; Removed|NotFound delete row+audit; AKS Refused keeps row+RemoveFailed. Item6: JITRulesAudit full lifecycle (Grant/Extend/AlreadyExternal/SkippedOpen/Revoke/Expire/RemoveFailed), best-effort. Testcase pass adding coverage now."
+        },
+        {
+          "id": "c2",
+          "author": "testcase",
+          "date": "2026-07-24T03:26:21Z",
+          "text": "Testcase pass complete (agent stalled on final run but tests were written; orchestrator ran suite to confirm): +58 new tests all passing. Suite 97/76/21 -> 155/134/21; 21 failures unchanged (pre-existing stale mocks, TODO-0006). New files: JITHelpers.Audit.Tests.ps1, JITTargetsDetection.Tests.ps1, Request-JITAccess.Tests.ps1 (new harness); Remove-ExpiredRules.Tests.ps1 extended (appService/aks dispatch + NotFound/Refused/Removed branches). Covers detection helpers, audit/justification/Update-JITTableRow, and Request-JITAccess Extend/AlreadyExternal/SkippedOpen/justification-400 branches."
+        }
+      ],
+      "created": "2026-07-24T01:20:29Z",
+      "updated": "2026-07-24T03:26:22Z"
     }
   ]
 }

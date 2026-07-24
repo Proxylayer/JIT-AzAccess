@@ -15,8 +15,8 @@ namespace AzureTray.Plugin.JITAzAccess;
 /// <summary>
 /// Discovers JIT-eligible resources by querying ARM Resource Graph using the
 /// signed-in user's ARM token. Returns one <see cref="JitTarget"/> per
-/// resource of the supported types (NSG, SQL Server, Storage Account,
-/// Key Vault, PostgreSQL Flexible Server) across every subscription the user can see.
+/// resource of the selected asset types (see <see cref="AssetTypeCatalog"/>)
+/// across every subscription the user can see.
 ///
 /// One Resource Graph query covers all subscriptions — no per-sub fan-out.
 /// The user only sees resources they themselves have ARM read access to,
@@ -27,18 +27,33 @@ internal sealed class ResourceDiscovery
     private const string ResourceGraphUrl =
         "https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01";
 
+    private readonly IPluginContext _context;
+
+    public ResourceDiscovery(IPluginContext context) => _context = context;
+
     /// <summary>
-    /// Resource Graph query: every supported resource type, projecting the
-    /// fields we map onto JitTarget. Sorted client-side later.
+    /// Builds the Resource Graph query for the given asset-type selection.
+    /// The <c>type in~</c> list is drawn from the selected types' argTypes; a
+    /// null/empty selection (or one covering every catalog type) queries the
+    /// full set. Types not in <see cref="AssetTypeCatalog"/> are never queried,
+    /// and <see cref="MapToTarget"/> drops any unknown row as a backstop.
     /// </summary>
-    private const string Kql = @"
+    private static string BuildKql(IReadOnlySet<string>? selectedTokens)
+    {
+        IEnumerable<AssetType> chosen = AssetTypeCatalog.All;
+        if (selectedTokens is { Count: > 0 } && selectedTokens.Count < AssetTypeCatalog.All.Count)
+            chosen = AssetTypeCatalog.All.Where(t => selectedTokens.Contains(t.Token));
+
+        var typeList = string.Join(",\n    ", chosen.Select(t => $"'{t.ArgType}'"));
+
+        // The jitFw projection only extracts pre-existing firewall IPs for the
+        // three types that expose them inline (storage / key vault / NSG); every
+        // other selected type falls through to an empty array. Harmless when
+        // those types aren't selected.
+        return $@"
 Resources
 | where type in~ (
-    'microsoft.network/networksecuritygroups',
-    'microsoft.sql/servers',
-    'microsoft.storage/storageaccounts',
-    'microsoft.keyvault/vaults',
-    'microsoft.dbforpostgresql/flexibleservers')
+    {typeList})
 | extend jitFw = case(
     type =~ 'microsoft.storage/storageaccounts', properties.networkAcls.ipRules,
     type =~ 'microsoft.keyvault/vaults', properties.networkAcls.ipRules,
@@ -46,13 +61,17 @@ Resources
     dynamic([]))
 | project id, name, type, resourceGroup, subscriptionId, location, tags, jitFw
 ";
+    }
 
-    private readonly IPluginContext _context;
-
-    public ResourceDiscovery(IPluginContext context) => _context = context;
-
-    public async Task<List<JitTarget>> DiscoverAsync(string tenantId, CancellationToken ct)
+    /// <summary>
+    /// Discovers targets for the given tenant. <paramref name="selectedTokens"/>
+    /// filters the query to those asset types; null/empty or a full selection
+    /// queries every catalog type.
+    /// </summary>
+    public async Task<List<JitTarget>> DiscoverAsync(
+        string tenantId, IReadOnlySet<string>? selectedTokens, CancellationToken ct)
     {
+        var kql = BuildKql(selectedTokens);
         var all = new List<JitTarget>();
 
         // Resource Graph pages by skipToken when results > $top (default 100,
@@ -62,7 +81,7 @@ Resources
         {
             var body = new
             {
-                query   = Kql,
+                query   = kql,
                 options = new { resultFormat = "objectArray", top = 1000, skipToken = (string?)skipToken },
             };
 
@@ -130,15 +149,7 @@ Resources
     {
         if (!row.TryGetProperty("type", out var typeEl) || typeEl.ValueKind != JsonValueKind.String) return null;
         var armType = typeEl.GetString()!.ToLowerInvariant();
-        var targetType = armType switch
-        {
-            "microsoft.network/networksecuritygroups" => "nsg",
-            "microsoft.sql/servers"                   => "sqlServer",
-            "microsoft.storage/storageaccounts"       => "storageAccount",
-            "microsoft.keyvault/vaults"               => "keyVault",
-            "microsoft.dbforpostgresql/flexibleservers" => "postgresqlFlexibleServer",
-            _                                         => null,
-        };
+        var targetType = AssetTypeCatalog.TokenForArgType(armType);
         if (targetType is null) return null;
 
         var id   = TryGetString(row, "id")             ?? string.Empty;

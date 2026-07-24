@@ -33,6 +33,12 @@ $script:JitRoleDefIdCache = @{}   # @{ <subscriptionId> = <guid> }
 $script:RoleCheckCache    = @{}
 $script:RoleCheckCacheTtl = [TimeSpan]::FromSeconds(60)
 
+# Cache of the AzureTray app registration's tags array (used to decide whether
+# justification is required). Refreshed ~every 5 minutes so a tag change takes
+# effect without a restart, while avoiding a Graph call on every request.
+$script:AppRegTagsCache    = $null   # { Tags: [string[]] or $null; FetchedAt: [DateTime] }
+$script:AppRegTagsCacheTtl = [TimeSpan]::FromMinutes(5)
+
 # ARM audiences accepted on bearer tokens. Override via EXPECTED_AUDIENCES env var
 # (comma-separated) for sovereign clouds.
 $script:DefaultArmAudiences = @(
@@ -547,6 +553,75 @@ function Write-JITAuditEvent {
 
 #endregion
 
+#region ── Justification Policy (AzureTray app-reg tags) ─────────────────────────────
+
+function Get-AzureTrayAppRegTags {
+    <#
+    .SYNOPSIS
+        Returns the AzureTray app registration's `tags` string array (or @() if
+        it carries none). Returns $null when the tags cannot be determined —
+        object id unset, or ANY error reading Graph — so callers can fail SAFE
+        (treat justification as required when the policy is unknown).
+
+    .DESCRIPTION
+        Reads the application identified by
+        $env:AZURETRAY_APP_REGISTRATION_OBJECT_ID via Microsoft Graph, using the
+        function app's managed identity Graph token. The result is cached per
+        worker for ~5 minutes so a tag change takes effect without a restart
+        while avoiding a Graph call on every request. Mirrors the array-safety
+        and try/catch profile.ps1 uses for the same call.
+    #>
+
+    $objId = $env:AZURETRAY_APP_REGISTRATION_OBJECT_ID
+    if (-not $objId) { return $null }   # unknown -> caller treats as required
+
+    $now = [DateTime]::UtcNow
+    if ($script:AppRegTagsCache -and
+        ($now - $script:AppRegTagsCache.FetchedAt) -lt $script:AppRegTagsCacheTtl) {
+        return $script:AppRegTagsCache.Tags
+    }
+
+    try {
+        $graphToken = Get-ManagedIdentityToken -Resource 'https://graph.microsoft.com/'
+        $headers    = @{ Authorization = "Bearer $graphToken" }
+        $app = Invoke-RestMethod -Method Get `
+            -Uri "https://graph.microsoft.com/v1.0/applications/$objId`?`$select=id,tags" `
+            -Headers $headers -ErrorAction Stop
+
+        $tags = if ($app.tags) { @($app.tags) } else { @() }
+        $script:AppRegTagsCache = @{ Tags = $tags; FetchedAt = $now }
+        return $tags
+    }
+    catch {
+        # Fail SAFE: on ANY error return $null so justification stays required.
+        # Do NOT cache the failure — retry on the next request.
+        Write-Warning "JIT: could not read AzureTray app reg tags for $objId (treating justification as required): $_"
+        return $null
+    }
+}
+
+function Test-JustificationRequired {
+    <#
+    .SYNOPSIS
+        Returns $true unless the AzureTray app registration carries the tag
+        `JustificationRequired:false` (case-insensitive, trimmed). Server-
+        authoritative opt-out: when the tag is absent — or the tags cannot be
+        read at all ($null) — justification is REQUIRED (fail-safe).
+    #>
+
+    $tags = Get-AzureTrayAppRegTags
+    if ($null -eq $tags) { return $true }   # unknown/unreadable -> required
+
+    foreach ($t in $tags) {
+        if ("$t".Trim().ToLowerInvariant() -eq 'justificationrequired:false') {
+            return $false
+        }
+    }
+    return $true
+}
+
+#endregion
+
 #region ── NSG Helpers ───────────────────────────────────────────────────────────────
 function Get-AvailableNsgPriority {
     <#
@@ -745,6 +820,36 @@ function Add-JITTableRow {
     Invoke-TableRest -Method POST -Path "/$TableName" -Body $Properties | Out-Null
 }
 
+function Update-JITTableRow {
+    <#
+    .SYNOPSIS
+        Merges (partial-updates) an existing row in a Table Storage table,
+        keyed by PartitionKey + RowKey. Only the supplied properties are
+        changed; every other column on the entity is preserved (Table Storage
+        MERGE semantics). Used to refresh a JITRules row's ExpiryUtc when a
+        grant lands on an IP that is already whitelisted by a JIT-managed row
+        (idempotent re-grant / extend), instead of inserting a duplicate.
+
+        If-Match '*' performs an unconditional merge (last-writer-wins), which
+        matches the single-writer expiry-refresh use case here.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$TableName,
+        [Parameter(Mandatory)][string]$PartitionKey,
+        [Parameter(Mandatory)][string]$RowKey,
+        [Parameter(Mandatory)][hashtable]$Properties
+    )
+    $pk   = [Uri]::EscapeDataString($PartitionKey)
+    $rk   = [Uri]::EscapeDataString($RowKey)
+    # The MERGE body must carry the keys; copy so the caller's hashtable is untouched.
+    $body = @{}
+    foreach ($k in $Properties.Keys) { $body[$k] = $Properties[$k] }
+    $body.PartitionKey = $PartitionKey
+    $body.RowKey       = $RowKey
+    Invoke-TableRest -Method MERGE -Path "/$TableName(PartitionKey='$pk',RowKey='$rk')" `
+        -Body $body -ExtraHeaders @{ 'If-Match' = '*' } | Out-Null
+}
+
 function Remove-JITTableRow {
     <#
     .SYNOPSIS
@@ -759,6 +864,90 @@ function Remove-JITTableRow {
     $rk   = [Uri]::EscapeDataString($RowKey)
     Invoke-TableRest -Method DELETE -Path "/$TableName(PartitionKey='$pk',RowKey='$rk')" `
         -ExtraHeaders @{ 'If-Match' = '*' } | Out-Null
+}
+
+#endregion
+
+#region ── Audit History Table (JITRulesAudit) ────────────────────────────────
+
+function Get-JITAuditTableName {
+    <#
+    .SYNOPSIS
+        Returns the name of the JIT audit history table, creating it via Table
+        REST if it does not yet exist. This is an append-only table that
+        accumulates one row per JITRules lifecycle event (grant, revoke, expire,
+        remove-failed, ...). Distinct from the JITRules table, which holds only
+        the CURRENTLY active rules. Name defaults to 'JITRulesAudit'; override
+        via $env:JIT_AUDIT_TABLE_NAME.
+    #>
+    $tableName = if ($env:JIT_AUDIT_TABLE_NAME) { $env:JIT_AUDIT_TABLE_NAME } else { 'JITRulesAudit' }
+
+    # Ensure the table exists (POST /Tables, idempotent against 409) — same
+    # create-if-not-exists pattern as Get-JITTableName.
+    try {
+        Invoke-TableRest -Method POST -Path '/Tables' -Body @{ TableName = $tableName } | Out-Null
+    } catch {
+        $status = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+        if ($status -ne 409) { throw }  # 409 = already exists
+    }
+    return $tableName
+}
+
+function Add-JITAuditRow {
+    <#
+    .SYNOPSIS
+        Appends an event row to the JITRulesAudit history table. Append-only —
+        every lifecycle event gets its own row (rows are never updated or
+        deleted), so the RowKey is a unique per-event id ("<ISO8601>-<guid8>")
+        rather than the rule id, letting multiple events for the same rule
+        coexist. PartitionKey is the subscription id (matching JITRules).
+
+    .PARAMETER Action
+        The lifecycle event — Grant | Revoke | Expire | RemoveFailed (and future
+        actions such as Extend). Accepts any string so later passes can add new
+        event kinds without touching this helper.
+
+    .PARAMETER Extra
+        Optional additional columns merged into the row (e.g. error detail).
+    #>
+    param(
+        [Parameter(Mandatory)][string] $Action,
+        [string]    $SubscriptionId,
+        [string]    $TargetType,
+        [string]    $ResourceName,
+        [string]    $ResourceRg,
+        [string]    $RuleIdentifier,
+        [string]    $CallerIp,
+        [string]    $Port,
+        [string]    $RequestedBy,
+        [string]    $ExpiryUtc,
+        [string]    $Justification,
+        [hashtable] $Extra = @{}
+    )
+
+    $tableName = Get-JITAuditTableName
+    $eventUtc  = [DateTime]::UtcNow.ToString('o')
+    $rowKey    = "$eventUtc-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+
+    $props = @{
+        PartitionKey   = $SubscriptionId
+        RowKey         = $rowKey
+        Action         = $Action
+        EventUtc       = $eventUtc
+        TargetType     = $TargetType
+        ResourceName   = $ResourceName
+        ResourceRg     = $ResourceRg
+        SubscriptionId = $SubscriptionId
+        RuleIdentifier = $RuleIdentifier
+        CallerIp       = $CallerIp
+        Port           = $Port
+        RequestedBy    = $RequestedBy
+        ExpiryUtc      = $ExpiryUtc
+        Justification  = if ($Justification) { $Justification } else { '' }
+    }
+    foreach ($k in $Extra.Keys) { $props[$k] = $Extra[$k] }
+
+    Add-JITTableRow -TableName $tableName -Properties $props
 }
 
 #endregion
@@ -799,11 +988,16 @@ Export-ModuleMember -Function @(
     'Get-JitSiteResourceId'
     'Get-JitTenantId'
     'Write-JITAuditEvent'
+    'Get-AzureTrayAppRegTags'
+    'Test-JustificationRequired'
     'Get-AvailableNsgPriority'
     'Invoke-WithBlobLock'
     'Get-JITTableName'
     'Get-JITTableRows'
     'Add-JITTableRow'
+    'Update-JITTableRow'
     'Remove-JITTableRow'
+    'Get-JITAuditTableName'
+    'Add-JITAuditRow'
     'Get-CallerIp'
 )

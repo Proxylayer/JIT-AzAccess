@@ -1,7 +1,7 @@
 {
   "docType": "changes",
   "idPrefix": "CHG",
-  "nextId": 33,
+  "nextId": 50,
   "items": [
     {
       "id": "CHG-0001",
@@ -610,6 +610,329 @@
       "comments": [],
       "created": "2026-07-21T23:12:49Z",
       "updated": "2026-07-21T23:12:49Z"
+    },
+    {
+      "id": "CHG-0033",
+      "title": "add todos TODO-0011",
+      "state": "done",
+      "tags": [
+        "todos",
+        "add"
+      ],
+      "description": "Added 'Refactor JITTargets.psm1: one file per JIT asset type'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0011"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-22T00:17:58Z",
+      "updated": "2026-07-22T00:17:58Z"
+    },
+    {
+      "id": "CHG-0034",
+      "title": "add todos TODO-0012",
+      "state": "done",
+      "tags": [
+        "todos",
+        "add"
+      ],
+      "description": "Added 'HOST FIX (AzureTray): dedupe plugin load by Plugin.Id, not AssemblyPath'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0012"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-22T00:28:44Z",
+      "updated": "2026-07-22T00:28:44Z"
+    },
+    {
+      "id": "CHG-0035",
+      "title": "addComment todos TODO-0011",
+      "state": "done",
+      "tags": [
+        "todos",
+        "addComment"
+      ],
+      "description": "Comment c1 by claude.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0011"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-22T00:28:45Z",
+      "updated": "2026-07-22T00:28:45Z"
+    },
+    {
+      "id": "CHG-0036",
+      "title": "addComment todos TODO-0011",
+      "state": "done",
+      "tags": [
+        "todos",
+        "addComment"
+      ],
+      "description": "Comment c2 by developer.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0011"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-22T00:33:28Z",
+      "updated": "2026-07-22T00:33:28Z"
+    },
+    {
+      "id": "CHG-0037",
+      "title": "setState todos TODO-0011",
+      "state": "done",
+      "tags": [
+        "todos",
+        "setState"
+      ],
+      "description": "State: active -> done.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0011"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-22T00:33:29Z",
+      "updated": "2026-07-22T00:33:29Z"
+    },
+    {
+      "id": "CHG-0038",
+      "title": "addComment todos TODO-0012",
+      "state": "done",
+      "tags": [
+        "todos",
+        "addComment"
+      ],
+      "description": "Comment c1 by developer.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0012"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-22T00:33:30Z",
+      "updated": "2026-07-22T00:33:30Z"
+    },
+    {
+      "id": "CHG-0039",
+      "title": "add features FEAT-0002",
+      "state": "done",
+      "tags": [
+        "features",
+        "add"
+      ],
+      "description": "Added 'Add 12 more JIT whitelist asset types + plugin asset-type selector'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "FEAT-0002"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-22T17:06:53Z",
+      "updated": "2026-07-22T17:06:53Z"
+    },
+    {
+      "id": "CHG-0040",
+      "title": "addComment features FEAT-0002",
+      "state": "done",
+      "tags": [
+        "features",
+        "addComment"
+      ],
+      "description": "Comment c1 by developer.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "FEAT-0002"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-22T17:31:11Z",
+      "updated": "2026-07-22T17:31:11Z"
+    },
+    {
+      "id": "CHG-0041",
+      "title": "add todos TODO-0013",
+      "state": "done",
+      "tags": [
+        "todos",
+        "add"
+      ],
+      "description": "Added 'Reduce supportedTypes drift: single canonical validation list (function app)'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0013"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-22T17:31:12Z",
+      "updated": "2026-07-22T17:31:12Z"
+    },
+    {
+      "id": "CHG-0042",
+      "title": "add todos TODO-0014",
+      "state": "done",
+      "tags": [
+        "todos",
+        "add"
+      ],
+      "description": "Added 'Optional: positive ARM verification for array-type grants (plugin)'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0014"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-22T17:31:13Z",
+      "updated": "2026-07-22T17:31:13Z"
+    },
+    {
+      "id": "CHG-0043",
+      "title": "addComment features FEAT-0002",
+      "state": "done",
+      "tags": [
+        "features",
+        "addComment"
+      ],
+      "description": "Comment c2 by testcase.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "FEAT-0002"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-22T17:38:37Z",
+      "updated": "2026-07-22T17:38:37Z"
+    },
+    {
+      "id": "CHG-0044",
+      "title": "setState features FEAT-0002",
+      "state": "done",
+      "tags": [
+        "features",
+        "setState"
+      ],
+      "description": "State: active -> done.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "FEAT-0002"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-22T17:38:38Z",
+      "updated": "2026-07-22T17:38:38Z"
+    },
+    {
+      "id": "CHG-0045",
+      "title": "add features FEAT-0003",
+      "state": "done",
+      "tags": [
+        "features",
+        "add"
+      ],
+      "description": "Added 'JIT batch: App Service + AKS targets, mandatory justification, single notification, idempotent add, remove-cleanup, audit table'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "FEAT-0003"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-24T01:20:29Z",
+      "updated": "2026-07-24T01:20:29Z"
+    },
+    {
+      "id": "CHG-0046",
+      "title": "addComment features FEAT-0003",
+      "state": "done",
+      "tags": [
+        "features",
+        "addComment"
+      ],
+      "description": "Comment c1 by developer.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "FEAT-0003"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-24T02:37:26Z",
+      "updated": "2026-07-24T02:37:26Z"
+    },
+    {
+      "id": "CHG-0047",
+      "title": "add todos TODO-0015",
+      "state": "done",
+      "tags": [
+        "todos",
+        "add"
+      ],
+      "description": "Added 'NSG already-whitelisted detection: CIDR/prefixes/service-tag aware'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0015"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-24T02:37:27Z",
+      "updated": "2026-07-24T02:37:27Z"
+    },
+    {
+      "id": "CHG-0048",
+      "title": "addComment features FEAT-0003",
+      "state": "done",
+      "tags": [
+        "features",
+        "addComment"
+      ],
+      "description": "Comment c2 by testcase.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "FEAT-0003"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-24T03:26:21Z",
+      "updated": "2026-07-24T03:26:21Z"
+    },
+    {
+      "id": "CHG-0049",
+      "title": "setState features FEAT-0003",
+      "state": "done",
+      "tags": [
+        "features",
+        "setState"
+      ],
+      "description": "State: active -> done.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "FEAT-0003"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-24T03:26:22Z",
+      "updated": "2026-07-24T03:26:22Z"
     }
   ]
 }

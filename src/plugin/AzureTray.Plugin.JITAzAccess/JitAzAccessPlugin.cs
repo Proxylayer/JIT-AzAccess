@@ -127,35 +127,76 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
     private const string DefaultDurationOptionKey  = "defaultDurationHours";
     private const string AllowedDurationsOptionKey = "allowedDurations";
 
+    // Asset-type selector keys. The host's generic option grid only renders
+    // Boolean/Text/Number (no Select/ComboBox), so the type picker is a set of
+    // Boolean checkboxes — one per catalog type plus an "All" master.
+    private const string IncludeAllOptionKey = "include.all";
+    private const string IncludePrefix       = "include.";
+
+    private static string IncludeKey(string token) => IncludePrefix + token;
+
     // Defaults applied before the user changes anything (and the fallback when
     // a stored value is blank or malformed).
     private const int    DefaultDurationHoursValue = 4;
     private const string DefaultAllowedDurations   = "1,2,4,8";
 
-    public IReadOnlyList<PluginOption> Options { get; } = new[]
+    // Built once from the canonical catalog: the two duration options, the "All
+    // asset types" master, then one "Include <label>" checkbox per asset type.
+    // Defaulting every checkbox to true preserves the pre-selector behaviour of
+    // discovering every supported type.
+    public IReadOnlyList<PluginOption> Options { get; } = BuildOptions();
+
+    private static IReadOnlyList<PluginOption> BuildOptions()
     {
-        new PluginOption(
-            Key:          DefaultDurationOptionKey,
-            Label:        "Default access duration (hours)",
-            Kind:         PluginOptionKind.Number,
-            Description:  "Pre-selected duration in the grant prompt. A resource that declares its own durations still overrides this.",
-            DefaultValue: DefaultDurationHoursValue),
-        new PluginOption(
-            Key:          AllowedDurationsOptionKey,
-            Label:        "Offered durations (hours)",
-            Kind:         PluginOptionKind.Text,
-            Description:  "Comma-separated durations offered in the grant prompt (e.g. 1,2,4,8). Used when a resource doesn't specify its own.",
-            DefaultValue: DefaultAllowedDurations),
-    };
+        var options = new List<PluginOption>
+        {
+            new PluginOption(
+                Key:          DefaultDurationOptionKey,
+                Label:        "Default access duration (hours)",
+                Kind:         PluginOptionKind.Number,
+                Description:  "Pre-selected duration in the grant prompt. A resource that declares its own durations still overrides this.",
+                DefaultValue: DefaultDurationHoursValue),
+            new PluginOption(
+                Key:          AllowedDurationsOptionKey,
+                Label:        "Offered durations (hours)",
+                Kind:         PluginOptionKind.Text,
+                Description:  "Comma-separated durations offered in the grant prompt (e.g. 1,2,4,8). Used when a resource doesn't specify its own.",
+                DefaultValue: DefaultAllowedDurations),
+            new PluginOption(
+                Key:          IncludeAllOptionKey,
+                Label:        "All asset types",
+                Kind:         PluginOptionKind.Boolean,
+                Description:  "When on, discover every supported asset type. Turning it off lets you pick individual types below.",
+                DefaultValue: true),
+        };
+
+        options.AddRange(AssetTypeCatalog.All.Select(t => new PluginOption(
+            Key:          IncludeKey(t.Token),
+            Label:        $"Include {t.DisplayLabel}",
+            Kind:         PluginOptionKind.Boolean,
+            Description:  $"Discover {t.DisplayLabel} ({t.ArmType}) resources.",
+            DefaultValue: true)));
+
+        return options;
+    }
 
     // Seeded with every option's default so the keys exist before the host
     // hydrates persisted values (SetValue ignores unknown keys), and so the
     // typed accessors below always resolve.
-    private readonly Dictionary<string, object?> _optionValues = new(StringComparer.Ordinal)
+    private readonly Dictionary<string, object?> _optionValues = BuildDefaultValues();
+
+    private static Dictionary<string, object?> BuildDefaultValues()
     {
-        [DefaultDurationOptionKey]  = DefaultDurationHoursValue,
-        [AllowedDurationsOptionKey] = DefaultAllowedDurations,
-    };
+        var values = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            [DefaultDurationOptionKey]  = DefaultDurationHoursValue,
+            [AllowedDurationsOptionKey] = DefaultAllowedDurations,
+            [IncludeAllOptionKey]       = true,
+        };
+        foreach (var t in AssetTypeCatalog.All)
+            values[IncludeKey(t.Token)] = true;
+        return values;
+    }
 
     public IReadOnlyDictionary<string, object?> Values => _optionValues;
 
@@ -164,13 +205,67 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         if (!_optionValues.TryGetValue(key, out var current)) return;   // unknown key
         if (Equals(current, value)) return;
         _optionValues[key] = value;
+
+        // Keep the "All asset types" master in sync with the per-type
+        // checkboxes. Sibling keys are written straight into the dictionary
+        // (never via a nested SetValue), so ValuesChanged/MenuChanged fire
+        // exactly once below and there is no re-entrancy loop.
+        if (key == IncludeAllOptionKey)
+        {
+            var on = ToBool(value);
+            foreach (var t in AssetTypeCatalog.All)
+                _optionValues[IncludeKey(t.Token)] = on;
+        }
+        else if (key.StartsWith(IncludePrefix, StringComparison.Ordinal))
+        {
+            // Unchecking any type turns the master off; checking the last one
+            // turns it back on.
+            var allOn = AssetTypeCatalog.All.All(
+                t => ToBool(_optionValues.GetValueOrDefault(IncludeKey(t.Token))));
+            _optionValues[IncludeAllOptionKey] = allOn;
+        }
+
         ValuesChanged?.Invoke();
 
-        // The remaining options (default/offered durations) are read fresh on
-        // every grant prompt, so a change has no side effects beyond the next
-        // menu build.
+        // Remaining options (default/offered durations) are read fresh on every
+        // grant prompt; the type selection is read fresh on every discovery poll
+        // — so a change has no side effects beyond the next menu build.
         MenuChanged?.Invoke();
     }
+
+    /// <summary>
+    /// Asset-type tokens the plugin should discover. Returns the full catalog
+    /// (no filter) when "All asset types" is on, when no include keys are set
+    /// (fresh install / missing keys), or when the user has cleared every
+    /// individual type — preserving the pre-selector behaviour of querying
+    /// everything. Otherwise returns just the checked tokens.
+    /// </summary>
+    public IReadOnlySet<string> SelectedAssetTypes
+    {
+        get
+        {
+            var allTokens = AssetTypeCatalog.All.Select(t => t.Token).ToHashSet(StringComparer.Ordinal);
+
+            if (ToBool(_optionValues.GetValueOrDefault(IncludeAllOptionKey)))
+                return allTokens;
+
+            var selected = AssetTypeCatalog.All
+                .Where(t => ToBool(_optionValues.GetValueOrDefault(IncludeKey(t.Token))))
+                .Select(t => t.Token)
+                .ToHashSet(StringComparer.Ordinal);
+
+            return selected.Count == 0 ? allTokens : selected;
+        }
+    }
+
+    private static bool ToBool(object? value) => value switch
+    {
+        bool b                                          => b,
+        string s when bool.TryParse(s, out var p)       => p,
+        int i                                           => i != 0,
+        long l                                          => l != 0,
+        _                                               => false,
+    };
 
     public object? BuildSettingsView() => null;   // generic option grid only
 
@@ -549,7 +644,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                 try
                 {
                     var targets = await resources
-                        .DiscoverAsync(tenantId, CancellationToken.None)
+                        .DiscoverAsync(tenantId, SelectedAssetTypes, CancellationToken.None)
                         .ConfigureAwait(false);
                     lock (state.Lock) { state.Targets = targets; state.TargetsAt = now; }
                     changed = true;
@@ -1019,8 +1114,13 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
 
         var tenantId = state.Tenant.TenantId;
 
+        // Justification is required on EVERY grant by default. It becomes optional
+        // only when the tenant opted out via the JustificationRequired:false app-reg
+        // tag — but a resource-level RequiresJustification still forces the prompt
+        // even in an opt-out tenant. The server enforces this authoritatively; this
+        // is the matching client-side UX.
         string? justification = null;
-        if (target.RequiresJustification)
+        if (!state.Urls.JustificationOptional || target.RequiresJustification)
         {
             var result = await context.Notifier.ShowAsync(
                 new TextInputRequest(
@@ -1113,15 +1213,29 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                 "JIT access granted: {TargetType} {ResourceName}, rule {RuleId}, expires {ExpiresUtc}.",
                 response.TargetType, target.ResourceName, response.RuleId, response.ExpiresUtc);
 
+            // Sole post-grant user feedback is raised by VerifyAndNotifyAsync
+            // (exactly one toast per outcome). No success toast fires here —
+            // green is reserved for a real ARM-confirmed grant.
+            _ = VerifyAndNotifyAsync(response, target, context, tenantId, durationHours);
+        }
+        catch (JitHttpException ex) when (ex.StatusCode == 400)
+        {
+            // Authoritative server-side rejection (e.g. missing/invalid
+            // justification). Surface the server's own message as a clear Warning
+            // rather than a generic red error, so the reason reads cleanly.
+            var serverMessage = string.IsNullOrWhiteSpace(ex.ServerError) ? ex.Message : ex.ServerError!;
+            context.Logger.LogWarning(ex,
+                "JIT grant rejected (400) for {ResourceName}: {ServerError}.",
+                target.ResourceName, serverMessage);
             _ = context.Notifier.ShowAsync(
                 new InformationRequest(
-                    Title:   "JIT Access Granted ✓",
-                    Message: $"{target.DisplayName} — {durationHours}h access granted.\n" +
-                             $"Expires {response.ExpiresUtc:HH:mm} UTC  |  Rule: {response.RuleId}")
-                { Severity = NotificationSeverity.Success },
+                    Title:   "JIT Access Not Granted",
+                    Message: $"{target.DisplayName} — the request was rejected by the server.\n{serverMessage}")
+                {
+                    Severity = NotificationSeverity.Warning,
+                    Details  = new[] { new NotificationDetail("Server", serverMessage) },
+                },
                 CancellationToken.None);
-
-            _ = VerifyAndNotifyAsync(response, context, tenantId);
         }
         catch (Exception ex)
         {
@@ -1224,9 +1338,33 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
 
     // ── ARM post-grant verification ───────────────────────────────────────────
 
-    private async Task VerifyAndNotifyAsync(JitGrantResponse grant, IPluginContext context, string tenantId)
+    // Sole owner of post-grant user feedback: raises EXACTLY ONE toast for the
+    // grant, and green ONLY when ARM actually confirms the rule. Every
+    // VerificationResult value is covered, plus a fallback for the (practically
+    // unreachable) case where the verifier was never constructed, so no grant is
+    // ever silent. Called fire-and-forget once per grant, so there is no
+    // re-entrancy concern.
+    private async Task VerifyAndNotifyAsync(
+        JitGrantResponse grant, JitTarget target, IPluginContext context, string tenantId, int durationHours)
     {
-        if (_verifier is null) return;
+        var expiry = $"Expires {grant.ExpiresUtc:HH:mm} UTC  |  Rule: {grant.RuleId}";
+
+        if (_verifier is null)
+        {
+            // _verifier is assigned alongside _context/_client in InitializeAsync
+            // and the grant path already guards on those being non-null, so this
+            // branch should not be reachable in practice. Emit a single neutral
+            // toast anyway rather than leaving the grant silent.
+            context.Logger.LogWarning(
+                "JIT ARM verification skipped: verifier unavailable for rule {RuleId}.", grant.RuleId);
+            _ = context.Notifier.ShowAsync(
+                new InformationRequest(
+                    Title:   "JIT Access Granted",
+                    Message: $"{target.DisplayName} — {durationHours}h access granted.\n{expiry}")
+                { Severity = NotificationSeverity.Info },
+                CancellationToken.None);
+            return;
+        }
 
         var result = await _verifier.VerifyAsync(grant, tenantId).ConfigureAwait(false);
 
@@ -1238,9 +1376,9 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                     grant.RuleId, grant.ResourceName);
                 _ = context.Notifier.ShowAsync(
                     new InformationRequest(
-                        Title:   "✅ IP Whitelist Confirmed",
-                        Message: $"Your IP ({grant.CallerIp}) is confirmed in the Azure resource.\n" +
-                                 $"{grant.TargetType}: {grant.ResourceName}")
+                        Title:   "✅ JIT Access Granted",
+                        Message: $"{target.DisplayName} — {durationHours}h access confirmed.\n" +
+                                 $"Your IP ({grant.CallerIp}) is present in the Azure resource.\n{expiry}")
                     { Severity = NotificationSeverity.Success },
                     CancellationToken.None);
                 break;
@@ -1263,6 +1401,37 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
 
             case VerificationResult.Timeout:
                 context.Logger.LogWarning("JIT ARM verification timed out for rule {RuleId}.", grant.RuleId);
+                _ = context.Notifier.ShowAsync(
+                    new InformationRequest(
+                        Title:   "JIT Access Granted",
+                        Message: "Access granted; verification timed out — it may still be propagating.\n" +
+                                 expiry)
+                    { Severity = NotificationSeverity.Info },
+                    CancellationToken.None);
+                break;
+
+            case VerificationResult.Skipped:
+                context.Logger.LogInformation(
+                    "JIT ARM verification skipped for {TargetType} rule {RuleId} (type not auto-verifiable).",
+                    grant.TargetType, grant.RuleId);
+                _ = context.Notifier.ShowAsync(
+                    new InformationRequest(
+                        Title:   "JIT Access Granted",
+                        Message: "Access granted. This resource type can't be auto-verified.\n" + expiry)
+                    { Severity = NotificationSeverity.Info },
+                    CancellationToken.None);
+                break;
+
+            case VerificationResult.Error:
+            default:
+                context.Logger.LogWarning(
+                    "JIT ARM verification could not complete for rule {RuleId}.", grant.RuleId);
+                _ = context.Notifier.ShowAsync(
+                    new InformationRequest(
+                        Title:   "JIT Access Granted",
+                        Message: "Access granted; verification could not complete.\n" + expiry)
+                    { Severity = NotificationSeverity.Info },
+                    CancellationToken.None);
                 break;
         }
     }
@@ -1277,15 +1446,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         return $"{(int)remaining.TotalHours}h {remaining.Minutes:D2}m";
     }
 
-    private static string TargetTypeLabel(string targetType) => targetType switch
-    {
-        "nsg"            => "NSG",
-        "sqlServer"      => "SQL",
-        "storageAccount" => "Storage",
-        "keyVault"       => "Key Vault",
-        "postgresqlFlexibleServer" => "PostgreSQL",
-        _                => targetType,
-    };
+    private static string TargetTypeLabel(string targetType) => AssetTypeCatalog.LabelForToken(targetType);
 
     private static int[] BuildDurationList(int defaultDuration, int[]? allowed)
     {

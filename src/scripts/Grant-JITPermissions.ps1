@@ -49,7 +49,7 @@ if (
 
 $roleName = 'JIT-AzAccess Manager'
 
-$roleDescription = 'Manages temporary IP allowlist entries on NSGs, SQL servers, PostgreSQL flexible servers, storage accounts, and key vaults for JIT-AzAccess.'
+$roleDescription = 'Manages temporary IP allowlist entries for JIT-AzAccess on NSGs, SQL / PostgreSQL / MySQL flexible servers, storage accounts, key vaults, Redis caches, Synapse workspaces, Cosmos DB accounts, container registries, AI Search services, Cognitive Services accounts, Kusto clusters, IoT hubs, SignalR services, Event Hubs / Service Bus namespaces, App Service sites, and AKS managed clusters.'
 
 $roleActions = @(
     'Microsoft.Network/networkSecurityGroups/read'
@@ -73,6 +73,57 @@ $roleActions = @(
 
     'Microsoft.KeyVault/vaults/read'
     'Microsoft.KeyVault/vaults/write'
+
+    'Microsoft.DBforMySQL/flexibleServers/read'
+    'Microsoft.DBforMySQL/flexibleServers/firewallRules/read'
+    'Microsoft.DBforMySQL/flexibleServers/firewallRules/write'
+    'Microsoft.DBforMySQL/flexibleServers/firewallRules/delete'
+
+    'Microsoft.Cache/redis/read'
+    'Microsoft.Cache/redis/firewallRules/read'
+    'Microsoft.Cache/redis/firewallRules/write'
+    'Microsoft.Cache/redis/firewallRules/delete'
+
+    'Microsoft.Synapse/workspaces/read'
+    'Microsoft.Synapse/workspaces/firewallRules/read'
+    'Microsoft.Synapse/workspaces/firewallRules/write'
+    'Microsoft.Synapse/workspaces/firewallRules/delete'
+
+    'Microsoft.DocumentDB/databaseAccounts/read'
+    'Microsoft.DocumentDB/databaseAccounts/write'
+
+    'Microsoft.ContainerRegistry/registries/read'
+    'Microsoft.ContainerRegistry/registries/write'
+
+    'Microsoft.Search/searchServices/read'
+    'Microsoft.Search/searchServices/write'
+
+    'Microsoft.CognitiveServices/accounts/read'
+    'Microsoft.CognitiveServices/accounts/write'
+
+    'Microsoft.Kusto/clusters/read'
+    'Microsoft.Kusto/clusters/write'
+
+    'Microsoft.Devices/IotHubs/read'
+    'Microsoft.Devices/IotHubs/write'
+
+    'Microsoft.SignalRService/signalR/read'
+    'Microsoft.SignalRService/signalR/write'
+
+    'Microsoft.EventHub/namespaces/read'
+    'Microsoft.EventHub/namespaces/networkRuleSets/read'
+    'Microsoft.EventHub/namespaces/networkRuleSets/write'
+
+    'Microsoft.ServiceBus/namespaces/read'
+    'Microsoft.ServiceBus/namespaces/networkRuleSets/read'
+    'Microsoft.ServiceBus/namespaces/networkRuleSets/write'
+
+    'Microsoft.Web/sites/read'
+    'Microsoft.Web/sites/config/read'
+    'Microsoft.Web/sites/config/write'
+
+    'Microsoft.ContainerService/managedClusters/read'
+    'Microsoft.ContainerService/managedClusters/write'
 
     # Required by the function app to evaluate the JIT-Requester RBAC role
     # assignment of each caller before granting access.

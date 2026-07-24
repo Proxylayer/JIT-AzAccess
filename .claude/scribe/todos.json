@@ -1,7 +1,7 @@
 {
   "docType": "todos",
   "idPrefix": "TODO",
-  "nextId": 11,
+  "nextId": 16,
   "items": [
     {
       "id": "TODO-0001",
@@ -205,6 +205,101 @@
       "comments": [],
       "created": "2026-07-18T00:21:04Z",
       "updated": "2026-07-18T00:21:04Z"
+    },
+    {
+      "id": "TODO-0011",
+      "title": "Refactor JITTargets.psm1: one file per JIT asset type",
+      "state": "done",
+      "tags": [
+        "jit",
+        "functionapp",
+        "refactor"
+      ],
+      "description": "Split Modules/JITTargets/JITTargets.psm1 so each supported asset type (nsg, sqlServer, storageAccount, keyVault, postgresqlFlexibleServer) has its own file under Modules/JITTargets/Targets/. Shared helpers (Wait-JITArmAsyncOperation, Get-HeaderValue, api-version consts, PRIVATE_SERVER_REJECTED sentinel, ARM/status helpers) move to a shared file. JITTargets.psm1 becomes a loader that dot-sources Targets/*.ps1 (shared first) and keeps Export-ModuleMember surface IDENTICAL. Pure move/reorg, no behavior change; consumers (run.ps1 dispatch, profile.ps1) unchanged. Verify module imports + exports identical + test.ps1 baseline unchanged.",
+      "links": [],
+      "comments": [
+        {
+          "id": "c1",
+          "author": "claude",
+          "date": "2026-07-22T00:28:45Z",
+          "text": "Follow-up (user request): move per-type $script constants out of _Shared.ps1 into their own target files (KeyVaultApi->KeyVault.ps1, SqlApi->SqlServer.ps1, NsgApi->Nsg.ps1, StorageMgmtApi->StorageAccount.ps1, PostgresApi + sentinel + LRO bounds->PostgresqlFlexibleServer.ps1). Keep only genuinely-shared helpers in _Shared (Wait-JITArmAsyncOperation, Get-HeaderValue, ConvertTo-Hashtable). Rationale: co-locate each type's config with its handler so version changes are local per type."
+        },
+        {
+          "id": "c2",
+          "author": "developer",
+          "date": "2026-07-22T00:33:28Z",
+          "text": "Follow-up done: moved all 8 per-type $script constants into their target files (NsgApi->Nsg, SqlApi->SqlServer, StorageMgmtApi->StorageAccount, KeyVaultApi->KeyVault, PostgresApi+sentinel+2 LRO bounds->PostgresqlFlexibleServer). Wait-JITArmAsyncOperation parameterized (-TimeoutSeconds=180/-DefaultPollSeconds=5 defaults matching old constants); postgres handlers pass their own consts. _Shared now holds only ConvertTo-Hashtable, Get-HeaderValue, Wait-JITArmAsyncOperation. Export parity + test baseline (62/41/21) unchanged."
+        }
+      ],
+      "created": "2026-07-22T00:17:58Z",
+      "updated": "2026-07-22T00:33:29Z"
+    },
+    {
+      "id": "TODO-0012",
+      "title": "HOST FIX (AzureTray): dedupe plugin load by Plugin.Id, not AssemblyPath",
+      "state": "proposed",
+      "tags": [
+        "azuretray-host",
+        "bug",
+        "plugin-lifecycle"
+      ],
+      "description": "Stale/duplicate JIT tray menu after plugin version swap. ROOT CAUSE (host-side): PluginLoader keys load-vs-reload on assembly FILE PATH not Plugin.Id (LoadOrReloadAsync ~L327-329, LoadOneAsync ~L224-227). When the new version's DLL lands at a different path (legacy plugins/<id>.dll -> subfolder plugins/<id>/<id>.dll, or filename change) the host ADDS a second entry instead of unloading the old; both instances' menus show and the orphaned old instance's 90s poll timer roots it (leaked collectible ALC, keeps polling). FIX: before registering a newly loaded plugin, unload any existing _entries item with the same Plugin.Id via UnloadEntryAsync (change reload/idempotency key AssemblyPath->Plugin.Id). Plugin side needs NO change (Dispose/ShutdownAsync already tear down timer+events). Secondary: TrayIcon holds plugin refs in _menuChangeSubscriptions/_badgeSubscriptions cleared on dispatcher after UnloadEntryAsync's GC.Collect, delaying ALC unload even on the correct path. AzureTray repo is READ-ONLY for the agent; patch drafted to c:\\tmp for the user to apply.",
+      "links": [],
+      "comments": [
+        {
+          "id": "c1",
+          "author": "developer",
+          "date": "2026-07-22T00:33:30Z",
+          "text": "Patch drafted + verified with git apply --check: c:\\tmp\\azuretray-plugin-id-dedupe.patch. Single dedupe-by-Plugin.Id chokepoint in TryLoadAsync (unload existing same-Id entry via UnloadEntryAsync before registering new). Deliberately did NOT change LoadOneAsync idempotency to Id (would block upgrades). Secondary TrayIcon unload-timing fix described only (with primary fix it's just a GC-timing nicety, not a leak). AzureTray repo left untouched (read-only)."
+        }
+      ],
+      "created": "2026-07-22T00:28:44Z",
+      "updated": "2026-07-22T00:33:30Z"
+    },
+    {
+      "id": "TODO-0013",
+      "title": "Reduce supportedTypes drift: single canonical validation list (function app)",
+      "state": "proposed",
+      "tags": [
+        "jit",
+        "functionapp",
+        "tech-debt"
+      ],
+      "description": "The 3 $supportedTypes lists (Request/Remove-ExpiredRules) + 3 dispatch switches are hand-maintained. Consider one exported canonical list from JITTargets feeding the VALIDATION lists (keep dispatch switches explicit for security). Also cosmetic: Test-JITAccess.ps1 Check-3 prose still says 'NSG/SQL/Storage/Key Vault' though the actions list is correct.",
+      "links": [],
+      "comments": [],
+      "created": "2026-07-22T17:31:12Z",
+      "updated": "2026-07-22T17:31:12Z"
+    },
+    {
+      "id": "TODO-0014",
+      "title": "Optional: positive ARM verification for array-type grants (plugin)",
+      "state": "proposed",
+      "tags": [
+        "jit",
+        "plugin",
+        "enhancement"
+      ],
+      "description": "ArmVerifier returns Skipped for the 9 array-type targets (cosmosDb/containerRegistry/aiSearch/cognitiveServices/kusto/iotHub/signalR/eventHub/serviceBus), matching storage/keyVault. For positive post-grant confirmation, GET the parent and scan the ipRules array for the granted IP (parent-GET + ipRules scan pattern). Nice-to-have UX.",
+      "links": [],
+      "comments": [],
+      "created": "2026-07-22T17:31:13Z",
+      "updated": "2026-07-22T17:31:13Z"
+    },
+    {
+      "id": "TODO-0015",
+      "title": "NSG already-whitelisted detection: CIDR/prefixes/service-tag aware",
+      "state": "proposed",
+      "tags": [
+        "jit",
+        "functionapp",
+        "enhancement"
+      ],
+      "description": "FEAT-0003 item4: NSG duplicate-detection is best-effort exact-single-IP only (matches an inbound Allow rule whose sourceAddressPrefix == caller IP or /32). It does NOT evaluate CIDR ranges, sourceAddressPrefixes arrays, service tags, or per-port scope, so an IP covered by a broader rule is treated as not-present and a fresh JIT rule is created. Enhancement: make NSG detection range/prefix/service-tag aware if dup-suppression fidelity matters. Documented in code.",
+      "links": [],
+      "comments": [],
+      "created": "2026-07-24T02:37:27Z",
+      "updated": "2026-07-24T02:37:27Z"
     }
   ]
 }

@@ -2,7 +2,10 @@
 #
 # HTTP POST — Grants a caller's IP address temporary access on a supported target resource.
 #
-# Supported targetType values:  nsg | sqlServer | postgresqlFlexibleServer | storageAccount | keyVault
+# Supported targetType values:  nsg | sqlServer | postgresqlFlexibleServer |
+#   storageAccount | keyVault | mysqlFlexibleServer | redis | synapse | cosmosDb |
+#   containerRegistry | aiSearch | cognitiveServices | kusto | iotHub | signalR |
+#   eventHub | serviceBus | appService | aks
 #
 # Minimum request body:
 # {
@@ -130,7 +133,12 @@ $durationHours  = [int]$body.durationHours
 $port           = $body.port          # NSG only — null means any port
 $justification  = $body.justification # Optional free-text reason; required when target.requiresJustification = true
 
-$supportedTypes = @('nsg', 'sqlServer', 'postgresqlFlexibleServer', 'storageAccount', 'keyVault')
+$supportedTypes = @(
+    'nsg', 'sqlServer', 'postgresqlFlexibleServer', 'storageAccount', 'keyVault',
+    'mysqlFlexibleServer', 'redis', 'synapse', 'cosmosDb', 'containerRegistry',
+    'aiSearch', 'cognitiveServices', 'kusto', 'iotHub', 'signalR',
+    'eventHub', 'serviceBus', 'appService', 'aks'
+)
 
 if ($targetType -notin $supportedTypes) {
     Write-JsonResponse -Status BadRequest -Body @{
@@ -174,6 +182,18 @@ if ($resourceName -notmatch '^[a-zA-Z0-9._\-]{1,90}$') {
 
 if ($port -and $port -notmatch '^\d{1,5}(-\d{1,5})?$') {
     Write-JsonResponse -Status BadRequest -Body @{ error = "port must be a number or range (e.g. '443' or '8080-8090')." }
+    return
+}
+
+# Justification is REQUIRED by default. The AzureTray app registration can opt
+# out server-side by carrying the tag `JustificationRequired:false`. When the
+# policy can't be read, Test-JustificationRequired fails SAFE (required).
+$justificationTrimmed = if ($justification) { "$justification".Trim() } else { '' }
+if ((Test-JustificationRequired) -and -not $justificationTrimmed) {
+    Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp 'unknown' `
+        -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
+        -SubscriptionId $subscriptionId -DenyReason 'JustificationRequired'
+    Write-JsonResponse -Status BadRequest -Body @{ error = 'Justification is required for JIT access requests.' }
     return
 }
 
@@ -328,17 +348,26 @@ try {
     }
     else {
         $result = switch ($targetType) {
-            'sqlServer'                { Add-JITSqlFirewallRule      @addParams }
-            'postgresqlFlexibleServer' { Add-JITPostgresFirewallRule @addParams }
-            'storageAccount'           { Add-JITStorageNetworkRule   @addParams }
-            'keyVault'                 { Add-JITKeyVaultNetworkRule  @addParams }
+            'sqlServer'                { Add-JITSqlFirewallRule           @addParams }
+            'postgresqlFlexibleServer' { Add-JITPostgresFirewallRule      @addParams }
+            'storageAccount'           { Add-JITStorageNetworkRule        @addParams }
+            'keyVault'                 { Add-JITKeyVaultNetworkRule       @addParams }
+            'mysqlFlexibleServer'      { Add-JITMysqlFlexibleServerRule   @addParams }
+            'redis'                    { Add-JITRedisRule                 @addParams }
+            'synapse'                  { Add-JITSynapseRule               @addParams }
+            'cosmosDb'                 { Add-JITCosmosDbRule              @addParams }
+            'containerRegistry'        { Add-JITContainerRegistryRule     @addParams }
+            'aiSearch'                 { Add-JITAiSearchRule              @addParams }
+            'cognitiveServices'        { Add-JITCognitiveServicesRule     @addParams }
+            'kusto'                    { Add-JITKustoRule                 @addParams }
+            'iotHub'                   { Add-JITIotHubRule                @addParams }
+            'signalR'                  { Add-JITSignalRRule               @addParams }
+            'eventHub'                 { Add-JITEventHubRule              @addParams }
+            'serviceBus'               { Add-JITServiceBusRule            @addParams }
+            'appService'               { Add-JITAppServiceRule            @addParams }
+            'aks'                      { Add-JITAksRule                   @addParams }
         }
     }
-
-    Write-JITAuditEvent -EventType JITGranted -Caller $requestedBy -CallerIp $callerIp `
-        -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
-        -SubscriptionId $subscriptionId -RuleId $ruleId `
-        -Extra @{ expiresUtc = $expiry.ToString('o'); port = $portVal; durationHours = $durationHours; justification = $justification }
 }
 catch {
     # A PostgreSQL flexible server on private/VNet networking has no firewall to
@@ -370,42 +399,182 @@ catch {
 
 #endregion
 
-#region ── 5. Record expiry in Table Storage ──────────────────────────────────
+#region ── 5. Persist / audit based on the Add outcome ─────────────────────────
 
-try {
-    Get-JITTableName -TableName $tableName | Out-Null
+# Every Add-JIT*Rule handler returns a Status describing what actually happened
+# on the target resource:
+#   Created        — a rule was added for the caller IP (normal grant).
+#   AlreadyPresent — the caller IP was already whitelisted (idempotent add).
+#   SkippedOpen    — the resource is open/unrestricted, so nothing was added.
+# A handler that returns no Status (unexpected/legacy) is treated as Created.
+$grantStatus    = if ($result -and $result.Status) { $result.Status } else { 'Created' }
+$ruleIdentifier = if ($result) { $result.RuleIdentifier } else { $ruleId }
 
-    Add-JITTableRow -TableName $tableName -Properties @{
-        PartitionKey   = $subscriptionId
-        RowKey         = $ruleId
-        TargetType     = $targetType
-        ResourceName   = $resourceName
-        ResourceRg     = $resourceGroup
-        SubscriptionId = $subscriptionId
-        RuleIdentifier = $result.RuleIdentifier
-        CallerIp       = $callerIp
-        Port           = $portVal
-        RequestedBy    = $requestedBy
-        ExpiryUtc      = $expiry.ToString('o')
-        Justification  = if ($justification) { $justification } else { '' }
+switch ($grantStatus) {
+
+    'SkippedOpen' {
+        # The target is currently open/unrestricted (App Service open site, AKS
+        # open cluster, or an unconfigured resource firewall). Adding a single
+        # Allow rule would have *restricted* it, so we intentionally did nothing —
+        # the caller already has access. No JITRules row, no scheduled removal.
+        try {
+            Add-JITAuditRow -Action 'SkippedOpen' `
+                -SubscriptionId $subscriptionId -TargetType $targetType `
+                -ResourceName $resourceName -ResourceRg $resourceGroup `
+                -RuleIdentifier $ruleIdentifier -CallerIp $callerIp `
+                -Port $portVal -RequestedBy $requestedBy `
+                -ExpiryUtc $expiry.ToString('o') -Justification $justification
+        }
+        catch { Write-Warning "JITRulesAudit write failed for skipped-open '$ruleId': $_" }
+
+        Write-JsonResponse -Status OK -Body @{
+            status         = 'SkippedOpen'
+            message        = "The $targetType resource is currently open/unrestricted, so no JIT rule was added — the caller IP already has access."
+            targetType     = $targetType
+            resourceName   = $resourceName
+            resourceGroup  = $resourceGroup
+            subscriptionId = $subscriptionId
+            callerIp       = $callerIp
+        }
+        return
     }
-}
-catch {
-    Write-Warning "Table write failed. Rule '$($result.RuleIdentifier)' was added but expiry record was not saved: $_"
+
+    'AlreadyPresent' {
+        # The caller IP is already whitelisted on the target. If a JIT-managed row
+        # for this resource+IP exists it is OURS — refresh its expiry (extend)
+        # rather than create a duplicate. Otherwise the whitelist entry is
+        # external/manual, so we neither create a row nor schedule a removal for
+        # something JIT did not create.
+        $existingRow = $null
+        try {
+            Get-JITTableName -TableName $tableName | Out-Null
+            $filter = "PartitionKey eq '$subscriptionId' and ResourceName eq '$resourceName' " +
+                      "and ResourceRg eq '$resourceGroup' and TargetType eq '$targetType' " +
+                      "and CallerIp eq '$callerIp'"
+            $existingRow = Get-JITTableRows -TableName $tableName -Filter $filter | Select-Object -First 1
+        }
+        catch {
+            Write-Warning "AlreadyPresent lookup failed for '$resourceName'/${callerIp}: $_"
+        }
+
+        if ($existingRow) {
+            # Ours — refresh the expiry in place (no duplicate row).
+            try {
+                Update-JITTableRow -TableName $tableName `
+                    -PartitionKey $existingRow.PartitionKey -RowKey $existingRow.RowKey `
+                    -Properties @{ ExpiryUtc = $expiry.ToString('o') }
+            }
+            catch { Write-Warning "Failed to extend expiry for existing rule '$($existingRow.RowKey)': $_" }
+
+            try {
+                Add-JITAuditRow -Action 'Extend' `
+                    -SubscriptionId $subscriptionId -TargetType $targetType `
+                    -ResourceName $resourceName -ResourceRg $resourceGroup `
+                    -RuleIdentifier $existingRow.RuleIdentifier -CallerIp $callerIp `
+                    -Port $portVal -RequestedBy $requestedBy `
+                    -ExpiryUtc $expiry.ToString('o') -Justification $justification
+            }
+            catch { Write-Warning "JITRulesAudit write failed for extend '$($existingRow.RowKey)': $_" }
+
+            Write-JsonResponse -Status OK -Body @{
+                status         = 'Extended'
+                message        = 'IP already granted by JIT; expiry extended.'
+                ruleId         = $existingRow.RowKey
+                ruleIdentifier = $existingRow.RuleIdentifier
+                targetType     = $targetType
+                resourceName   = $resourceName
+                resourceGroup  = $resourceGroup
+                subscriptionId = $subscriptionId
+                callerIp       = $callerIp
+                expiresUtc     = $expiry.ToString('o')
+                requestedBy    = $requestedBy
+            }
+            return
+        }
+
+        # External/manual entry — leave it alone and track nothing.
+        try {
+            Add-JITAuditRow -Action 'AlreadyExternal' `
+                -SubscriptionId $subscriptionId -TargetType $targetType `
+                -ResourceName $resourceName -ResourceRg $resourceGroup `
+                -RuleIdentifier $ruleIdentifier -CallerIp $callerIp `
+                -Port $portVal -RequestedBy $requestedBy `
+                -ExpiryUtc $expiry.ToString('o') -Justification $justification
+        }
+        catch { Write-Warning "JITRulesAudit write failed for already-external '$ruleId': $_" }
+
+        Write-JsonResponse -Status OK -Body @{
+            status         = 'AlreadyWhitelisted'
+            message        = 'IP already whitelisted (existing entry not managed by JIT); no rule created and no removal scheduled.'
+            targetType     = $targetType
+            resourceName   = $resourceName
+            resourceGroup  = $resourceGroup
+            subscriptionId = $subscriptionId
+            callerIp       = $callerIp
+        }
+        return
+    }
+
+    default {
+        # 'Created' (and any unexpected/legacy status) — record the new rule in
+        # Table Storage and audit a normal grant.
+        Write-JITAuditEvent -EventType JITGranted -Caller $requestedBy -CallerIp $callerIp `
+            -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
+            -SubscriptionId $subscriptionId -RuleId $ruleId `
+            -Extra @{ expiresUtc = $expiry.ToString('o'); port = $portVal; durationHours = $durationHours; justification = $justification }
+
+        try {
+            Get-JITTableName -TableName $tableName | Out-Null
+
+            Add-JITTableRow -TableName $tableName -Properties @{
+                PartitionKey   = $subscriptionId
+                RowKey         = $ruleId
+                TargetType     = $targetType
+                ResourceName   = $resourceName
+                ResourceRg     = $resourceGroup
+                SubscriptionId = $subscriptionId
+                RuleIdentifier = $ruleIdentifier
+                CallerIp       = $callerIp
+                Port           = $portVal
+                RequestedBy    = $requestedBy
+                ExpiryUtc      = $expiry.ToString('o')
+                Justification  = if ($justification) { $justification } else { '' }
+            }
+        }
+        catch {
+            Write-Warning "Table write failed. Rule '$ruleIdentifier' was added but expiry record was not saved: $_"
+        }
+
+        # Append a lifecycle event to the audit history table. Best-effort — an
+        # audit write failure must NEVER fail the grant.
+        try {
+            Add-JITAuditRow -Action 'Grant' `
+                -SubscriptionId $subscriptionId -TargetType $targetType `
+                -ResourceName $resourceName -ResourceRg $resourceGroup `
+                -RuleIdentifier $ruleIdentifier -CallerIp $callerIp `
+                -Port $portVal -RequestedBy $requestedBy `
+                -ExpiryUtc $expiry.ToString('o') -Justification $justification
+        }
+        catch {
+            Write-Warning "JITRulesAudit write failed for grant '$ruleId' (grant itself succeeded): $_"
+        }
+
+        Write-JsonResponse -Status OK -Body @{
+            status         = 'Created'
+            ruleId         = $ruleId
+            ruleIdentifier = $ruleIdentifier
+            targetType     = $targetType
+            resource       = "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/$resourceName"
+            subscriptionId = $subscriptionId
+            resourceGroup  = $resourceGroup
+            resourceName   = $resourceName
+            callerIp       = $callerIp
+            port           = if ($targetType -eq 'nsg') { $portVal } else { $null }
+            expiresUtc     = $expiry.ToString('o')
+            requestedBy    = $requestedBy
+        }
+        return
+    }
 }
 
 #endregion
-
-Write-JsonResponse -Status OK -Body @{
-    ruleId         = $ruleId
-    ruleIdentifier = $result.RuleIdentifier
-    targetType     = $targetType
-    resource       = "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/$resourceName"
-    subscriptionId = $subscriptionId
-    resourceGroup  = $resourceGroup
-    resourceName   = $resourceName
-    callerIp       = $callerIp
-    port           = if ($targetType -eq 'nsg') { $portVal } else { $null }
-    expiresUtc     = $expiry.ToString('o')
-    requestedBy    = $requestedBy
-}
