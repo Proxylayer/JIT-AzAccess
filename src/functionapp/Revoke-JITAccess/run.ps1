@@ -113,25 +113,30 @@ if (-not (Test-CallerHasJitRequesterRole -CallerObjectId $callerObjectId -Subscr
 #region ── 3. Remove the firewall / network rule ──────────────────────────────
 
 try {
-    switch ($row.TargetType) {
-        'nsg'                      { Remove-JITNsgRule              -Row $row }
-        'sqlServer'                { Remove-JITSqlFirewallRule      -Row $row }
-        'postgresqlFlexibleServer' { Remove-JITPostgresFirewallRule -Row $row }
-        'storageAccount'           { Remove-JITStorageNetworkRule   -Row $row }
-        'keyVault'                 { Remove-JITKeyVaultNetworkRule  -Row $row }
+    $removeResult = switch ($row.TargetType) {
+        'nsg'                      { Remove-JITNsgRule                  -Row $row }
+        'sqlServer'                { Remove-JITSqlFirewallRule          -Row $row }
+        'postgresqlFlexibleServer' { Remove-JITPostgresFirewallRule     -Row $row }
+        'storageAccount'           { Remove-JITStorageNetworkRule       -Row $row }
+        'keyVault'                 { Remove-JITKeyVaultNetworkRule      -Row $row }
+        'mysqlFlexibleServer'      { Remove-JITMysqlFlexibleServerRule  -Row $row }
+        'redis'                    { Remove-JITRedisRule                -Row $row }
+        'synapse'                  { Remove-JITSynapseRule              -Row $row }
+        'cosmosDb'                 { Remove-JITCosmosDbRule             -Row $row }
+        'containerRegistry'        { Remove-JITContainerRegistryRule    -Row $row }
+        'aiSearch'                 { Remove-JITAiSearchRule             -Row $row }
+        'cognitiveServices'        { Remove-JITCognitiveServicesRule    -Row $row }
+        'kusto'                    { Remove-JITKustoRule                -Row $row }
+        'iotHub'                   { Remove-JITIotHubRule               -Row $row }
+        'signalR'                  { Remove-JITSignalRRule              -Row $row }
+        'eventHub'                 { Remove-JITEventHubRule             -Row $row }
+        'serviceBus'               { Remove-JITServiceBusRule           -Row $row }
+        'appService'               { Remove-JITAppServiceRule           -Row $row }
+        'aks'                      { Remove-JITAksRule                  -Row $row }
         default {
             Write-Warning "Unknown targetType '$($row.TargetType)' — skipping resource removal."
         }
     }
-
-    Write-JITAuditEvent -EventType JITRevoked `
-        -Caller        $requestedBy `
-        -TargetType    $row.TargetType `
-        -ResourceName  $row.ResourceName `
-        -ResourceGroup $row.ResourceRg `
-        -SubscriptionId $row.SubscriptionId `
-        -RuleId        $ruleId `
-        -CallerIp      $row.CallerIp
 }
 catch {
     Write-Error "Revoke-JITAccess: failed to remove rule '$ruleId' from resource — $_"
@@ -144,7 +149,72 @@ catch {
 
 #endregion
 
-#region ── 4. Delete table record ────────────────────────────────────────────
+#region ── 4. Branch on the remove Status ─────────────────────────────────────
+
+# Remove handlers return a Status: Removed | NotFound | Refused. A handler that
+# returns no Status (unknown/legacy targetType) is treated as Removed so the
+# stale record is still cleaned up.
+$removeStatus = if ($removeResult -and $removeResult.Status) { $removeResult.Status } else { 'Removed' }
+
+if ($removeStatus -eq 'Refused') {
+    # AKS only: removing the caller IP would leave authorizedIPRanges empty and
+    # open the API server, so the handler refused. Keep the JITRules row (the IP
+    # stays tracked/visible) and do NOT return success.
+    Write-Warning "Revoke refused for '$ruleId': removing it would open the $($row.TargetType) API server. Table record retained."
+    Write-JITAuditEvent -EventType JITRemoveFailed `
+        -Caller $requestedBy -TargetType $row.TargetType `
+        -ResourceName $row.ResourceName -ResourceGroup $row.ResourceRg `
+        -SubscriptionId $row.SubscriptionId -RuleId $ruleId -CallerIp $row.CallerIp `
+        -Extra @{ reason = 'refused-would-open-cluster' }
+    try {
+        Add-JITAuditRow -Action 'RemoveFailed' `
+            -SubscriptionId $row.SubscriptionId -TargetType $row.TargetType `
+            -ResourceName $row.ResourceName -ResourceRg $row.ResourceRg `
+            -RuleIdentifier $row.RuleIdentifier -CallerIp $row.CallerIp `
+            -Port $row.Port -RequestedBy $row.RequestedBy `
+            -ExpiryUtc $row.ExpiryUtc -Justification $row.Justification `
+            -Extra @{ reason = 'refused-would-open-cluster' }
+    }
+    catch {
+        Write-Warning "JITRulesAudit write failed for refused revoke '$ruleId': $_"
+    }
+    Write-JsonResponse -Status Conflict -Body @{
+        status = 'Refused'
+        error  = "Cannot revoke '$ruleId': removing the last authorized IP range would open the $($row.TargetType) API server to the internet. The rule has been left in place."
+    }
+    return
+}
+
+# Removed OR NotFound — the rule is gone from the resource (either we removed it,
+# or the user had already deleted it manually). Clean up the stale tracking row.
+$notFound = ($removeStatus -eq 'NotFound')
+
+Write-JITAuditEvent -EventType JITRevoked `
+    -Caller        $requestedBy `
+    -TargetType    $row.TargetType `
+    -ResourceName  $row.ResourceName `
+    -ResourceGroup $row.ResourceRg `
+    -SubscriptionId $row.SubscriptionId `
+    -RuleId        $ruleId `
+    -CallerIp      $row.CallerIp `
+    -Extra         @{ notFound = $notFound }
+
+# Append a lifecycle event to the audit history table before the active-rule
+# record is deleted. Best-effort — a JITRulesAudit write failure must NEVER
+# fail the revoke.
+try {
+    $revokeExtra = if ($notFound) { @{ notFound = $true } } else { @{} }
+    Add-JITAuditRow -Action 'Revoke' `
+        -SubscriptionId $row.SubscriptionId -TargetType $row.TargetType `
+        -ResourceName $row.ResourceName -ResourceRg $row.ResourceRg `
+        -RuleIdentifier $row.RuleIdentifier -CallerIp $row.CallerIp `
+        -Port $row.Port -RequestedBy $row.RequestedBy `
+        -ExpiryUtc $row.ExpiryUtc -Justification $row.Justification `
+        -Extra $revokeExtra
+}
+catch {
+    Write-Warning "JITRulesAudit write failed for revoke '$ruleId' (revoke itself succeeded): $_"
+}
 
 try {
     Remove-JITTableRow -TableName $tableName `
@@ -158,9 +228,10 @@ catch {
 Write-Host "JIT rule revoked: $ruleId ($($row.TargetType) $($row.ResourceName)) by $requestedBy"
 
 Write-JsonResponse -Status OK -Body @{
-    ruleId     = $ruleId
-    revokedBy  = $requestedBy
-    targetType = $row.TargetType
+    status       = $removeStatus
+    ruleId       = $ruleId
+    revokedBy    = $requestedBy
+    targetType   = $row.TargetType
     resourceName = $row.ResourceName
 }
 

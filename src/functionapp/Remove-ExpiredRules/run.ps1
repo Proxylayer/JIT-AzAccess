@@ -42,7 +42,12 @@ Write-Host "JIT cleanup: found $($expired.Count) expired rule(s) to remove."
 
 #region ── Remove each expired rule ──────────────────────────────────────────
 
-$supportedTypes = @('nsg', 'sqlServer', 'postgresqlFlexibleServer', 'storageAccount', 'keyVault')
+$supportedTypes = @(
+    'nsg', 'sqlServer', 'postgresqlFlexibleServer', 'storageAccount', 'keyVault',
+    'mysqlFlexibleServer', 'redis', 'synapse', 'cosmosDb', 'containerRegistry',
+    'aiSearch', 'cognitiveServices', 'kusto', 'iotHub', 'signalR',
+    'eventHub', 'serviceBus', 'appService', 'aks'
+)
 
 foreach ($row in $expired) {
     $label = "'$($row.RuleIdentifier)' ($($row.TargetType)) on '$($row.ResourceName)' (expired $($row.ExpiryUtc))"
@@ -59,19 +64,84 @@ foreach ($row in $expired) {
 
     $removed = $false
     try {
-        switch ($row.TargetType) {
-            'nsg'                      { Remove-JITNsgRule              -Row $row }
-            'sqlServer'                { Remove-JITSqlFirewallRule      -Row $row }
-            'postgresqlFlexibleServer' { Remove-JITPostgresFirewallRule -Row $row }
-            'storageAccount'           { Remove-JITStorageNetworkRule   -Row $row }
-            'keyVault'                 { Remove-JITKeyVaultNetworkRule  -Row $row }
+        $removeResult = switch ($row.TargetType) {
+            'nsg'                      { Remove-JITNsgRule                  -Row $row }
+            'sqlServer'                { Remove-JITSqlFirewallRule          -Row $row }
+            'postgresqlFlexibleServer' { Remove-JITPostgresFirewallRule     -Row $row }
+            'storageAccount'           { Remove-JITStorageNetworkRule       -Row $row }
+            'keyVault'                 { Remove-JITKeyVaultNetworkRule      -Row $row }
+            'mysqlFlexibleServer'      { Remove-JITMysqlFlexibleServerRule  -Row $row }
+            'redis'                    { Remove-JITRedisRule                -Row $row }
+            'synapse'                  { Remove-JITSynapseRule              -Row $row }
+            'cosmosDb'                 { Remove-JITCosmosDbRule             -Row $row }
+            'containerRegistry'        { Remove-JITContainerRegistryRule    -Row $row }
+            'aiSearch'                 { Remove-JITAiSearchRule             -Row $row }
+            'cognitiveServices'        { Remove-JITCognitiveServicesRule    -Row $row }
+            'kusto'                    { Remove-JITKustoRule                -Row $row }
+            'iotHub'                   { Remove-JITIotHubRule               -Row $row }
+            'signalR'                  { Remove-JITSignalRRule              -Row $row }
+            'eventHub'                 { Remove-JITEventHubRule             -Row $row }
+            'serviceBus'               { Remove-JITServiceBusRule           -Row $row }
+            'appService'               { Remove-JITAppServiceRule           -Row $row }
+            'aks'                      { Remove-JITAksRule                  -Row $row }
         }
-        Write-Host "  Removed $label"
-        Write-JITAuditEvent -EventType JITExpired `
-            -TargetType $row.TargetType -ResourceName $row.ResourceName `
-            -ResourceGroup $row.ResourceRg -SubscriptionId $row.SubscriptionId `
-            -RuleId $row.RowKey -CallerIp $row.CallerIp -Caller $row.RequestedBy
-        $removed = $true
+
+        # Remove handlers return a Status: Removed | NotFound | Refused. A handler
+        # that returns no Status (unexpected/legacy) is treated as Removed.
+        $removeStatus = if ($removeResult -and $removeResult.Status) { $removeResult.Status } else { 'Removed' }
+
+        if ($removeStatus -eq 'Refused') {
+            # AKS only: removing this IP would empty authorizedIPRanges and open
+            # the API server, so the handler refused. Keep the table record so the
+            # IP stays tracked/visible and is retried next cycle — do NOT delete.
+            Write-Warning "  Refused to remove $label — would open the API server to the internet. Table record retained."
+            Write-JITAuditEvent -EventType JITRemoveFailed `
+                -TargetType $row.TargetType -ResourceName $row.ResourceName `
+                -ResourceGroup $row.ResourceRg -SubscriptionId $row.SubscriptionId `
+                -RuleId $row.RowKey -CallerIp $row.CallerIp `
+                -Extra @{ reason = 'refused-would-open-cluster' }
+            try {
+                Add-JITAuditRow -Action 'RemoveFailed' `
+                    -SubscriptionId $row.SubscriptionId -TargetType $row.TargetType `
+                    -ResourceName $row.ResourceName -ResourceRg $row.ResourceRg `
+                    -RuleIdentifier $row.RuleIdentifier -CallerIp $row.CallerIp `
+                    -Port $row.Port -RequestedBy $row.RequestedBy `
+                    -ExpiryUtc $row.ExpiryUtc -Justification $row.Justification `
+                    -Extra @{ reason = 'refused-would-open-cluster' }
+            }
+            catch {
+                Write-Warning "  JITRulesAudit write failed for refused removal of ${label}: $_"
+            }
+            # $removed stays $false — the record is intentionally preserved.
+        }
+        else {
+            # Removed OR NotFound — the rule is gone from the resource (either we
+            # removed it, or the user deleted it manually). Either way, clean up
+            # the stale tracking row below.
+            $notFound = ($removeStatus -eq 'NotFound')
+            Write-Host "  Removed $label"
+            Write-JITAuditEvent -EventType JITExpired `
+                -TargetType $row.TargetType -ResourceName $row.ResourceName `
+                -ResourceGroup $row.ResourceRg -SubscriptionId $row.SubscriptionId `
+                -RuleId $row.RowKey -CallerIp $row.CallerIp -Caller $row.RequestedBy `
+                -Extra @{ notFound = $notFound }
+            # Best-effort JITRulesAudit history row — a write failure here must NEVER
+            # prevent the JITRules table record deletion below.
+            try {
+                $expireExtra = if ($notFound) { @{ notFound = $true } } else { @{} }
+                Add-JITAuditRow -Action 'Expire' `
+                    -SubscriptionId $row.SubscriptionId -TargetType $row.TargetType `
+                    -ResourceName $row.ResourceName -ResourceRg $row.ResourceRg `
+                    -RuleIdentifier $row.RuleIdentifier -CallerIp $row.CallerIp `
+                    -Port $row.Port -RequestedBy $row.RequestedBy `
+                    -ExpiryUtc $row.ExpiryUtc -Justification $row.Justification `
+                    -Extra $expireExtra
+            }
+            catch {
+                Write-Warning "  JITRulesAudit write failed for expire of $label (removal itself succeeded): $_"
+            }
+            $removed = $true
+        }
     }
     catch {
         Write-Warning "  Failed to remove $label — $_"
@@ -79,6 +149,20 @@ foreach ($row in $expired) {
             -TargetType $row.TargetType -ResourceName $row.ResourceName `
             -ResourceGroup $row.ResourceRg -SubscriptionId $row.SubscriptionId `
             -RuleId $row.RowKey -Extra @{ error = $_.ToString() }
+        # Best-effort JITRulesAudit history row — must NEVER throw on the failure
+        # path (the table record is intentionally left for retry regardless).
+        try {
+            Add-JITAuditRow -Action 'RemoveFailed' `
+                -SubscriptionId $row.SubscriptionId -TargetType $row.TargetType `
+                -ResourceName $row.ResourceName -ResourceRg $row.ResourceRg `
+                -RuleIdentifier $row.RuleIdentifier -CallerIp $row.CallerIp `
+                -Port $row.Port -RequestedBy $row.RequestedBy `
+                -ExpiryUtc $row.ExpiryUtc -Justification $row.Justification `
+                -Extra @{ error = $_.ToString() }
+        }
+        catch {
+            Write-Warning "  JITRulesAudit write failed for remove-failure of ${label}: $_"
+        }
         # Leave the table record so we retry on the next tick.
     }
 

@@ -181,15 +181,72 @@ group, or on a resource group / resource inside it.
 }
 ```
 
-Supported `targetType` values: `nsg`, `sqlServer`, `postgresqlFlexibleServer`, `storageAccount`, `keyVault`.
+Supported `targetType` values:
+
+| `targetType` | Azure resource | Model |
+|---|---|---|
+| `nsg` | Network security group | Per-IP inbound security rule |
+| `sqlServer` | Azure SQL server | Firewall rule (child) |
+| `postgresqlFlexibleServer` | PostgreSQL flexible server | Firewall rule (child, async) |
+| `mysqlFlexibleServer` | MySQL flexible server | Firewall rule (child, async) |
+| `redis` | Azure Cache for Redis | Firewall rule (child) |
+| `synapse` | Synapse workspace | Firewall rule (child, async) |
+| `storageAccount` | Storage account | `networkAcls.ipRules[]` entry |
+| `keyVault` | Key vault | `networkAcls.ipRules[]` entry |
+| `cosmosDb` | Cosmos DB account | `ipRules[]` entry (async) |
+| `containerRegistry` | Container registry | `networkRuleSet.ipRules[]` entry (async) |
+| `aiSearch` | AI Search service | `networkRuleSet.ipRules[]` entry |
+| `cognitiveServices` | Cognitive Services / Azure OpenAI | `networkAcls.ipRules[]` entry (async) |
+| `kusto` | Data Explorer (Kusto) cluster | `allowedIpRangeList[]` entry (async) |
+| `iotHub` | IoT hub | `networkRuleSets.ipRules[]` entry (async) |
+| `signalR` | SignalR service | `networkACLs.ipRules[]` entry (async) |
+| `eventHub` | Event Hubs namespace | `networkRuleSets/default` `ipRules[]` entry |
+| `serviceBus` | Service Bus namespace | `networkRuleSets/default` `ipRules[]` entry |
+| `appService` | App Service site | `config/web` `ipSecurityRestrictions[]` + `scmIpSecurityRestrictions[]` entry |
+| `aks` | AKS managed cluster | `apiServerAccessProfile.authorizedIPRanges[]` entry (full-body PUT, async) |
+
 `port` is NSG-only (omit for any-port; supports ranges like `8080-8090`).
 
-> **PostgreSQL flexible servers** must be **public-access**: a private/VNet-integrated
-> server (public network access disabled, or delegated to a subnet) has no firewall to
-> write to, so such a request is rejected with `409 Conflict`. Firewall-rule create and
-> delete on flexible servers are **asynchronous** (long-running) operations — JIT polls
-> the operation to completion before confirming the grant, and the expiry timer preserves
-> the record for retry if a delete has not yet completed.
+> **PostgreSQL / MySQL / Synapse** firewall-rule create and delete are **asynchronous**
+> (long-running) operations — JIT polls the operation to completion before confirming the
+> grant, and the expiry timer preserves the record for retry if a delete has not yet
+> completed.
+>
+> **PostgreSQL flexible servers** must additionally be **public-access**: a private/VNet-
+> integrated server (public network access disabled, or delegated to a subnet) has no
+> firewall to write to, so such a request is rejected with `409 Conflict`.
+>
+> **AKS managed clusters** must be **public** clusters: a private cluster
+> (`apiServerAccessProfile.enablePrivateCluster = true`) does not use API-server authorized
+> IP ranges, so such a request is rejected with `409 Conflict`. JIT edits only
+> `authorizedIPRanges` and **never writes an empty array** — it will not create the first
+> range on an unrestricted (open) cluster, and on cleanup it refuses to remove the last
+> range (which would open the API server to the internet), leaving that entry in place.
+>
+> **App Service sites** are whitelisted on **both** the main site and the SCM/Kudu site
+> (`ipSecurityRestrictions[]` and `scmIpSecurityRestrictions[]`; when
+> `scmIpSecurityRestrictionsUseMain = true` the SCM site inherits the main rules and only
+> the main list is touched). Because an App Service with an empty restriction list is
+> *unrestricted*, JIT only adds a rule when the site is **already restricted** (a concrete
+> rule exists, or the list's default action is `Deny`) — a currently-open site is a no-op.
+>
+> **Array-on-resource types** (`storageAccount`, `keyVault`, `cosmosDb`, `containerRegistry`,
+> `aiSearch`, `cognitiveServices`, `kusto`, `iotHub`, `signalR`, `eventHub`, `serviceBus`,
+> `appService`, `aks`)
+> add or remove a single entry in an IP-allowlist array on the resource. To avoid two
+> concurrent grants clobbering each other's entry, these use an optimistic-concurrency
+> read-modify-write (ETag `If-Match`, bounded retry on `412`). Several of these updates are
+> **eventually consistent** — the grant is confirmed once ARM accepts (or the long-running
+> operation completes), but the resource may take a short time to enforce the new rule.
+>
+> **Tier / configuration caveats** (JIT never *creates* a restriction — it only edits an
+> already network-restricted resource, so if the target is currently open the grant is a
+> no-op that reports "no change"):
+> - **Redis / Event Hubs / Service Bus / SignalR** require the **Standard tier** (or higher);
+>   a Basic-tier resource has no firewall to manage.
+> - **Container Registry** requires the **Premium SKU** and `networkRuleSet.defaultAction = Deny`.
+> - **Cognitive Services / Container Registry / Cosmos DB** require `publicNetworkAccess`
+>   **enabled** and the relevant `defaultAction = Deny` for the allowlist to take effect.
 
 **Success response (200):**
 

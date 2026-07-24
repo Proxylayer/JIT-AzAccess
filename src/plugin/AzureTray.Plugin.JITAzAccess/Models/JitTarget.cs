@@ -16,7 +16,12 @@ public sealed record JitTarget
     [JsonPropertyName("displayName")]
     public string DisplayName { get; init; } = string.Empty;
 
-    /// <summary>nsg | sqlServer | storageAccount | keyVault | postgresqlFlexibleServer</summary>
+    /// <summary>
+    /// Asset-type token from the canonical catalog (see <c>AssetTypeCatalog</c>):
+    /// nsg | sqlServer | storageAccount | keyVault | postgresqlFlexibleServer |
+    /// mysqlFlexibleServer | redis | synapse | cosmosDb | containerRegistry |
+    /// aiSearch | cognitiveServices | kusto | iotHub | signalR | eventHub | serviceBus.
+    /// </summary>
     [JsonPropertyName("targetType")]
     public string TargetType { get; init; } = string.Empty;
 

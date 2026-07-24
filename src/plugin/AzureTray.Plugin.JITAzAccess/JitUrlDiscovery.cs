@@ -27,6 +27,11 @@ internal sealed class JitUrlDiscovery
     private const string GraphBase = "https://graph.microsoft.com";
     private const string TagPrefix = "jit-baseurl:";
 
+    // Opt-out tag: when any readable app registration carries this tag the
+    // per-grant justification prompt becomes optional (the server still enforces
+    // authoritatively — this only relaxes the matching client-side UX).
+    private const string JustificationOptOutTag = "JustificationRequired:false";
+
     // Cap the number of pages walked so a directory with a large number of app
     // registrations can't turn discovery into an unbounded crawl.
     private const int MaxPages = 20;
@@ -44,6 +49,7 @@ internal sealed class JitUrlDiscovery
         CancellationToken ct)
     {
         var perSub = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var justificationOptional = false;
         var nextUrl = $"{GraphBase}/v1.0/applications?$select=id,appId,displayName,tags&$top=100";
         var pages   = 0;
 
@@ -86,7 +92,10 @@ internal sealed class JitUrlDiscovery
                     values.ValueKind == JsonValueKind.Array)
                 {
                     foreach (var app in values.EnumerateArray())
-                        CollectTags(app, perSub);
+                    {
+                        if (CollectTags(app, perSub))
+                            justificationOptional = true;
+                    }
                 }
 
                 nextUrl = root.TryGetProperty("@odata.nextLink", out var nextEl) &&
@@ -111,27 +120,40 @@ internal sealed class JitUrlDiscovery
         }
 
         _context.Logger.LogInformation(
-            "JIT: discovered {Count} function-app URL(s) from app registration tags in tenant {TenantId}.",
-            perSub.Count, tenantId);
+            "JIT: discovered {Count} function-app URL(s) from app registration tags in tenant {TenantId} " +
+            "(justification {Mode}).",
+            perSub.Count, tenantId, justificationOptional ? "optional" : "required");
 
-        return new JitUrlDiscoveryResult(perSub);
+        return new JitUrlDiscoveryResult(perSub, justificationOptional);
     }
 
     // Scans one application's tag array for jit-baseurl entries and merges them
     // into <paramref name="perSub"/>. The first URL seen for a given
     // subscription wins; a later app advertising the same subscription is
     // logged and ignored (normally only one app reg carries these tags).
-    private void CollectTags(JsonElement app, Dictionary<string, string> perSub)
+    // Returns true if this app carries the JustificationRequired:false opt-out
+    // tag (case-insensitive, trimmed).
+    private bool CollectTags(JsonElement app, Dictionary<string, string> perSub)
     {
         if (!app.TryGetProperty("tags", out var tagsEl) ||
             tagsEl.ValueKind != JsonValueKind.Array)
-            return;
+            return false;
+
+        var justificationOptional = false;
 
         foreach (var tagEl in tagsEl.EnumerateArray())
         {
             if (tagEl.ValueKind != JsonValueKind.String) continue;
             var tag = tagEl.GetString();
-            if (string.IsNullOrEmpty(tag) || !tag.StartsWith(TagPrefix, StringComparison.OrdinalIgnoreCase))
+            if (string.IsNullOrEmpty(tag)) continue;
+
+            if (string.Equals(tag.Trim(), JustificationOptOutTag, StringComparison.OrdinalIgnoreCase))
+            {
+                justificationOptional = true;
+                continue;
+            }
+
+            if (!tag.StartsWith(TagPrefix, StringComparison.OrdinalIgnoreCase))
                 continue;
 
             var rest = tag.Substring(TagPrefix.Length);
@@ -153,6 +175,8 @@ internal sealed class JitUrlDiscovery
 
             perSub[subId] = jitUrl;
         }
+
+        return justificationOptional;
     }
 }
 
@@ -160,8 +184,14 @@ internal sealed class JitUrlDiscovery
 /// Snapshot of what was discovered from the AzureTray app reg tags.
 /// </summary>
 /// <param name="PerSubscription">subscription-id → function-app URL.</param>
+/// <param name="JustificationOptional">
+/// True when a readable app registration carries the
+/// <c>JustificationRequired:false</c> opt-out tag, relaxing the per-grant
+/// justification prompt (the server still enforces authoritatively).
+/// </param>
 internal sealed record JitUrlDiscoveryResult(
-    IReadOnlyDictionary<string, string> PerSubscription)
+    IReadOnlyDictionary<string, string> PerSubscription,
+    bool JustificationOptional = false)
 {
     public static readonly JitUrlDiscoveryResult Empty =
         new(new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase));

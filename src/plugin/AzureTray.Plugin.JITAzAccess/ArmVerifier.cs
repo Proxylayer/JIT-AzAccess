@@ -24,6 +24,9 @@ internal sealed class ArmVerifier
     private const string StorageApi      = "2023-01-01";
     private const string KeyVaultApi     = "2023-07-01";
     private const string PostgresApi     = "2024-08-01";
+    private const string MySqlApi        = "2023-12-30";
+    private const string RedisApi        = "2024-11-01";
+    private const string SynapseApi      = "2021-06-01";
     private const string ArmBase         = "https://management.azure.com";
 
     private static readonly JsonSerializerOptions JsonOpts = new()
@@ -63,6 +66,25 @@ internal sealed class ArmVerifier
                 "storageAccount" => await VerifyStorageRuleAsync(grant, tenantId, linked.Token),
                 "keyVault"       => await VerifyKeyVaultRuleAsync(grant, tenantId, linked.Token),
                 "postgresqlFlexibleServer" => await VerifyPostgresRuleAsync(grant, tenantId, linked.Token),
+
+                // Child firewallRules types — a GET of the named rule under the
+                // parent resource: 200 => Confirmed, 404 => NotFound.
+                "mysqlFlexibleServer" => await VerifyChildFirewallRuleAsync(
+                    grant, tenantId, "Microsoft.DBforMySQL/flexibleServers", MySqlApi, linked.Token),
+                "redis" => await VerifyChildFirewallRuleAsync(
+                    grant, tenantId, "Microsoft.Cache/Redis", RedisApi, linked.Token),
+                "synapse" => await VerifyChildFirewallRuleAsync(
+                    grant, tenantId, "Microsoft.Synapse/workspaces", SynapseApi, linked.Token),
+
+                // Array/property-based resources (cosmosDb, containerRegistry,
+                // aiSearch, cognitiveServices, kusto, iotHub, signalR, eventHub,
+                // serviceBus, appService, aks) model their firewall as an ipRules
+                // array or an access-restrictions property on the parent rather
+                // than an addressable child rule, so there is no child GET to
+                // confirm a single rule by id. We deliberately return Skipped
+                // rather than fabricate a Confirmed/NotFound. (A parent GET +
+                // ipRules scan, as storage/key vault do, is possible later but
+                // out of scope here.)
                 _                => VerificationResult.Skipped,
             };
 
@@ -121,6 +143,25 @@ internal sealed class ArmVerifier
         var url = $"{ArmBase}/subscriptions/{grant.SubscriptionId}/resourceGroups/{grant.ResourceGroup}" +
                   $"/providers/Microsoft.DBforPostgreSQL/flexibleServers/{grant.ResourceName}" +
                   $"/firewallRules/{grant.RuleId}?api-version={PostgresApi}";
+
+        var response = await ArmGetAsync(tenantId, url, ct).ConfigureAwait(false);
+        return response.IsSuccessStatusCode ? VerificationResult.Confirmed : VerificationResult.NotFound;
+    }
+
+    // ── Child firewallRules types (MySQL / Redis / Synapse) ───────────────────
+
+    /// <summary>
+    /// Verifies a firewall rule that exists as an addressable child resource:
+    /// GET <c>.../{armType}/{name}/firewallRules/{ruleId}</c> — 200 = Confirmed,
+    /// anything else (typically 404) = NotFound. <paramref name="armType"/> is
+    /// the provider-cased type, e.g. <c>Microsoft.Cache/Redis</c>.
+    /// </summary>
+    private async Task<VerificationResult> VerifyChildFirewallRuleAsync(
+        JitGrantResponse grant, string tenantId, string armType, string apiVersion, CancellationToken ct)
+    {
+        var url = $"{ArmBase}/subscriptions/{grant.SubscriptionId}/resourceGroups/{grant.ResourceGroup}" +
+                  $"/providers/{armType}/{grant.ResourceName}" +
+                  $"/firewallRules/{grant.RuleId}?api-version={apiVersion}";
 
         var response = await ArmGetAsync(tenantId, url, ct).ConfigureAwait(false);
         return response.IsSuccessStatusCode ? VerificationResult.Confirmed : VerificationResult.NotFound;
