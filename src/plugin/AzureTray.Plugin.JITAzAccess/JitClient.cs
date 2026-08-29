@@ -67,7 +67,9 @@ internal sealed class JitClient
         if (!response.IsSuccessStatusCode)
         {
             var serverError = TryExtractError(responseBody);
-            _context.Logger.LogWarning(
+            // Debug only: the thrown JitHttpException carries the same info and
+            // the catch site decides how loudly to log it (once-then-quiet).
+            _context.Logger.LogDebug(
                 "JIT: POST {Url} returned {Status}.", url, (int)response.StatusCode);
             throw new JitHttpException(
                 (int)response.StatusCode,
@@ -101,7 +103,9 @@ internal sealed class JitClient
         if (!response.IsSuccessStatusCode)
         {
             var serverError = TryExtractError(body);
-            _context.Logger.LogWarning(
+            // Debug only: the thrown JitHttpException carries the same info and
+            // the catch site decides how loudly to log it (once-then-quiet).
+            _context.Logger.LogDebug(
                 "JIT: GET {Url} returned {Status}.", url, (int)response.StatusCode);
             throw new JitHttpException(
                 (int)response.StatusCode,
@@ -144,7 +148,9 @@ internal sealed class JitClient
         {
             var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
             var serverError = TryExtractError(body);
-            _context.Logger.LogWarning(
+            // Debug only: the thrown JitHttpException carries the same info and
+            // the catch site decides how loudly to log it (once-then-quiet).
+            _context.Logger.LogDebug(
                 "JIT: DELETE {Url} returned {Status}.", url, (int)response.StatusCode);
             throw new JitHttpException(
                 (int)response.StatusCode,

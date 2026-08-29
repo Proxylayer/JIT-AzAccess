@@ -96,24 +96,17 @@ function Remove-JITPostgresFirewallRule {
             "/providers/Microsoft.DBforPostgreSQL/flexibleServers/$($Row.ResourceName)" +
             "/firewallRules/$ruleName"
 
-    try {
-        $resp = Invoke-ArmRestRaw -Method DELETE -Path $path -ApiVersion $script:PostgresApi
-        # 204 No Content => already gone / synchronous delete — idempotent success,
-        # no poll needed. 202 Accepted => long-running; poll to completion so a
-        # failure/timeout throws (and the caller preserves the table row).
-        if ($resp.StatusCode -eq 202) {
-            Wait-JITArmAsyncOperation -ResponseHeaders $resp.Headers `
-                -TimeoutSeconds     $script:PostgresLroTimeoutSeconds `
-                -DefaultPollSeconds $script:PostgresLroDefaultPollSeconds
-        }
-        return @{ Status = 'Removed'; Details = @{} }
-    }
-    catch {
-        if ((Get-StatusFromError $_) -eq 404) {
-            Write-Host "  PostgreSQL firewall rule '$ruleName' not found — already removed."
-            return @{ Status = 'NotFound'; Details = @{} }
-        } else { throw }
-    }
+    # Existence-reconciling idempotent delete — see Remove-JITChildRuleWithLro.
+    # Deleting an already-absent rule here does NOT 404: this RP replies 202 and
+    # then fails the async operation with InternalServerError, which used to
+    # strand the JITRules row on an endless five-minute retry loop.
+    return Remove-JITChildRuleWithLro `
+        -Path               $path `
+        -ApiVersion         $script:PostgresApi `
+        -RuleName           $ruleName `
+        -TypeLabel          'PostgreSQL firewall' `
+        -TimeoutSeconds     $script:PostgresLroTimeoutSeconds `
+        -DefaultPollSeconds $script:PostgresLroDefaultPollSeconds
 }
 
 #endregion

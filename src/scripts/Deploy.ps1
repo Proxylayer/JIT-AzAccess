@@ -86,7 +86,14 @@ param(
     [string]$AzureTrayAppRegistrationName  = 'AzureTray',
     [string]$ParametersFile,
     [string[]]$TargetSubscriptionIds,
-    [switch]$SkipGraphPermission
+    [switch]$SkipGraphPermission,
+
+    # Log Analytics workspace backing the app's Application Insights. Strongly
+    # recommended: the app runs from a package, which turns OFF filesystem log
+    # streaming, so App Insights is the only place its logs go. Without it the
+    # app is genuinely unobservable — which is how an eight-day storage outage
+    # went unnoticed in August 2026.
+    [string]$LogAnalyticsWorkspaceId
 )
 
 Set-StrictMode -Version Latest
@@ -173,6 +180,14 @@ else {
     $deployArgs += "resourceGroupName=$ResourceGroupName"
     $deployArgs += "azureTrayAppRegistrationName=$AzureTrayAppRegistrationName"
     $deployArgs += "azureTrayAppRegistrationObjectId=$azureTrayAppObjId"
+    if ($LogAnalyticsWorkspaceId) {
+        $deployArgs += "logAnalyticsWorkspaceId=$LogAnalyticsWorkspaceId"
+    }
+    else {
+        Write-Warning "  -LogAnalyticsWorkspaceId not supplied. Application Insights will be created without a"
+        Write-Warning "  workspace, and because the app runs from a package (no filesystem log streaming) you will"
+        Write-Warning "  have little to no visibility into its logs."
+    }
 }
 
 Write-Host "Running: az $($deployArgs -join ' ')"
@@ -187,6 +202,9 @@ $principalId      = $deployOutput.properties.outputs.functionAppPrincipalId.valu
 $functionAppName  = $deployOutput.properties.outputs.functionAppName.value
 $functionHostname = $deployOutput.properties.outputs.functionAppHostname.value
 $rgName           = $deployOutput.properties.outputs.resourceGroupName.value
+$storageName      = $deployOutput.properties.outputs.storageAccountName.value
+$packageContainer = $deployOutput.properties.outputs.packageContainer.value
+$packageBlob      = $deployOutput.properties.outputs.packageBlob.value
 
 Write-Host "ARM deployment succeeded." -ForegroundColor Green
 Write-Host "  Function app:   $functionAppName"
@@ -196,10 +214,104 @@ Write-Host "  Resource group: $rgName"
 
 $siteResourceId = "/subscriptions/$SubscriptionId/resourceGroups/$rgName/providers/Microsoft.Web/sites/$functionAppName"
 
-# ── Step 2: Zip-deploy function app code ─────────────────────────────────────
+# ── Step 1b: Storage data-plane roles for the function app identity ──────────
+#
+# These are granted here rather than in the ARM template on purpose. ARM names a
+# role assignment by GUID, and creating the same (principal, role, scope) triple
+# under a different GUID fails the whole deployment with RoleAssignmentExists.
+# Any assignment made out-of-band — by hand, by an earlier template revision, by
+# a colleague — therefore turns every later deploy into a hard failure, and the
+# obvious remedy (delete the old one) is itself blocked when the resource group
+# carries a CanNotDelete lock, as this one does. Granting from the script lets us
+# treat "already exists" as success, which is what idempotent actually means here.
+#
+# Control-plane roles (Owner, Contributor) grant NONE of this. Without these the
+# host cannot read its own deployment package, cannot persist timer schedule
+# state — so timer triggers silently stop firing — and cannot touch the JIT
+# tables.
+
+Write-Host ""
+Write-Host "=== Step 1b: Granting storage data-plane roles to the function app identity ===" -ForegroundColor Cyan
+
+$storageScope = "/subscriptions/$SubscriptionId/resourceGroups/$rgName/providers/Microsoft.Storage/storageAccounts/$storageName"
+
+# Built-in role definition GUIDs, hardcoded on purpose: resolving them by display
+# name costs a lookup per role and the names are not stable across clouds, while
+# these GUIDs are identical in every Azure tenant.
+$storageRoles = @(
+    @{ Name = 'Storage Blob Data Owner';        Guid = 'b7e6dc6d-f1e8-4753-8033-0f276bb0955b'; Why = 'read the deployment package; host blob state' }
+    @{ Name = 'Storage Table Data Contributor'; Guid = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'; Why = 'JITRules + JITRulesAudit tables' }
+    @{ Name = 'Storage Queue Data Contributor'; Guid = '974c5e8b-45b9-4653-ba55-5f855dd0fb88'; Why = 'host queue state' }
+)
+
+# Deterministic assignment name from (scope, principal, role) so re-running this
+# script reuses the same name instead of colliding with its own previous run.
+function script:New-DeterministicGuid {
+    param([string]$Text)
+    $md5   = [System.Security.Cryptography.MD5]::Create()
+    try   { return [guid]::new($md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($Text))).ToString() }
+    finally { $md5.Dispose() }
+}
+
+foreach ($role in $storageRoles) {
+    Write-Host "  $($role.Name) — $($role.Why)"
+
+    $assignmentName = New-DeterministicGuid "$storageScope|$principalId|$($role.Guid)"
+    $body = @{
+        properties = @{
+            roleDefinitionId = "/subscriptions/$SubscriptionId/providers/Microsoft.Authorization/roleDefinitions/$($role.Guid)"
+            principalId      = $principalId
+            principalType    = 'ServicePrincipal'
+        }
+    } | ConvertTo-Json -Depth 5 -Compress
+
+    # az rest rather than `az role assignment create`: the latter resolves the
+    # assignee through Microsoft Graph and fails with a misleading
+    # "MissingSubscription" error in environments where that lookup is blocked.
+    $assignErr = $body | az rest `
+        --method put `
+        --url  "https://management.azure.com$storageScope/providers/Microsoft.Authorization/roleAssignments/$assignmentName`?api-version=2022-04-01" `
+        --body '@-' `
+        --output none 2>&1
+
+    if ($LASTEXITCODE -ne 0) {
+        # RoleAssignmentExists is the expected steady state on every redeploy —
+        # and also covers an equivalent assignment created out-of-band under a
+        # different name, which is exactly what breaks the ARM-template approach.
+        if ("$assignErr" -match 'RoleAssignmentExists') {
+            Write-Host "    Already assigned." -ForegroundColor DarkGray
+        }
+        else {
+            Write-Error "Failed to assign '$($role.Name)' on $storageName : $assignErr"
+            exit 1
+        }
+    }
+    else {
+        Write-Host "    Assigned." -ForegroundColor Green
+    }
+}
+
+# Role assignments are eventually consistent; the host reads the package moments
+# from now, so give replication a beat rather than racing it into a 403.
+Write-Host "  Waiting 30s for role replication ..."
+Start-Sleep -Seconds 30
+
+# ── Step 2: Deploy function app code ─────────────────────────────────────────
 
 Write-Host ""
 Write-Host "=== Step 2: Deploying function app code ===" -ForegroundColor Cyan
+
+# The app runs from a package in Blob Storage (WEBSITE_RUN_FROM_PACKAGE, set by
+# the ARM template) rather than from Azure Files, because Azure Files has no
+# identity-based auth and this subscription's Entra-only storage policy makes a
+# key-based content share impossible. So "deploy" means: upload the zip to the
+# blob the app already points at, then make the host pick it up.
+#
+# NOTE the deliberate difference from `az functionapp deployment source
+# config-zip`: that pushes to wwwroot and implicitly syncs triggers. Here the
+# blob write is invisible to the host, so the restart + explicit trigger sync
+# below are REQUIRED. Skipping the sync is precisely how a timer trigger stops
+# firing while HTTP triggers keep working — a silent, easily-missed failure.
 
 $zipPath = Join-Path $env:TEMP "jit-azaccess-functionapp.zip"
 if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
@@ -208,18 +320,47 @@ Write-Host "Packaging $funcAppDir ..."
 Compress-Archive -Path "$funcAppDir\*" -DestinationPath $zipPath -Force
 Write-Host "  Package: $zipPath ($([Math]::Round((Get-Item $zipPath).Length / 1KB)) KB)"
 
-Write-Host "Deploying to $functionAppName ..."
-az functionapp deployment source config-zip `
-    --name              $functionAppName `
-    --resource-group    $rgName `
-    --subscription      $SubscriptionId `
-    --src               $zipPath `
-    --output            none
+Write-Host "Uploading package to $storageName/$packageContainer/$packageBlob ..."
+# --auth-mode login: the deployer's own Entra identity, never an account key.
+# Requires Storage Blob Data Contributor (or Owner) on the storage account.
+az storage blob upload `
+    --account-name  $storageName `
+    --auth-mode     login `
+    --container-name $packageContainer `
+    --name          $packageBlob `
+    --file          $zipPath `
+    --overwrite     true `
+    --output        none
 
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "Function app code deployment failed."
+    Write-Error @"
+Package upload failed. The most likely cause is that your account lacks data-plane
+access to the storage account (control-plane roles such as Owner or Contributor do
+NOT grant blob data access). Grant yourself 'Storage Blob Data Contributor' on
+$storageName and re-run:
+
+  az role assignment create --assignee <you> --role "Storage Blob Data Contributor" ``
+      --scope /subscriptions/$SubscriptionId/resourceGroups/$rgName/providers/Microsoft.Storage/storageAccounts/$storageName
+"@
     exit 1
 }
+Write-Host "  Package uploaded." -ForegroundColor Green
+
+# Restart so the host re-reads the package, then sync triggers so the timer and
+# HTTP listeners are re-registered against the new content.
+Write-Host "Restarting $functionAppName to pick up the new package ..."
+az functionapp restart --name $functionAppName --resource-group $rgName --subscription $SubscriptionId --output none
+if ($LASTEXITCODE -ne 0) { Write-Warning "  Restart failed; the app may still be running the previous package." }
+
+Write-Host "Syncing function triggers ..."
+az rest --method post `
+    --url "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$rgName/providers/Microsoft.Web/sites/$functionAppName/syncfunctiontriggers?api-version=2022-03-01" `
+    --output none
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "  Trigger sync failed. Timer triggers may not fire until you re-run it:"
+    Write-Warning "    az rest --method post --url https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$rgName/providers/Microsoft.Web/sites/$functionAppName/syncfunctiontriggers?api-version=2022-03-01"
+}
+
 Write-Host "Code deployment succeeded." -ForegroundColor Green
 
 # ── Step 3a: Grant target-subscription permissions ───────────────────────────

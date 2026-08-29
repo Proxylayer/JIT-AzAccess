@@ -62,21 +62,14 @@ function Remove-JITSynapseRule {
             "/providers/Microsoft.Synapse/workspaces/$($Row.ResourceName)" +
             "/firewallRules/$ruleName"
 
-    try {
-        $resp = Invoke-ArmRestRaw -Method DELETE -Path $path -ApiVersion $script:SynapseApi
-        if ($resp.StatusCode -eq 202) {
-            Wait-JITArmAsyncOperation -ResponseHeaders $resp.Headers `
-                -TimeoutSeconds     $script:SynapseLroTimeoutSeconds `
-                -DefaultPollSeconds $script:SynapseLroDefaultPollSeconds
-        }
-        return @{ Status = 'Removed'; Details = @{} }
-    }
-    catch {
-        if ((Get-StatusFromError $_) -eq 404) {
-            Write-Host "  Synapse firewall rule '$ruleName' not found — already removed."
-            return @{ Status = 'NotFound'; Details = @{} }
-        } else { throw }
-    }
+    # Existence-reconciling idempotent delete — see Remove-JITChildRuleWithLro.
+    return Remove-JITChildRuleWithLro `
+        -Path               $path `
+        -ApiVersion         $script:SynapseApi `
+        -RuleName           $ruleName `
+        -TypeLabel          'Synapse firewall' `
+        -TimeoutSeconds     $script:SynapseLroTimeoutSeconds `
+        -DefaultPollSeconds $script:SynapseLroDefaultPollSeconds
 }
 
 #endregion

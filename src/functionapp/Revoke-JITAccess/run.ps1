@@ -155,6 +155,11 @@ catch {
 # returns no Status (unknown/legacy targetType) is treated as Removed so the
 # stale record is still cleaned up.
 $removeStatus = if ($removeResult -and $removeResult.Status) { $removeResult.Status } else { 'Removed' }
+# Per-resource outcome detail from the handler (App Service reports the site
+# plus every deployment slot, and flags a slot enumeration failure). Carried
+# onto the audit rows below so a partial revoke is auditable rather than
+# visible only as a warning in the function logs.
+$removeDetails = if ($removeResult) { $removeResult.Details } else { $null }
 
 if ($removeStatus -eq 'Refused') {
     # AKS only: removing the caller IP would leave authorizedIPRanges empty and
@@ -173,7 +178,8 @@ if ($removeStatus -eq 'Refused') {
             -RuleIdentifier $row.RuleIdentifier -CallerIp $row.CallerIp `
             -Port $row.Port -RequestedBy $row.RequestedBy `
             -ExpiryUtc $row.ExpiryUtc -Justification $row.Justification `
-            -Extra @{ reason = 'refused-would-open-cluster' }
+            -Extra @{ reason = 'refused-would-open-cluster' } `
+            -Details $removeDetails
     }
     catch {
         Write-Warning "JITRulesAudit write failed for refused revoke '$ruleId': $_"
@@ -210,7 +216,8 @@ try {
         -RuleIdentifier $row.RuleIdentifier -CallerIp $row.CallerIp `
         -Port $row.Port -RequestedBy $row.RequestedBy `
         -ExpiryUtc $row.ExpiryUtc -Justification $row.Justification `
-        -Extra $revokeExtra
+        -Extra $revokeExtra `
+        -Details $removeDetails
 }
 catch {
     Write-Warning "JITRulesAudit write failed for revoke '$ruleId' (revoke itself succeeded): $_"

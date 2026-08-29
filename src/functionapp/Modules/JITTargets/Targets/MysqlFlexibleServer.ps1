@@ -63,21 +63,14 @@ function Remove-JITMysqlFlexibleServerRule {
             "/providers/Microsoft.DBforMySQL/flexibleServers/$($Row.ResourceName)" +
             "/firewallRules/$ruleName"
 
-    try {
-        $resp = Invoke-ArmRestRaw -Method DELETE -Path $path -ApiVersion $script:MysqlApi
-        if ($resp.StatusCode -eq 202) {
-            Wait-JITArmAsyncOperation -ResponseHeaders $resp.Headers `
-                -TimeoutSeconds     $script:MysqlLroTimeoutSeconds `
-                -DefaultPollSeconds $script:MysqlLroDefaultPollSeconds
-        }
-        return @{ Status = 'Removed'; Details = @{} }
-    }
-    catch {
-        if ((Get-StatusFromError $_) -eq 404) {
-            Write-Host "  MySQL firewall rule '$ruleName' not found — already removed."
-            return @{ Status = 'NotFound'; Details = @{} }
-        } else { throw }
-    }
+    # Existence-reconciling idempotent delete — see Remove-JITChildRuleWithLro.
+    return Remove-JITChildRuleWithLro `
+        -Path               $path `
+        -ApiVersion         $script:MysqlApi `
+        -RuleName           $ruleName `
+        -TypeLabel          'MySQL firewall' `
+        -TimeoutSeconds     $script:MysqlLroTimeoutSeconds `
+        -DefaultPollSeconds $script:MysqlLroDefaultPollSeconds
 }
 
 #endregion

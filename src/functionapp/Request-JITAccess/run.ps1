@@ -409,6 +409,12 @@ catch {
 # A handler that returns no Status (unexpected/legacy) is treated as Created.
 $grantStatus    = if ($result -and $result.Status) { $result.Status } else { 'Created' }
 $ruleIdentifier = if ($result) { $result.RuleIdentifier } else { $ruleId }
+# Per-resource outcome detail the handler chose to report (App Service returns
+# the site's status plus one entry per deployment slot, and flags a failed slot
+# enumeration). Carried onto every audit row below so a partial grant is
+# visible in the audit table, not only in the function logs. Most handlers
+# report nothing, in which case no Details column is written at all.
+$grantDetails   = if ($result) { $result.Details } else { $null }
 
 switch ($grantStatus) {
 
@@ -423,7 +429,8 @@ switch ($grantStatus) {
                 -ResourceName $resourceName -ResourceRg $resourceGroup `
                 -RuleIdentifier $ruleIdentifier -CallerIp $callerIp `
                 -Port $portVal -RequestedBy $requestedBy `
-                -ExpiryUtc $expiry.ToString('o') -Justification $justification
+                -ExpiryUtc $expiry.ToString('o') -Justification $justification `
+                -Details $grantDetails
         }
         catch { Write-Warning "JITRulesAudit write failed for skipped-open '$ruleId': $_" }
 
@@ -472,7 +479,8 @@ switch ($grantStatus) {
                     -ResourceName $resourceName -ResourceRg $resourceGroup `
                     -RuleIdentifier $existingRow.RuleIdentifier -CallerIp $callerIp `
                     -Port $portVal -RequestedBy $requestedBy `
-                    -ExpiryUtc $expiry.ToString('o') -Justification $justification
+                    -ExpiryUtc $expiry.ToString('o') -Justification $justification `
+                    -Details $grantDetails
             }
             catch { Write-Warning "JITRulesAudit write failed for extend '$($existingRow.RowKey)': $_" }
 
@@ -499,7 +507,8 @@ switch ($grantStatus) {
                 -ResourceName $resourceName -ResourceRg $resourceGroup `
                 -RuleIdentifier $ruleIdentifier -CallerIp $callerIp `
                 -Port $portVal -RequestedBy $requestedBy `
-                -ExpiryUtc $expiry.ToString('o') -Justification $justification
+                -ExpiryUtc $expiry.ToString('o') -Justification $justification `
+                -Details $grantDetails
         }
         catch { Write-Warning "JITRulesAudit write failed for already-external '$ruleId': $_" }
 
@@ -553,7 +562,8 @@ switch ($grantStatus) {
                 -ResourceName $resourceName -ResourceRg $resourceGroup `
                 -RuleIdentifier $ruleIdentifier -CallerIp $callerIp `
                 -Port $portVal -RequestedBy $requestedBy `
-                -ExpiryUtc $expiry.ToString('o') -Justification $justification
+                -ExpiryUtc $expiry.ToString('o') -Justification $justification `
+                -Details $grantDetails
         }
         catch {
             Write-Warning "JITRulesAudit write failed for grant '$ruleId' (grant itself succeeded): $_"

@@ -7,6 +7,14 @@
 #   • Update-JITTableRow         — MERGE (partial update) keyed by PK+RK, used to
 #     refresh a JITRules row's ExpiryUtc on the extend path.
 #
+# Plus (TODO-0017) the target-handler Details column on the audit row:
+#   • ConvertTo-JITAuditDetails  — module-internal serializer (depth 6, 8192-char
+#     cap with an explicit truncation envelope, $null on empty or on failure).
+#   • Add-JITAuditRow -Details   — stores that JSON in a single `Details` column,
+#     omitted entirely when there is nothing to store.
+#   • The call-site wiring in the three function-app entry points, including the
+#     one deliberate omission in the Remove-ExpiredRules outer catch.
+#
 # The table layer (Invoke-TableRest, defined in HttpHelpers and imported globally)
 # is mocked with `-ModuleName JITHelpers` so the mocks intercept the calls the
 # JITHelpers functions make — nothing touches Table Storage or the network.
@@ -20,6 +28,57 @@
 
 Import-Module "$PSScriptRoot/../Modules/HttpHelpers/HttpHelpers.psm1" -Force -DisableNameChecking
 Import-Module "$PSScriptRoot/../Modules/JITHelpers/JITHelpers.psm1"   -Force
+
+# Pester 3.4's `Should Throw` does not work under PowerShell 7, so terminating
+# (or, here, deliberately NON-terminating) behavior is asserted with try/catch.
+function script:Test-Throws {
+    param([scriptblock]$Action)
+    try { & $Action | Out-Null; return $false } catch { return $true }
+}
+
+# The 14 columns Add-JITAuditRow has always written. Used as the regression
+# guard for the 18 handlers that report no Details: their rows must keep exactly
+# this shape.
+$script:BaseAuditColumns = @(
+    'PartitionKey','RowKey','Action','EventUtc','TargetType','ResourceName',
+    'ResourceRg','SubscriptionId','RuleIdentifier','CallerIp','Port',
+    'RequestedBy','ExpiryUtc','Justification'
+)
+
+function script:Get-AuditRowCallSites {
+    # Every Add-JITAuditRow invocation in a function-app entry point, with the
+    # Action it stamps and whether it forwards -Details. Parsed from the AST so
+    # the wiring is pinned without having to stand up the whole function host.
+    param([string]$RelativePath)
+    $full = Join-Path $PSScriptRoot $RelativePath
+    $ast  = [System.Management.Automation.Language.Parser]::ParseFile($full, [ref]$null, [ref]$null)
+    $cmds = $ast.FindAll({
+        param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        $n.GetCommandName() -eq 'Add-JITAuditRow'
+    }, $true)
+
+    return @($cmds | ForEach-Object {
+        $elements = $_.CommandElements
+        $action   = ''
+        for ($i = 0; $i -lt $elements.Count; $i++) {
+            if ($elements[$i] -is [System.Management.Automation.Language.CommandParameterAst] -and
+                $elements[$i].ParameterName -eq 'Action' -and ($i + 1) -lt $elements.Count) {
+                $action = $elements[$i + 1].Extent.Text.Trim("'", '"')
+            }
+        }
+        $hasDetails = @($elements | Where-Object {
+            $_ -is [System.Management.Automation.Language.CommandParameterAst] -and
+            $_.ParameterName -eq 'Details'
+        }).Count -gt 0
+
+        [pscustomobject]@{
+            Line       = $_.Extent.StartLineNumber
+            Action     = $action
+            HasDetails = $hasDetails
+        }
+    })
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 Describe 'Test-JustificationRequired' {
@@ -140,6 +199,301 @@ Describe 'Add-JITAuditRow' {
             Add-JITAuditRow -Action $action -SubscriptionId 'sub-x'
             $global:__AuditRowBodies[0].Action | Should Be $action
         }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TODO-0017 — the target-handler Details hashtable reaches the audit row.
+#
+# Same Invoke-TableRest body-capture harness as the Describe above (the /Tables
+# ensure-exists POST is ignored; every other POST body is the row that would be
+# written). Assertions are made against the entity Add-JITAuditRow hands to the
+# table layer, so they pin what actually lands in JITRulesAudit.
+Describe 'Add-JITAuditRow — target handler Details' {
+
+    BeforeEach {
+        $global:__AuditRowBodies = @()
+        Mock -ModuleName JITHelpers Invoke-TableRest {
+            if ($Path -ne '/Tables') { $global:__AuditRowBodies += ,$Body }
+            return $null
+        }
+    }
+
+    AfterEach {
+        Remove-Variable -Name __AuditRowBodies -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    # ── 1. Rich nested Details survive at full fidelity (depth 6) ───────────────
+
+    It 'stores a rich App Service Details hashtable as JSON that round-trips' {
+        $details = @{
+            site                  = 'Removed'
+            slotCount             = 2
+            slots                 = @{ staging = 'Removed'; qa = 'Failed' }
+            slotFailures          = @{ qa = '403 Forbidden' }
+            slotEnumerationFailed = $true
+        }
+        Add-JITAuditRow -Action 'Expire' -SubscriptionId 'sub-x' -TargetType 'appService' -Details $details
+
+        $b = $global:__AuditRowBodies[0]
+        $b.ContainsKey('Details') | Should Be $true
+
+        $parsed = $b.Details | ConvertFrom-Json
+        $parsed.site                  | Should Be 'Removed'
+        $parsed.slotCount             | Should Be 2
+        $parsed.slotEnumerationFailed | Should Be $true
+        # The nested levels are the point: the default ConvertTo-Json depth would
+        # flatten these into "System.Collections.Hashtable".
+        $parsed.slots.staging         | Should Be 'Removed'
+        $parsed.slots.qa              | Should Be 'Failed'
+        $parsed.slotFailures.qa       | Should Be '403 Forbidden'
+    }
+
+    It 'serializes to depth 6, not the ConvertTo-Json default of 2' {
+        # Five levels of nesting below the root: at the default depth of 2 the
+        # third level collapses to the literal string "System.Collections.Hashtable".
+        $details = @{ l1 = @{ l2 = @{ l3 = @{ l4 = @{ l5 = 'leaf' } } } } }
+        Add-JITAuditRow -Action 'Expire' -SubscriptionId 'sub-x' -Details $details
+
+        $b = $global:__AuditRowBodies[0]
+        $b.Details | Should Not Match 'System.Collections.Hashtable'
+        ($b.Details | ConvertFrom-Json).l1.l2.l3.l4.l5 | Should Be 'leaf'
+    }
+
+    It 'stores the Details JSON compactly (no pretty-printing whitespace)' {
+        Add-JITAuditRow -Action 'Revoke' -SubscriptionId 'sub-x' -Details @{ site = 'Removed' }
+        $global:__AuditRowBodies[0].Details | Should Be '{"site":"Removed"}'
+    }
+
+    # ── 2/3. Empty means absent — no "{}" on the 18 quiet handlers' rows ────────
+
+    It 'omits the Details property entirely when Details is $null' {
+        Add-JITAuditRow -Action 'Grant' -SubscriptionId 'sub-x' -Details $null
+        $global:__AuditRowBodies[0].ContainsKey('Details') | Should Be $false
+    }
+
+    It 'omits the Details property entirely when Details is an empty hashtable' {
+        Add-JITAuditRow -Action 'Grant' -SubscriptionId 'sub-x' -Details @{}
+        $global:__AuditRowBodies[0].ContainsKey('Details') | Should Be $false
+    }
+
+    It 'writes neither an empty string nor "{}" for an empty Details' {
+        Add-JITAuditRow -Action 'Grant' -SubscriptionId 'sub-x' -Details @{}
+        $b = $global:__AuditRowBodies[0]
+        # Absent, so the lookup yields $null rather than '' or '{}'.
+        $b['Details'] | Should BeNullOrEmpty
+        ($b.Keys -contains 'Details') | Should Be $false
+    }
+
+    # ── 4/5. The 8192-char cap and its truncation envelope ─────────────────────
+
+    It 'replaces an over-cap payload with a valid truncation envelope' {
+        $slots = @{}
+        1..400 | ForEach-Object { $slots["slot-$('{0:d3}' -f $_)"] = "Removed-after-retry-$_" }
+        $details = @{ site = 'Removed'; slots = $slots }
+
+        # Same instance the helper serializes, so the expected length is exact.
+        $expectedJson = $details | ConvertTo-Json -Compress -Depth 6
+        $expectedJson.Length | Should BeGreaterThan 8192
+
+        Add-JITAuditRow -Action 'Expire' -SubscriptionId 'sub-x' -Details $details
+
+        $stored = $global:__AuditRowBodies[0].Details
+        $stored | Should Not BeNullOrEmpty
+        # Still parses as JSON — truncation never chops the string mid-token.
+        $parsed = $stored | ConvertFrom-Json
+        $parsed._truncated      | Should Be $true
+        $parsed._originalLength | Should Be $expectedJson.Length
+        $parsed._preview.Length | Should Be 1024
+        $parsed._preview        | Should Be $expectedJson.Substring(0, 1024)
+        # The envelope itself stays comfortably inside the cap.
+        $stored.Length          | Should BeLessThan 8192
+    }
+
+    It 'does not truncate an under-cap payload' {
+        $slots = @{}
+        1..20 | ForEach-Object { $slots["slot-$_"] = 'Removed' }
+        $details = @{ site = 'Removed'; slots = $slots }
+
+        Add-JITAuditRow -Action 'Expire' -SubscriptionId 'sub-x' -Details $details
+
+        $stored = $global:__AuditRowBodies[0].Details
+        $stored.Length | Should BeLessThan 8192
+        $parsed = $stored | ConvertFrom-Json
+        (@($parsed.PSObject.Properties.Name) -contains '_truncated') | Should Be $false
+        $parsed.site           | Should Be 'Removed'
+        $parsed.slots.'slot-1' | Should Be 'Removed'
+        @($parsed.slots.PSObject.Properties).Count | Should Be 20
+    }
+
+    # ── 6. Auditing is observability, never a transaction participant ──────────
+    # Own Context: Pester 3.4 tears mocks down at Describe/Context exit rather
+    # than after each It, so the throwing ConvertTo-Json must be quarantined or
+    # it leaks into every later test in the block.
+    Context 'when Details cannot be serialized' {
+
+        It 'still writes the row, without Details, and does not throw' {
+            Mock -ModuleName JITHelpers ConvertTo-Json { throw 'serializer exploded' }
+
+            $threw = Test-Throws {
+                Add-JITAuditRow -Action 'Grant' -SubscriptionId 'sub-x' -RuleIdentifier 'rule-1' `
+                    -Details @{ site = 'Removed' } -WarningAction SilentlyContinue
+            }
+            $threw | Should Be $false
+
+            $global:__AuditRowBodies.Count | Should Be 1
+            $b = $global:__AuditRowBodies[0]
+            $b.ContainsKey('Details') | Should Be $false
+            # The rest of the row is intact — the grant is still auditable.
+            $b.Action         | Should Be 'Grant'
+            $b.RuleIdentifier | Should Be 'rule-1'
+        }
+    }
+
+    # ── 7. Extra and Details compose (the refused-revoke row carries both) ─────
+
+    It 'carries Extra columns and Details together without either clobbering the other' {
+        Add-JITAuditRow -Action 'RemoveFailed' -SubscriptionId 'sub-x' -TargetType 'aks' `
+            -Extra @{ reason = 'refused-would-open-cluster' } `
+            -Details @{ site = 'Retained'; slots = @{ staging = 'Retained' } }
+
+        $b = $global:__AuditRowBodies[0]
+        $b.reason | Should Be 'refused-would-open-cluster'
+        $parsed = $b.Details | ConvertFrom-Json
+        $parsed.site          | Should Be 'Retained'
+        $parsed.slots.staging | Should Be 'Retained'
+    }
+
+    It 'does not let Extra overwrite the Details column' {
+        # Details is applied after Extra, so a stray Extra key of the same name
+        # loses — the handler's own Details are authoritative.
+        Add-JITAuditRow -Action 'Revoke' -SubscriptionId 'sub-x' `
+            -Extra @{ Details = 'from-extra' } -Details @{ site = 'Removed' }
+        $global:__AuditRowBodies[0].Details | Should Be '{"site":"Removed"}'
+    }
+
+    # ── 8. Regression guard for the 18 handlers that report no Details ─────────
+
+    It 'writes exactly the pre-existing 14 columns when -Details is not supplied' {
+        Add-JITAuditRow -Action 'Grant' -SubscriptionId 'sub-x' -TargetType 'nsg' `
+            -ResourceName 'res1' -ResourceRg 'rg1' -RuleIdentifier 'jit-rule-1' `
+            -CallerIp '10.0.0.9' -Port '443' -RequestedBy 'alice@contoso.com' `
+            -ExpiryUtc '2026-01-01T00:00:00.0000000Z' -Justification 'ticket-42'
+
+        $b = $global:__AuditRowBodies[0]
+        $b.Keys.Count | Should Be 14
+        foreach ($col in $script:BaseAuditColumns) {
+            $b.ContainsKey($col) | Should Be $true
+        }
+        $b.ContainsKey('Details') | Should Be $false
+    }
+
+    It 'produces the same row shape whether -Details is omitted or empty' {
+        $rowArgs = @{
+            Action = 'Grant'; SubscriptionId = 'sub-x'; TargetType = 'nsg'
+            ResourceName = 'res1'; ResourceRg = 'rg1'; RuleIdentifier = 'jit-rule-1'
+            CallerIp = '10.0.0.9'; Port = '443'; RequestedBy = 'alice@contoso.com'
+            ExpiryUtc = '2026-01-01T00:00:00.0000000Z'; Justification = 'ticket-42'
+        }
+        Add-JITAuditRow @rowArgs
+        Add-JITAuditRow @rowArgs -Details @{}
+        Add-JITAuditRow @rowArgs -Details $null
+
+        $global:__AuditRowBodies.Count | Should Be 3
+        $baseline = $global:__AuditRowBodies[0]
+        foreach ($row in $global:__AuditRowBodies) {
+            (($row.Keys | Sort-Object) -join ',') | Should Be (($baseline.Keys | Sort-Object) -join ',')
+            # Every column but the per-event identity pair is byte-identical.
+            foreach ($col in $script:BaseAuditColumns) {
+                if ($col -in @('RowKey', 'EventUtc')) { continue }
+                $row[$col] | Should Be $baseline[$col]
+            }
+        }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The internal serializer, exercised directly for the cases that are easier to
+# state without a table round-trip. Not exported, so reached via InModuleScope.
+Describe 'ConvertTo-JITAuditDetails' {
+
+    It 'returns $null for $null Details' {
+        InModuleScope JITHelpers { ConvertTo-JITAuditDetails -Details $null } | Should BeNullOrEmpty
+    }
+
+    It 'returns $null for an empty hashtable' {
+        InModuleScope JITHelpers { ConvertTo-JITAuditDetails -Details @{} } | Should BeNullOrEmpty
+    }
+
+    It 'returns compact JSON for a populated hashtable' {
+        InModuleScope JITHelpers {
+            ConvertTo-JITAuditDetails -Details @{ site = 'Removed' }
+        } | Should Be '{"site":"Removed"}'
+    }
+
+    It 'caps the serialized output at 8192 characters' {
+        $result = InModuleScope JITHelpers {
+            $slots = @{}
+            1..400 | ForEach-Object { $slots["slot-$('{0:d3}' -f $_)"] = "Removed-after-retry-$_" }
+            ConvertTo-JITAuditDetails -Details @{ slots = $slots }
+        }
+        $result.Length | Should BeLessThan 8192
+        ($result | ConvertFrom-Json)._truncated | Should Be $true
+    }
+
+    # Quarantined for the same mock-teardown reason as the Add-JITAuditRow case.
+    Context 'when ConvertTo-Json fails' {
+
+        It 'returns $null instead of throwing' {
+            # ConvertTo-JITAuditDetails is a simple function (no [Parameter()]
+            # attribute) so it takes no common parameters — the warning is
+            # quieted by preference instead of -WarningAction.
+            $result = InModuleScope JITHelpers {
+                $WarningPreference = 'SilentlyContinue'
+                Mock ConvertTo-Json { throw 'serializer exploded' }
+                ConvertTo-JITAuditDetails -Details @{ site = 'Removed' }
+            }
+            $result | Should BeNullOrEmpty
+        }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Call-site wiring. Parsed from the entry points' ASTs rather than executed, so
+# these stay meaningful independently of the function-host harnesses.
+Describe 'Add-JITAuditRow Details wiring at the call sites' {
+
+    It 'forwards Details on all four Request-JITAccess audit rows' {
+        $calls = Get-AuditRowCallSites '../Request-JITAccess/run.ps1'
+        $calls.Count | Should Be 4
+        (($calls.Action | Sort-Object) -join ',') | Should Be 'AlreadyExternal,Extend,Grant,SkippedOpen'
+        @($calls | Where-Object { -not $_.HasDetails }).Count | Should Be 0
+    }
+
+    It 'forwards Details on both Revoke-JITAccess audit rows' {
+        $calls = Get-AuditRowCallSites '../Revoke-JITAccess/run.ps1'
+        $calls.Count | Should Be 2
+        (($calls.Action | Sort-Object) -join ',') | Should Be 'RemoveFailed,Revoke'
+        @($calls | Where-Object { -not $_.HasDetails }).Count | Should Be 0
+    }
+
+    # The outer catch runs when the remove handler THREW, so there is no result
+    # to describe and $removeResult still holds the PREVIOUS loop iteration's
+    # value — forwarding it would attribute one resource's slot state to another.
+    # The omission is deliberate; this pins it.
+    It 'omits Details on the Remove-ExpiredRules outer-catch RemoveFailed row only' {
+        $calls = Get-AuditRowCallSites '../Remove-ExpiredRules/run.ps1'
+        $calls.Count | Should Be 3
+
+        $without = @($calls | Where-Object { -not $_.HasDetails })
+        $without.Count     | Should Be 1
+        $without[0].Action | Should Be 'RemoveFailed'
+        # It is the last of the three — the per-resource outer catch, not the
+        # in-loop Refused/Expire rows, both of which do carry Details.
+        $without[0].Line   | Should Be ($calls.Line | Measure-Object -Maximum).Maximum
+
+        $with = @($calls | Where-Object { $_.HasDetails })
+        (($with.Action | Sort-Object) -join ',') | Should Be 'Expire,RemoveFailed'
     }
 }
 

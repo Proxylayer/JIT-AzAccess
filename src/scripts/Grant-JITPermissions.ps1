@@ -49,7 +49,7 @@ if (
 
 $roleName = 'JIT-AzAccess Manager'
 
-$roleDescription = 'Manages temporary IP allowlist entries for JIT-AzAccess on NSGs, SQL / PostgreSQL / MySQL flexible servers, storage accounts, key vaults, Redis caches, Synapse workspaces, Cosmos DB accounts, container registries, AI Search services, Cognitive Services accounts, Kusto clusters, IoT hubs, SignalR services, Event Hubs / Service Bus namespaces, App Service sites, and AKS managed clusters.'
+$roleDescription = 'Manages temporary IP allowlist entries for JIT-AzAccess on NSGs, SQL / PostgreSQL / MySQL flexible servers, storage accounts, key vaults, Redis caches, Synapse workspaces, Cosmos DB accounts, container registries, AI Search services, Cognitive Services accounts, Kusto clusters, IoT hubs, SignalR services, Event Hubs / Service Bus namespaces, App Service sites (including their deployment slots), and AKS managed clusters.'
 
 $roleActions = @(
     'Microsoft.Network/networkSecurityGroups/read'
@@ -121,6 +121,9 @@ $roleActions = @(
     'Microsoft.Web/sites/read'
     'Microsoft.Web/sites/config/read'
     'Microsoft.Web/sites/config/write'
+    'Microsoft.Web/sites/slots/read'
+    'Microsoft.Web/sites/slots/config/read'
+    'Microsoft.Web/sites/slots/config/write'
 
     'Microsoft.ContainerService/managedClusters/read'
     'Microsoft.ContainerService/managedClusters/write'
@@ -183,45 +186,67 @@ if ($existingRole) {
     # Merge the new scopes with the existing ones so re-running this with a
     # different subset of target subs doesn't silently drop subscriptions
     # we've already assigned the role on. (Multi-subscription safe.)
-    $existingScopes  = @($existingRole.assignableScopes)
+    $existingScopes = @($existingRole.assignableScopes)
     $assignableScopes = @(($existingScopes + $assignableScopes) | Sort-Object -Unique)
 
     if ($existingScopes.Count -ne $assignableScopes.Count) {
-        $added = $assignableScopes | Where-Object { $_ -notin $existingScopes }
+        # @() so a single added scope is still an array - Set-StrictMode -Latest
+        # makes .Count on a bare string a terminating error.
+        $added = @($assignableScopes | Where-Object { $_ -notin $existingScopes })
         Write-Host "  Adding $($added.Count) new assignable scope(s): $($added -join ', ')"
     }
 }
 
-# Build the role definition as a flat, PascalCase object and pipe it to az via
-# STDIN ("@-"). This is the shape `az role definition create/update` actually
-# accepts (it matches the official az docs example); the previous camelCase form
-# with a nested permissions[] array, written to a temp file, did not create the
-# role reliably in practice.
+# Build the role definition as a flat, camelCase object and pipe it to az via
+# STDIN ("@-").
+#
+# Key names are dictated by az's own role module
+# (Lib/site-packages/azure/cli/command_modules/role/custom.py,
+# _create_update_role_definition). It lower-cases the first letter of every key
+# before use, then:
+#   * create path  -> role_name = role_definition.get('name', None)
+#   * update path, when 'id' is supplied -> role_name = role_definition['roleName']
+# so 'roleName' is MANDATORY on update-with-id (its absence is the KeyError:
+# 'roleName' this script used to fail with) and 'name' is mandatory on create.
+# Both are supplied here so the same object works on either path.
+# RoleApiHelper.create_role_definition subscripts 'assignableScopes' directly on
+# both paths, and RoleApiHelper._init_individual_permission reads the flat
+# 'actions' / 'notActions' / 'dataActions' / 'notDataActions' keys off this same
+# object when no nested 'permissions' array is present - hence the flat shape.
+# Unrecognised keys are ignored.
 $roleDefinition = @{
-    Name             = $roleName
-    Description      = $roleDescription
-    IsCustom         = $true
-    Actions          = $roleActions
-    NotActions       = @()
-    DataActions      = @()
-    NotDataActions   = @()
-    AssignableScopes = $assignableScopes
+    name             = $roleName
+    roleName         = $roleName
+    description      = $roleDescription
+    isCustom         = $true
+    actions          = $roleActions
+    notActions       = @()
+    dataActions      = @()
+    notDataActions   = @()
+    assignableScopes = $assignableScopes
 }
 
 if ($existingRole) {
 
-    # For update, include the existing role's full ARM path under 'Id' so az can
+    # For update, include the existing role's full ARM path under 'id' so az can
     # identify the role. The .name on the existing object is the bare GUID; az
     # needs the full /subscriptions/.../roleDefinitions/<guid> path, which .id
     # holds.
-    $roleDefinition['Id'] = $existingRole.id
+    $roleDefinition['id'] = $existingRole.id
 
     $roleDefinition |
-        ConvertTo-Json -Depth 10 -Compress |
-        az role definition update `
-            --role-definition "@-" `
-            --output none `
-            --only-show-errors
+    ConvertTo-Json -Depth 10 -Compress |
+    az role definition update `
+        --role-definition "@-" `
+        --output none `
+        --only-show-errors
+
+
+    # $ErrorActionPreference='Stop' does NOT catch native (az) failures, so check
+    # the exit code explicitly and abort rather than printing a false success.
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to update role definition '$roleName' (az exited $LASTEXITCODE)."
+    }
 
     Write-Host "  Role updated."
 }
@@ -229,11 +254,15 @@ else {
     Write-Host "  Role does not exist. Creating..."
 
     $roleDefinition |
-        ConvertTo-Json -Depth 10 -Compress |
-        az role definition create `
-            --role-definition "@-" `
-            --output none `
-            --only-show-errors
+    ConvertTo-Json -Depth 10 -Compress |
+    az role definition create `
+        --role-definition "@-" `
+        --output none `
+        --only-show-errors
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to create role definition '$roleName' (az exited $LASTEXITCODE)."
+    }
 
     Write-Host "  Role created."
 }
@@ -267,7 +296,12 @@ foreach ($subId in $TargetSubscriptionIds) {
             --assignee-principal-type ServicePrincipal `
             --role $roleName `
             --scope $scope `
-            --output none
+            --output none `
+            --only-show-errors
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to assign role '$roleName' on $scope (az exited $LASTEXITCODE)."
+        }
 
         Write-Host "  Assigned."
     }
@@ -283,7 +317,7 @@ foreach ($subId in $TargetSubscriptionIds) {
 # script performs. The role grants no Azure control-plane actions by itself —
 # it is a pure access marker the function app checks for.
 
-$requesterRoleName        = 'JIT-Requester'
+$requesterRoleName = 'JIT-Requester'
 $requesterRoleDescription = 'Permits the holder to request JIT access in this subscription via the JIT-AzAccess function app. Assigned to end users; grants no Azure control-plane actions by itself.'
 
 Write-Host ""
@@ -312,39 +346,47 @@ if ($existingRequester) {
     # Merge new scopes with existing ones so re-running with a different subset
     # of target subs doesn't drop subscriptions the role is already assignable on.
     $existingReqScopes = @($existingRequester.assignableScopes)
-    $requesterScopes   = @(($existingReqScopes + $requesterScopes) | Sort-Object -Unique)
+    $requesterScopes = @(($existingReqScopes + $requesterScopes) | Sort-Object -Unique)
 
     if ($existingReqScopes.Count -ne $requesterScopes.Count) {
-        $addedReq = $requesterScopes | Where-Object { $_ -notin $existingReqScopes }
+        # @() for the same Set-StrictMode reason as the manager role above.
+        $addedReq = @($requesterScopes | Where-Object { $_ -notin $existingReqScopes })
         Write-Host "  Adding $($addedReq.Count) new assignable scope(s): $($addedReq -join ', ')"
     }
 }
 
-# Same flat, PascalCase + STDIN ("@-") shape as the manager role above. The
-# requester role grants no Azure actions, so Actions is empty.
+# Same flat, camelCase + STDIN ("@-") shape as the manager role above, including
+# both 'name' (required by az on create) and 'roleName' (required by az on
+# update-with-id). The requester role grants no Azure actions, so actions is
+# empty.
 $requesterRoleDefinition = @{
-    Name             = $requesterRoleName
-    Description      = $requesterRoleDescription
-    IsCustom         = $true
-    Actions          = @()
-    NotActions       = @()
-    DataActions      = @()
-    NotDataActions   = @()
-    AssignableScopes = $requesterScopes
+    name             = $requesterRoleName
+    roleName         = $requesterRoleName
+    description      = $requesterRoleDescription
+    isCustom         = $true
+    actions          = @()
+    notActions       = @()
+    dataActions      = @()
+    notDataActions   = @()
+    assignableScopes = $requesterScopes
 }
 
 if ($existingRequester) {
 
-    # Full ARM path under 'Id' so az can identify the role on update (see note
+    # Full ARM path under 'id' so az can identify the role on update (see note
     # on the manager role above).
-    $requesterRoleDefinition['Id'] = $existingRequester.id
+    $requesterRoleDefinition['id'] = $existingRequester.id
 
     $requesterRoleDefinition |
-        ConvertTo-Json -Depth 10 -Compress |
-        az role definition update `
-            --role-definition "@-" `
-            --output none `
-            --only-show-errors
+    ConvertTo-Json -Depth 10 -Compress |
+    az role definition update `
+        --role-definition "@-" `
+        --output none `
+        --only-show-errors
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to update role definition '$requesterRoleName' (az exited $LASTEXITCODE)."
+    }
 
     Write-Host "  Role updated."
 }
@@ -352,11 +394,15 @@ else {
     Write-Host "  Role does not exist. Creating..."
 
     $requesterRoleDefinition |
-        ConvertTo-Json -Depth 10 -Compress |
-        az role definition create `
-            --role-definition "@-" `
-            --output none `
-            --only-show-errors
+    ConvertTo-Json -Depth 10 -Compress |
+    az role definition create `
+        --role-definition "@-" `
+        --output none `
+        --only-show-errors
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to create role definition '$requesterRoleName' (az exited $LASTEXITCODE)."
+    }
 
     Write-Host "  Role created."
 }
@@ -370,3 +416,4 @@ Write-Host (
     "The '{0}' role is now assignable to end users on: {1}" -f
     $requesterRoleName, ($TargetSubscriptionIds -join ', ')
 )
+

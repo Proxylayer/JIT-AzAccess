@@ -154,6 +154,96 @@ function Wait-JITArmAsyncOperation {
     throw "Async operation did not complete within $TimeoutSeconds seconds (timeout)."
 }
 
+function Remove-JITChildRuleWithLro {
+    <#
+    .SYNOPSIS
+        Idempotently deletes a child rule resource whose DELETE is long-running,
+        returning 'Removed' or 'NotFound' and never failing merely because the
+        rule was already gone.
+
+    .DESCRIPTION
+        Shared by the four target types whose firewall-rule DELETE is an LRO:
+        PostgreSQL / MySQL flexible servers, Redis, and Synapse.
+
+        The naive shape — DELETE, then poll — is not idempotent in practice.
+        Deleting an ALREADY-ABSENT PostgreSQL firewall rule does not return 404:
+        the resource provider accepts the request with 202 Accepted and then
+        fails the async operation with a bare InternalServerError. A caller that
+        trusts that error concludes the removal failed, keeps the JITRules row,
+        and retries every five minutes forever, so a rule removed out-of-band
+        (by an admin, another tool, or a partially-completed earlier run) strands
+        its row permanently. Observed in production 2026-08-29.
+
+        So this helper reconciles against reality rather than trusting the RP:
+
+          1. GET the rule first. Absent -> 'NotFound', no DELETE attempted. This
+             is the cheap path and avoids the broken behavior entirely.
+          2. DELETE, polling if the reply is 202.
+          3. If the poll throws, GET again. If the rule is now gone the delete
+             actually succeeded (or someone else removed it concurrently), so
+             report 'Removed'. Only a rule that is STILL PRESENT rethrows.
+
+        Step 3 matters beyond this one RP bug: it also converts async timeouts
+        into a correct answer whenever the underlying operation did complete.
+
+    .PARAMETER Path
+        Full ARM path of the child rule resource.
+
+    .PARAMETER TypeLabel
+        Human-readable resource type used in log lines (e.g. 'PostgreSQL').
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$ApiVersion,
+        [Parameter(Mandatory)][string]$RuleName,
+        [string]$TypeLabel          = 'firewall rule',
+        [int]   $TimeoutSeconds     = 180,
+        [int]   $DefaultPollSeconds = 5
+    )
+
+    # Returns $true / $false, or $null when existence could not be determined
+    # (a transport failure, say) — the caller must not treat unknown as absent.
+    $ruleExists = {
+        try {
+            Invoke-ArmRestRaw -Method GET -Path $Path -ApiVersion $ApiVersion | Out-Null
+            return $true
+        }
+        catch {
+            if ((Get-StatusFromError $_) -eq 404) { return $false }
+            return $null
+        }
+    }
+
+    if ((& $ruleExists) -eq $false) {
+        Write-Host "  $TypeLabel rule '$RuleName' not found — already removed."
+        return @{ Status = 'NotFound'; Details = @{} }
+    }
+
+    try {
+        $resp = Invoke-ArmRestRaw -Method DELETE -Path $Path -ApiVersion $ApiVersion
+        if ($resp.StatusCode -eq 202) {
+            Wait-JITArmAsyncOperation -ResponseHeaders $resp.Headers `
+                -TimeoutSeconds     $TimeoutSeconds `
+                -DefaultPollSeconds $DefaultPollSeconds
+        }
+        return @{ Status = 'Removed'; Details = @{} }
+    }
+    catch {
+        if ((Get-StatusFromError $_) -eq 404) {
+            Write-Host "  $TypeLabel rule '$RuleName' not found — already removed."
+            return @{ Status = 'NotFound'; Details = @{} }
+        }
+
+        # The delete reported failure. Believe the resource, not the report.
+        if ((& $ruleExists) -eq $false) {
+            Write-Warning "  $TypeLabel rule '$RuleName': delete reported failure but the rule is gone — treating as removed. $($_.Exception.Message)"
+            return @{ Status = 'Removed'; Details = @{ reconciled = $true; reportedError = $_.Exception.Message } }
+        }
+
+        throw
+    }
+}
+
 function Invoke-JITArmReadModifyWrite {
     <#
     .SYNOPSIS

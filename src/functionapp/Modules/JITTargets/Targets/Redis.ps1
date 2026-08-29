@@ -66,21 +66,14 @@ function Remove-JITRedisRule {
             "/providers/Microsoft.Cache/Redis/$($Row.ResourceName)" +
             "/firewallRules/$ruleName"
 
-    try {
-        $resp = Invoke-ArmRestRaw -Method DELETE -Path $path -ApiVersion $script:RedisApi
-        if ($resp.StatusCode -eq 202) {
-            Wait-JITArmAsyncOperation -ResponseHeaders $resp.Headers `
-                -TimeoutSeconds     $script:RedisLroTimeoutSeconds `
-                -DefaultPollSeconds $script:RedisLroDefaultPollSeconds
-        }
-        return @{ Status = 'Removed'; Details = @{} }
-    }
-    catch {
-        if ((Get-StatusFromError $_) -eq 404) {
-            Write-Host "  Redis firewall rule '$ruleName' not found — already removed."
-            return @{ Status = 'NotFound'; Details = @{} }
-        } else { throw }
-    }
+    # Existence-reconciling idempotent delete — see Remove-JITChildRuleWithLro.
+    return Remove-JITChildRuleWithLro `
+        -Path               $path `
+        -ApiVersion         $script:RedisApi `
+        -RuleName           $ruleName `
+        -TypeLabel          'Redis firewall' `
+        -TimeoutSeconds     $script:RedisLroTimeoutSeconds `
+        -DefaultPollSeconds $script:RedisLroDefaultPollSeconds
 }
 
 #endregion

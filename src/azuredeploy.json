@@ -57,6 +57,13 @@
             "type": "string",
             "defaultValue": "20",
             "metadata": { "description": "Maximum number of simultaneously active JIT rules on a single target resource." }
+        },
+        "logAnalyticsWorkspaceId": {
+            "type": "string",
+            "defaultValue": "",
+            "metadata": {
+                "description": "Resource ID of an existing Log Analytics workspace to back the Application Insights component. REQUIRED in practice: the app runs from a package, which disables filesystem log streaming, so App Insights is the only place its logs land. Leave empty only if you are deliberately deploying an app you cannot observe."
+            }
         }
     },
     "variables": {
@@ -85,6 +92,7 @@
                 "expressionEvaluationOptions": { "scope": "inner" },
                 "parameters": {
                     "location":                   { "value": "[parameters('location')]" },
+                    "appName":                      { "value": "[parameters('appName')]" },
                     "storageName":                  { "value": "[variables('storageName')]" },
                     "planName":                     { "value": "[variables('planName')]" },
                     "functionName":                 { "value": "[variables('functionName')]" },
@@ -94,13 +102,15 @@
                     "nsgPriorityMin":               { "value": "[parameters('nsgPriorityMin')]" },
                     "nsgPriorityMax":               { "value": "[parameters('nsgPriorityMax')]" },
                     "maxRulesPerCaller":            { "value": "[parameters('maxRulesPerCaller')]" },
-                    "maxRulesPerResource":          { "value": "[parameters('maxRulesPerResource')]" }
+                    "maxRulesPerResource":          { "value": "[parameters('maxRulesPerResource')]" },
+                    "logAnalyticsWorkspaceId":      { "value": "[parameters('logAnalyticsWorkspaceId')]" }
                 },
                 "template": {
                     "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
                     "contentVersion": "1.0.0.0",
                     "parameters": {
                         "location":                   { "type": "string" },
+                        "appName":                      { "type": "string" },
                         "storageName":                  { "type": "string" },
                         "planName":                     { "type": "string" },
                         "functionName":                 { "type": "string" },
@@ -110,9 +120,16 @@
                         "nsgPriorityMin":               { "type": "string" },
                         "nsgPriorityMax":               { "type": "string" },
                         "maxRulesPerCaller":            { "type": "string" },
-                        "maxRulesPerResource":          { "type": "string" }
+                        "maxRulesPerResource":          { "type": "string" },
+                        "logAnalyticsWorkspaceId":      { "type": "string" }
                     },
-                    "variables": {},
+                    "variables": {
+                        "insightsName":   "[format('appi-{0}', parameters('appName'))]",
+                        "packageContainer": "deployments",
+                        "packageBlob":      "functionapp.zip",
+                        "packageUrl":     "[format('https://{0}.blob.core.windows.net/deployments/functionapp.zip', parameters('storageName'))]",
+                        "storageId":      "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageName'))]"
+                    },
                     "resources": [
                         {
                             "type": "Microsoft.Storage/storageAccounts",
@@ -125,11 +142,29 @@
                                 "supportsHttpsTrafficOnly": true,
                                 "minimumTlsVersion": "TLS1_2",
                                 "allowBlobPublicAccess": false,
-                                "allowSharedKeyAccess": true,
+                                "allowSharedKeyAccess": false,
                                 "networkAcls": {
                                     "defaultAction": "Allow",
                                     "bypass": "AzureServices"
                                 }
+                            }
+                        },
+                        {
+                            "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+                            "apiVersion": "2022-09-01",
+                            "name": "[format('{0}/default/{1}', parameters('storageName'), variables('packageContainer'))]",
+                            "dependsOn": [ "[variables('storageId')]" ],
+                            "properties": { "publicAccess": "None" }
+                        },
+                        {
+                            "type": "Microsoft.Insights/components",
+                            "apiVersion": "2020-02-02",
+                            "name": "[variables('insightsName')]",
+                            "location": "[parameters('location')]",
+                            "kind": "web",
+                            "properties": {
+                                "Application_Type": "web",
+                                "WorkspaceResourceId": "[if(empty(parameters('logAnalyticsWorkspaceId')), json('null'), parameters('logAnalyticsWorkspaceId'))]"
                             }
                         },
                         {
@@ -150,7 +185,9 @@
                             "identity": { "type": "SystemAssigned" },
                             "dependsOn": [
                                 "[resourceId('Microsoft.Web/serverfarms', parameters('planName'))]",
-                                "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageName'))]"
+                                "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageName'))]",
+                                "[resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', parameters('storageName'), 'default', variables('packageContainer'))]",
+                                "[resourceId('Microsoft.Insights/components', variables('insightsName'))]"
                             ],
                             "properties": {
                                 "serverFarmId": "[resourceId('Microsoft.Web/serverfarms', parameters('planName'))]",
@@ -161,9 +198,11 @@
                                     "powerShellVersion": "7.2",
                                     "cors": { "allowedOrigins": [], "supportCredentials": false },
                                     "appSettings": [
+                                        { "name": "AzureWebJobsStorage__accountName",       "value": "[parameters('storageName')]" },
+                                        { "name": "WEBSITE_RUN_FROM_PACKAGE",              "value": "[variables('packageUrl')]" },
                                         {
-                                            "name": "AzureWebJobsStorage",
-                                            "value": "[format('DefaultEndpointsProtocol=https;AccountName={0};AccountKey={1};EndpointSuffix=core.windows.net', parameters('storageName'), listKeys(resourceId('Microsoft.Storage/storageAccounts', parameters('storageName')), '2022-09-01').keys[0].value)]"
+                                            "name": "APPLICATIONINSIGHTS_CONNECTION_STRING",
+                                            "value": "[reference(resourceId('Microsoft.Insights/components', variables('insightsName')), '2020-02-02').ConnectionString]"
                                         },
                                         { "name": "FUNCTIONS_EXTENSION_VERSION",           "value": "~4" },
                                         { "name": "FUNCTIONS_WORKER_RUNTIME",              "value": "powershell" },
@@ -192,6 +231,18 @@
                         "functionAppHostname": {
                             "type": "string",
                             "value": "[reference(resourceId('Microsoft.Web/sites', parameters('functionName')), '2022-03-01').defaultHostName]"
+                        },
+                        "storageAccountName": {
+                            "type": "string",
+                            "value": "[parameters('storageName')]"
+                        },
+                        "packageContainer": {
+                            "type": "string",
+                            "value": "[variables('packageContainer')]"
+                        },
+                        "packageBlob": {
+                            "type": "string",
+                            "value": "[variables('packageBlob')]"
                         }
                     }
                 }
@@ -214,6 +265,18 @@
         "resourceGroupName": {
             "type": "string",
             "value": "[parameters('resourceGroupName')]"
+        },
+        "storageAccountName": {
+            "type": "string",
+            "value": "[reference('jit-azaccess-resources').outputs.storageAccountName.value]"
+        },
+        "packageContainer": {
+            "type": "string",
+            "value": "[reference('jit-azaccess-resources').outputs.packageContainer.value]"
+        },
+        "packageBlob": {
+            "type": "string",
+            "value": "[reference('jit-azaccess-resources').outputs.packageBlob.value]"
         }
     }
 }
