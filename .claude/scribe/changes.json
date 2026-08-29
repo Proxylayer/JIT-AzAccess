@@ -1,7 +1,7 @@
 {
   "docType": "changes",
   "idPrefix": "CHG",
-  "nextId": 50,
+  "nextId": 71,
   "items": [
     {
       "id": "CHG-0001",
@@ -933,6 +933,405 @@
       "comments": [],
       "created": "2026-07-24T03:26:22Z",
       "updated": "2026-07-24T03:26:22Z"
+    },
+    {
+      "id": "CHG-0050",
+      "title": "add todos TODO-0016",
+      "state": "done",
+      "tags": [
+        "todos",
+        "add"
+      ],
+      "description": "Added 'FIXED: Grant-JITPermissions role-definition update KeyError roleName + swallowed az errors'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0016"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-24T19:51:16Z",
+      "updated": "2026-07-24T19:51:16Z"
+    },
+    {
+      "id": "CHG-0051",
+      "title": "add features FEAT-0004",
+      "state": "done",
+      "tags": [
+        "features",
+        "add"
+      ],
+      "description": "Added 'App Service JIT grants auto-cover all deployment slots'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "FEAT-0004"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-27T21:06:47Z",
+      "updated": "2026-07-27T21:06:47Z"
+    },
+    {
+      "id": "CHG-0052",
+      "title": "add todos TODO-0017",
+      "state": "done",
+      "tags": [
+        "todos",
+        "add"
+      ],
+      "description": "Added 'Wire target handler Details into the JIT audit rows'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0017"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-27T21:25:29Z",
+      "updated": "2026-07-27T21:25:29Z"
+    },
+    {
+      "id": "CHG-0053",
+      "title": "add todos TODO-0018",
+      "state": "done",
+      "tags": [
+        "todos",
+        "add"
+      ],
+      "description": "Added 'Two failing JITHelpers tests outside TODO-0006's scope'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0018"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-27T21:25:31Z",
+      "updated": "2026-07-27T21:25:31Z"
+    },
+    {
+      "id": "CHG-0054",
+      "title": "add todos TODO-0019",
+      "state": "done",
+      "tags": [
+        "todos",
+        "add"
+      ],
+      "description": "Added 'build.ps1 does not validate the PowerShell function app'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0019"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-27T21:25:32Z",
+      "updated": "2026-07-27T21:25:32Z"
+    },
+    {
+      "id": "CHG-0055",
+      "title": "addLink features FEAT-0004",
+      "state": "done",
+      "tags": [
+        "features",
+        "addLink"
+      ],
+      "description": "Link 'audit-gap' -> TODO-0017.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "FEAT-0004"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-27T21:25:47Z",
+      "updated": "2026-07-27T21:25:47Z"
+    },
+    {
+      "id": "CHG-0056",
+      "title": "addComment features FEAT-0004",
+      "state": "done",
+      "tags": [
+        "features",
+        "addComment"
+      ],
+      "description": "Comment c1 by developer.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "FEAT-0004"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-27T21:25:48Z",
+      "updated": "2026-07-27T21:25:48Z"
+    },
+    {
+      "id": "CHG-0057",
+      "title": "addComment features FEAT-0004",
+      "state": "done",
+      "tags": [
+        "features",
+        "addComment"
+      ],
+      "description": "Comment c2 by testcase.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "FEAT-0004"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-27T21:25:50Z",
+      "updated": "2026-07-27T21:25:50Z"
+    },
+    {
+      "id": "CHG-0058",
+      "title": "setState features FEAT-0004",
+      "state": "done",
+      "tags": [
+        "features",
+        "setState"
+      ],
+      "description": "State: active -> done.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "FEAT-0004"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-27T21:25:58Z",
+      "updated": "2026-07-27T21:25:58Z"
+    },
+    {
+      "id": "CHG-0059",
+      "title": "setState features FEAT-0004",
+      "state": "done",
+      "tags": [
+        "features",
+        "setState"
+      ],
+      "description": "State: done -> done.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "FEAT-0004"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-27T21:25:59Z",
+      "updated": "2026-07-27T21:25:59Z"
+    },
+    {
+      "id": "CHG-0060",
+      "title": "setState todos TODO-0017",
+      "state": "done",
+      "tags": [
+        "todos",
+        "setState"
+      ],
+      "description": "State: proposed -> active.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0017"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-27T21:28:59Z",
+      "updated": "2026-07-27T21:28:59Z"
+    },
+    {
+      "id": "CHG-0061",
+      "title": "addComment todos TODO-0017",
+      "state": "done",
+      "tags": [
+        "todos",
+        "addComment"
+      ],
+      "description": "Comment c1 by developer.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0017"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-27T21:44:10Z",
+      "updated": "2026-07-27T21:44:10Z"
+    },
+    {
+      "id": "CHG-0062",
+      "title": "addComment todos TODO-0017",
+      "state": "done",
+      "tags": [
+        "todos",
+        "addComment"
+      ],
+      "description": "Comment c2 by testcase.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0017"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-27T21:44:11Z",
+      "updated": "2026-07-27T21:44:11Z"
+    },
+    {
+      "id": "CHG-0063",
+      "title": "setState todos TODO-0017",
+      "state": "done",
+      "tags": [
+        "todos",
+        "setState"
+      ],
+      "description": "State: active -> done.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0017"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-27T21:44:30Z",
+      "updated": "2026-07-27T21:44:30Z"
+    },
+    {
+      "id": "CHG-0064",
+      "title": "addLink features FEAT-0004",
+      "state": "done",
+      "tags": [
+        "features",
+        "addLink"
+      ],
+      "description": "Link 'audit-details-wired' -> TODO-0017.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "FEAT-0004"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-27T21:44:32Z",
+      "updated": "2026-07-27T21:44:32Z"
+    },
+    {
+      "id": "CHG-0065",
+      "title": "add todos TODO-0020",
+      "state": "done",
+      "tags": [
+        "todos",
+        "add"
+      ],
+      "description": "Added 'Stale $removeResult in the Remove-ExpiredRules outer catch'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0020"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-27T21:44:34Z",
+      "updated": "2026-07-27T21:44:34Z"
+    },
+    {
+      "id": "CHG-0066",
+      "title": "add todos TODO-0021",
+      "state": "done",
+      "tags": [
+        "todos",
+        "add"
+      ],
+      "description": "Added 'Split JITHelpers.psm1 - multi-responsibility module at ~1030 lines'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0021"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-27T21:44:35Z",
+      "updated": "2026-07-27T21:44:35Z"
+    },
+    {
+      "id": "CHG-0067",
+      "title": "add todos TODO-0022",
+      "state": "done",
+      "tags": [
+        "todos",
+        "add"
+      ],
+      "description": "Added 'Pester 3.4 + PowerShell 7 gotchas for this repo's tests'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0022"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-27T21:44:35Z",
+      "updated": "2026-07-27T21:44:35Z"
+    },
+    {
+      "id": "CHG-0068",
+      "title": "removeLink features FEAT-0004",
+      "state": "done",
+      "tags": [
+        "features",
+        "removeLink"
+      ],
+      "description": "Link removed (label='audit-gap', ref='TODO-0017').",
+      "links": [
+        {
+          "label": "item",
+          "ref": "FEAT-0004"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-27T21:44:46Z",
+      "updated": "2026-07-27T21:44:46Z"
+    },
+    {
+      "id": "CHG-0069",
+      "title": "add designs DES-0002",
+      "state": "done",
+      "tags": [
+        "designs",
+        "add"
+      ],
+      "description": "Added 'Role-definition JSON shape for az role definition create/update'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "DES-0002"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-30T01:11:10Z",
+      "updated": "2026-07-30T01:11:10Z"
+    },
+    {
+      "id": "CHG-0070",
+      "title": "add todos TODO-0023",
+      "state": "done",
+      "tags": [
+        "todos",
+        "add"
+      ],
+      "description": "Added 'Guard against the single-added-scope StrictMode crash pattern'.",
+      "links": [
+        {
+          "label": "item",
+          "ref": "TODO-0023"
+        }
+      ],
+      "comments": [],
+      "created": "2026-07-30T01:11:12Z",
+      "updated": "2026-07-30T01:11:12Z"
     }
   ]
 }

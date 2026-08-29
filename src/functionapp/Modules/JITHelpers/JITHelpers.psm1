@@ -697,9 +697,7 @@ function Invoke-WithBlobLock {
             }
             $resp = Invoke-WebRequest -Method PUT `
                 -Uri ((Get-LockBlobUri $containerName $LockName) + '?comp=lease') `
-                -Headers (New-LeaseHeaders -ResourcePath "/$containerName/$LockName" `
-                                           -Query 'comp=lease' `
-                                           -ExtraHeaders $headers) `
+                -Headers (New-LeaseHeaders -ExtraHeaders $headers) `
                 -ErrorAction Stop
             $leaseId = $resp.Headers['x-ms-lease-id']
             if ($leaseId -is [array]) { $leaseId = $leaseId[0] }
@@ -729,9 +727,7 @@ function Invoke-WithBlobLock {
             }
             Invoke-WebRequest -Method PUT `
                 -Uri ((Get-LockBlobUri $containerName $LockName) + '?comp=lease') `
-                -Headers (New-LeaseHeaders -ResourcePath "/$containerName/$LockName" `
-                                           -Query 'comp=lease' `
-                                           -ExtraHeaders $headers) `
+                -Headers (New-LeaseHeaders -ExtraHeaders $headers) `
                 -ErrorAction SilentlyContinue | Out-Null
         }
         catch {
@@ -750,24 +746,19 @@ function script:Get-LockBlobUri {
     return "https://$($sp.Account).blob.$($sp.Suffix)/$Container/$Blob"
 }
 function script:New-LeaseHeaders {
-    param([string]$ResourcePath, [string]$Query, [hashtable]$ExtraHeaders)
-    $date = [DateTime]::UtcNow.ToString('R')
-    $headers = @{ 'x-ms-version' = '2021-12-02'; 'x-ms-date' = $date }
+    # The lease ops need Invoke-WebRequest directly (to read x-ms-lease-id off
+    # the response), so they build their own headers instead of going through
+    # Invoke-BlobRest. Auth still comes from the one shared helper, so the lease
+    # PUTs and ordinary blob calls can never end up on different schemes.
+    param([hashtable]$ExtraHeaders)
+    $headers = @{
+        'x-ms-version' = '2021-12-02'
+        'x-ms-date'    = [DateTime]::UtcNow.ToString('R')
+    }
     foreach ($k in $ExtraHeaders.Keys) { $headers[$k] = $ExtraHeaders[$k] }
 
-    $sp = & (Get-Module HttpHelpers) { Get-StorageParts }
+    $headers.Authorization = & (Get-Module HttpHelpers) { Get-StorageAuthHeader }
 
-    # CanonicalResource must use the Blob recipe: the query param goes on its
-    # own "comp:lease" line, NOT the literal "?comp=lease" (that's the Table
-    # form). Reuse the same helper Invoke-BlobRest uses so the two can't drift.
-    $canResource = & (Get-Module HttpHelpers) {
-        param($A, $P, $Q) Get-BlobCanonicalResource -Account $A -Path $P -Query $Q
-    } $sp.Account $ResourcePath $Query
-
-    $sig = & (Get-Module HttpHelpers) {
-        param($M, $C, $H, $L, $T) New-SharedKeySignature -Method $M -CanonicalResource $C -Headers $H -ContentLength $L -ContentType $T
-    } 'PUT' $canResource $headers 0 ''
-    $headers.Authorization = $sig
     return $headers
 }
 
@@ -893,6 +884,70 @@ function Get-JITAuditTableName {
     return $tableName
 }
 
+# Bound on the serialized Details column. Azure Table string properties cap at
+# 64 KB (UTF-16 — roughly 32K characters) and a whole entity at 1 MB, so 8K
+# characters is a deliberately conservative fraction of both: it comfortably
+# holds the richest Details any handler produces today (App Service reports one
+# short entry per deployment slot, and the platform maximum is 20 slots) while
+# leaving no way for a pathological payload to push an audit row near the entity
+# limit and start failing writes.
+$script:JITAuditDetailsMaxChars     = 8192
+# How much of an over-cap payload is kept as a human-readable preview. Sized so
+# that the truncation envelope stays far under the cap even if re-escaping the
+# preview inflates it several times over.
+$script:JITAuditDetailsPreviewChars = 1024
+
+function ConvertTo-JITAuditDetails {
+    <#
+    .SYNOPSIS
+        Serializes a target handler's Details hashtable to the compact JSON
+        string stored in the audit row's Details column, or $null when there is
+        nothing worth storing.
+
+    .DESCRIPTION
+        Azure Table properties are flat scalars but Details is nested (App
+        Service nests per-slot outcomes under `slots` / `slotFailures`), so the
+        whole hashtable goes into ONE property as JSON rather than being
+        exploded into columns.
+
+        Three behaviors matter to callers:
+          • Empty or $null Details returns $null — the 18 handlers with nothing
+            to say must not stamp "{}" onto every audit row.
+          • Over-cap payloads are replaced by a still-valid JSON envelope that
+            makes the truncation explicit (_truncated / _originalLength /
+            _preview). Truncation is never silent, and the column always parses
+            as JSON.
+          • Serialization failure returns $null after a warning. Auditing is
+            observability, never a transaction participant — a grant or revoke
+            must not fail because its Details would not serialize.
+    #>
+    param([hashtable]$Details)
+
+    if (-not $Details -or $Details.Count -eq 0) { return $null }
+
+    try {
+        # Depth 6: Details -> slots/slotFailures -> values is only three levels
+        # today, but the default of 2 silently mangles anything deeper, so leave
+        # headroom for handlers that nest further.
+        $json = $Details | ConvertTo-Json -Compress -Depth 6
+
+        if ($json.Length -gt $script:JITAuditDetailsMaxChars) {
+            $preview = $json.Substring(0, [Math]::Min($json.Length, $script:JITAuditDetailsPreviewChars))
+            $json = @{
+                _truncated      = $true
+                _originalLength = $json.Length
+                _preview        = $preview
+            } | ConvertTo-Json -Compress -Depth 3
+        }
+
+        return $json
+    }
+    catch {
+        Write-Warning "Audit Details could not be serialized — the audit row will be written without them: $_"
+        return $null
+    }
+}
+
 function Add-JITAuditRow {
     <#
     .SYNOPSIS
@@ -909,6 +964,14 @@ function Add-JITAuditRow {
 
     .PARAMETER Extra
         Optional additional columns merged into the row (e.g. error detail).
+
+    .PARAMETER Details
+        Optional target-handler Details hashtable (the third member of the
+        @{ RuleIdentifier; Status; Details } result every JIT target handler
+        returns). Stored as compact JSON in a single `Details` column — see
+        ConvertTo-JITAuditDetails for the size cap and truncation contract.
+        Omitted entirely when empty, so handlers with nothing to report leave
+        the column off the row rather than writing "{}".
     #>
     param(
         [Parameter(Mandatory)][string] $Action,
@@ -922,7 +985,8 @@ function Add-JITAuditRow {
         [string]    $RequestedBy,
         [string]    $ExpiryUtc,
         [string]    $Justification,
-        [hashtable] $Extra = @{}
+        [hashtable] $Extra = @{},
+        [hashtable] $Details
     )
 
     $tableName = Get-JITAuditTableName
@@ -946,6 +1010,12 @@ function Add-JITAuditRow {
         Justification  = if ($Justification) { $Justification } else { '' }
     }
     foreach ($k in $Extra.Keys) { $props[$k] = $Extra[$k] }
+
+    # Handler Details last, and only when there is something to store — $null
+    # covers both "handler reported nothing" and "serialization failed", and in
+    # either case the row is written without the column.
+    $detailsJson = ConvertTo-JITAuditDetails -Details $Details
+    if ($detailsJson) { $props['Details'] = $detailsJson }
 
     Add-JITTableRow -TableName $tableName -Properties $props
 }

@@ -29,6 +29,11 @@ internal sealed class ResourceDiscovery
 
     private readonly IPluginContext _context;
 
+    // Last discovered-resource count per tenant, used to demote the discovery
+    // heartbeat to Debug when the count hasn't changed since the last cycle.
+    private readonly object _lastCountLock = new();
+    private readonly Dictionary<string, int> _lastCountByTenant = new();
+
     public ResourceDiscovery(IPluginContext context) => _context = context;
 
     /// <summary>
@@ -141,7 +146,21 @@ Resources
         }
         while (!string.IsNullOrEmpty(skipToken));
 
-        _context.Logger.LogInformation("JIT: discovered {Count} JIT-eligible resource(s) via Resource Graph.", all.Count);
+        // The count is a heartbeat: at INF every cycle it was ~77% of all INF
+        // lines. Only a CHANGED count is information; a stable count is Debug.
+        bool countChanged;
+        lock (_lastCountLock)
+        {
+            countChanged = !_lastCountByTenant.TryGetValue(tenantId, out var previous)
+                           || previous != all.Count;
+            _lastCountByTenant[tenantId] = all.Count;
+        }
+        if (countChanged)
+            _context.Logger.LogInformation(
+                "JIT: discovered {Count} JIT-eligible resource(s) via Resource Graph.", all.Count);
+        else
+            _context.Logger.LogDebug(
+                "JIT: discovered {Count} JIT-eligible resource(s) via Resource Graph (unchanged).", all.Count);
         return all;
     }
 

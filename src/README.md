@@ -202,7 +202,7 @@ Supported `targetType` values:
 | `signalR` | SignalR service | `networkACLs.ipRules[]` entry (async) |
 | `eventHub` | Event Hubs namespace | `networkRuleSets/default` `ipRules[]` entry |
 | `serviceBus` | Service Bus namespace | `networkRuleSets/default` `ipRules[]` entry |
-| `appService` | App Service site | `config/web` `ipSecurityRestrictions[]` + `scmIpSecurityRestrictions[]` entry |
+| `appService` | App Service site (**and all of its deployment slots**) | `config/web` `ipSecurityRestrictions[]` + `scmIpSecurityRestrictions[]` entry |
 | `aks` | AKS managed cluster | `apiServerAccessProfile.authorizedIPRanges[]` entry (full-body PUT, async) |
 
 `port` is NSG-only (omit for any-port; supports ranges like `8080-8090`).
@@ -229,6 +229,16 @@ Supported `targetType` values:
 > the main list is touched). Because an App Service with an empty restriction list is
 > *unrestricted*, JIT only adds a rule when the site is **already restricted** (a concrete
 > rule exists, or the list's default action is `Deny`) — a currently-open site is a no-op.
+>
+> A grant against an App Service also covers **every deployment slot** of that site. Slots
+> are separate ARM children with their own independent allowlists
+> (`.../sites/{name}/slots/{slot}/config/web`), so JIT enumerates them and applies the *same*
+> rule to each — and revoking removes it from all of them again. The already-restricted guard
+> is re-evaluated **independently per slot**, so an open slot stays open even when the site is
+> restricted. **Consequence:** a grant on a production site also whitelists that site's
+> staging/QA slots. If a slot cannot be enumerated or written, the site (and the remaining
+> slots) still succeed and the shortfall is recorded on the audit record rather than failing
+> the request.
 >
 > **Array-on-resource types** (`storageAccount`, `keyVault`, `cosmosDb`, `containerRegistry`,
 > `aiSearch`, `cognitiveServices`, `kusto`, `iotHub`, `signalR`, `eventHub`, `serviceBus`,

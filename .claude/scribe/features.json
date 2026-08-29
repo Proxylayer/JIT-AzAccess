@@ -1,7 +1,7 @@
 {
   "docType": "features",
   "idPrefix": "FEAT",
-  "nextId": 4,
+  "nextId": 5,
   "items": [
     {
       "id": "FEAT-0001",
@@ -91,6 +91,40 @@
       ],
       "created": "2026-07-24T01:20:29Z",
       "updated": "2026-07-24T03:26:22Z"
+    },
+    {
+      "id": "FEAT-0004",
+      "title": "App Service JIT grants auto-cover all deployment slots",
+      "state": "done",
+      "tags": [
+        "jit",
+        "functionapp",
+        "appservice",
+        "rbac"
+      ],
+      "description": "Extend the existing appService JIT target so a grant/revoke for a site also applies to every deployment slot of that site (Microsoft.Web/sites/{name}/slots/{slot}/config/web). DESIGN DECISION (user, 2026-07-27): auto-cover all slots under the existing appService target rather than introducing a separate AppServiceSlot target type. This deliberately avoids the two structural blockers a separate type would hit: the resourceName regex in Request-JITAccess/run.ps1 rejects '/', and the JITRules row schema plus JitRequest.cs have no slot field. Consequence accepted: one storage row now spans N ARM writes, and a grant for the production site also whitelists staging slots. Guard is identical to the site guard - a slot whose ipSecurityRestrictions list is open (empty or catch-all Allow) and whose DefaultAction is not Deny is left untouched (SkippedOpen); JIT never converts an open slot into implicit-deny. Same scmIpSecurityRestrictions / scmIpSecurityRestrictionsUseMain handling applies per slot. No new target type means no changes to supportedTypes lists, JITTargets.psm1 exports, request validation, table schema, or the C# plugin. Scope: AppService.ps1, the three RBAC action lists (Grant-JITPermissions.ps1, Test-JITAccess.ps1, JIT-AzAccess-Manager.json), tests, and docs.",
+      "links": [
+        {
+          "label": "audit-details-wired",
+          "ref": "TODO-0017"
+        }
+      ],
+      "comments": [
+        {
+          "id": "c1",
+          "author": "developer",
+          "date": "2026-07-27T21:25:48Z",
+          "text": "Implemented. AppService.ps1 194 -> 441 lines; new script-scoped helpers Get-AppServiceConfigPath, ConvertTo-AppServiceSlotShortName, Get-AppServiceSlotNames (paged), Add-JITAppServiceRuleToConfig, Remove-JITAppServiceRuleFromConfig. Public signatures unchanged. RBAC gained Microsoft.Web/sites/slots/{read,config/read,config/write} in all three lists (Grant-JITPermissions.ps1, Test-JITAccess.ps1, JIT-AzAccess-Manager.json), verified byte-identical at 59 actions each. Docs updated in TECHNICAL-REFERENCE.md and src/README.md; asset-type count stays 19 since this is not a new type. OPERATOR ACTION REQUIRED: re-run Grant-JITPermissions.ps1 to refresh the deployed custom role, or the managed identity 403s on slot config writes and every slot lands in slotFailures."
+        },
+        {
+          "id": "c2",
+          "author": "testcase",
+          "date": "2026-07-27T21:25:50Z",
+          "text": "New src/functionapp/tests/AppService.Tests.ps1 - 44 tests in 5 Describes, all passing, first per-handler App Service coverage in the repo (also covers pre-existing site-only behavior). Full suite 199 tests / 178 pass / 21 fail; the 21 are exactly the baseline set, none from this file. No product bugs found. Repo-wide gotcha discovered: Pester 3.4.0 'Should Throw' is broken under PowerShell 7 here, so the file uses a local Test-Throws try/catch helper - reuse that pattern in new tests."
+        }
+      ],
+      "created": "2026-07-27T21:06:47Z",
+      "updated": "2026-07-27T21:44:46Z"
     }
   ]
 }

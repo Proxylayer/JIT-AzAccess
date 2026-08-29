@@ -89,6 +89,11 @@ foreach ($row in $expired) {
         # Remove handlers return a Status: Removed | NotFound | Refused. A handler
         # that returns no Status (unexpected/legacy) is treated as Removed.
         $removeStatus = if ($removeResult -and $removeResult.Status) { $removeResult.Status } else { 'Removed' }
+        # Per-resource outcome detail from the handler (App Service reports the
+        # site plus every deployment slot, and flags a slot enumeration failure).
+        # Carried onto the audit rows below so a partial removal is auditable
+        # rather than visible only as a warning in the function logs.
+        $removeDetails = if ($removeResult) { $removeResult.Details } else { $null }
 
         if ($removeStatus -eq 'Refused') {
             # AKS only: removing this IP would empty authorizedIPRanges and open
@@ -107,7 +112,8 @@ foreach ($row in $expired) {
                     -RuleIdentifier $row.RuleIdentifier -CallerIp $row.CallerIp `
                     -Port $row.Port -RequestedBy $row.RequestedBy `
                     -ExpiryUtc $row.ExpiryUtc -Justification $row.Justification `
-                    -Extra @{ reason = 'refused-would-open-cluster' }
+                    -Extra @{ reason = 'refused-would-open-cluster' } `
+                    -Details $removeDetails
             }
             catch {
                 Write-Warning "  JITRulesAudit write failed for refused removal of ${label}: $_"
@@ -135,7 +141,8 @@ foreach ($row in $expired) {
                     -RuleIdentifier $row.RuleIdentifier -CallerIp $row.CallerIp `
                     -Port $row.Port -RequestedBy $row.RequestedBy `
                     -ExpiryUtc $row.ExpiryUtc -Justification $row.Justification `
-                    -Extra $expireExtra
+                    -Extra $expireExtra `
+                    -Details $removeDetails
             }
             catch {
                 Write-Warning "  JITRulesAudit write failed for expire of $label (removal itself succeeded): $_"

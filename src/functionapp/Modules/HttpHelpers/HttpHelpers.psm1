@@ -1,13 +1,39 @@
 # HttpHelpers.psm1 — REST helpers used by the JIT function app.
 #
 # This module exists so the function app needs ZERO Az PowerShell modules at
-# runtime. All Azure ops go through Invoke-RestMethod with either:
-#   • The function app's managed identity (via IDENTITY_ENDPOINT) for ARM
-#     and Graph calls (Bearer tokens).
-#   • Shared-Key signing against AzureWebJobsStorage for Storage data-plane
-#     (blob, table) ops.
+# runtime. All Azure ops go through Invoke-RestMethod with the function app's
+# managed identity (via IDENTITY_ENDPOINT), which issues Bearer tokens for
+# three audiences: ARM, Microsoft Graph, and — since the storage migration
+# below — the Storage data plane.
 #
 # Dropping Az.* drops ~400MB of resident memory and ~5s of cold-start time.
+#
+# ── STORAGE AUTH: Entra ID only, never account keys ───────────────────────────
+# Storage data-plane calls (blob, table) authenticate with the function app's
+# managed identity — a token for https://storage.azure.com/ passed as a plain
+# Bearer header. There is NO account-key code path in this module, deliberately
+# and permanently. Do not reintroduce one.
+#
+# Two reasons, either sufficient on its own:
+#
+#   1. It cannot work. A subscription-scope Azure Policy ("Storage accounts
+#      authenticate with Entra ID, not account keys") applies a Modify effect
+#      that forces allowSharedKeyAccess = false and silently reverts any attempt
+#      to set it back — including from this repo's own ARM template. Shared Key
+#      requests return 403 KeyBasedAuthenticationNotPermitted, always.
+#
+#   2. It failed silently for eight days. When that policy landed on
+#      2026-08-21 the entire app went dark and nobody noticed: Get-JITRules
+#      returned 500, Request-JITAccess fail-closed to 503, and the
+#      Remove-ExpiredRules timer stopped firing, so expired JIT grants were
+#      never revoked. A key path that "works in some environments" is worse
+#      than none, because it turns a hard failure into a quiet one.
+#
+# This requires DATA-plane RBAC on the storage account — Storage Blob Data
+# Owner, Storage Table Data Contributor, Storage Queue Data Contributor.
+# Control-plane roles (Owner, Contributor) grant none of it. Deploy.ps1 step 1b
+# assigns them; the host's own AzureWebJobsStorage__accountName setting relies
+# on exactly the same grants.
 
 #region ── Per-worker caches ────────────────────────────────────────────────────
 
@@ -218,180 +244,74 @@ function Invoke-ArmRestRaw {
 #region ── Storage shared-key signing ───────────────────────────────────────────
 
 function script:Get-StorageParts {
-    if ($script:StorageParts) { return $script:StorageParts }
-    $cs = $env:AzureWebJobsStorage
-    if (-not $cs) { throw "AzureWebJobsStorage env var is missing." }
+    <#
+        Resolves the storage account this app uses for the rules table, the
+        audit table, and the NSG lock blobs.
 
+        Only the account NAME is resolved. Any AccountKey present in a legacy
+        AzureWebJobsStorage connection string is deliberately ignored and never
+        read — see the module header. Authentication is Entra ID only.
+
+        Name resolution, first match wins:
+          1. JIT_STORAGE_ACCOUNT          — explicit override
+          2. AzureWebJobsStorage__accountName — identity-based host connection
+          3. AccountName=… inside AzureWebJobsStorage — legacy connection string
+    #>
+    if ($script:StorageParts) { return $script:StorageParts }
+
+    $cs    = $env:AzureWebJobsStorage
     $parts = @{}
-    foreach ($pair in $cs -split ';') {
-        if ($pair -match '^([^=]+)=(.*)$') { $parts[$matches[1]] = $matches[2] }
+    if ($cs) {
+        foreach ($pair in $cs -split ';') {
+            if ($pair -match '^([^=]+)=(.*)$') { $parts[$matches[1]] = $matches[2] }
+        }
     }
-    if (-not $parts.AccountName -or -not $parts.AccountKey) {
-        throw "AzureWebJobsStorage must contain AccountName and AccountKey."
+
+    $account =
+        if     ($env:JIT_STORAGE_ACCOUNT)              { $env:JIT_STORAGE_ACCOUNT }
+        elseif ($env:AzureWebJobsStorage__accountName) { $env:AzureWebJobsStorage__accountName }
+        else                                           { $parts.AccountName }
+
+    if (-not $account) {
+        throw "Could not determine the storage account name. Set JIT_STORAGE_ACCOUNT, " +
+              "AzureWebJobsStorage__accountName, or an AzureWebJobsStorage connection string " +
+              "containing AccountName."
     }
+
     $script:StorageParts = @{
-        Account = $parts.AccountName
-        Key     = $parts.AccountKey
+        Account = $account
         Suffix  = if ($parts.EndpointSuffix) { $parts.EndpointSuffix } else { 'core.windows.net' }
     }
     return $script:StorageParts
 }
 
-function Get-BlobStringToSign {
+function script:Get-StorageAuthHeader {
     <#
     .SYNOPSIS
-        Builds the canonical 14-line StringToSign for Blob / Queue / File
-        SharedKey auth.
+        Returns the Authorization header for one Storage data-plane request:
+        always a managed-identity Bearer token, never an account-key signature.
+
+    .DESCRIPTION
+        Every storage caller routes through here — Invoke-BlobRest,
+        Invoke-TableRest, and the blob-lease path in JITHelpers that builds its
+        own headers to read the lease id off the response — so no caller can
+        drift onto a different auth scheme.
+
+        Tokens are cached per audience by Get-ManagedIdentityToken and refreshed
+        five minutes before expiry, so calling this per request is cheap.
     #>
-    param(
-        [Parameter(Mandatory)][string] $Method,
-        [Parameter(Mandatory)][string] $CanonicalResource,
-        [hashtable] $Headers = @{},
-        [int]       $ContentLength = 0,
-        [string]    $ContentType   = '',
-        [string]    $ContentMd5    = ''
-    )
-
-    $xms = $Headers.GetEnumerator() |
-        Where-Object { $_.Key -like 'x-ms-*' } |
-        ForEach-Object { @{ K = $_.Key.ToLowerInvariant(); V = $_.Value } }
-    $canHeaders = ($xms | Sort-Object { $_.K } | ForEach-Object { "$($_.K):$($_.V)" }) -join "`n"
-
-    $clLine = if ($ContentLength -eq 0) { '' } else { "$ContentLength" }
-
-    # The standard (non x-ms-) conditional headers each occupy a fixed line in
-    # the StringToSign, and Azure DOES include them in its computed signature
-    # when the request carries them — e.g. the create-only lock PUT sends
-    # `If-None-Match: *` and the release sends `If-Match: *`. We must sign the
-    # exact same values or the MAC won't match (AuthenticationFailed). Look them
-    # up case-insensitively from the request headers.
-    $lc = @{}
-    foreach ($e in $Headers.GetEnumerator()) { $lc[[string]$e.Key.ToLowerInvariant()] = [string]$e.Value }
-    $ifModifiedSince   = if ($lc.ContainsKey('if-modified-since'))   { $lc['if-modified-since'] }   else { '' }
-    $ifMatch           = if ($lc.ContainsKey('if-match'))            { $lc['if-match'] }            else { '' }
-    $ifNoneMatch       = if ($lc.ContainsKey('if-none-match'))       { $lc['if-none-match'] }       else { '' }
-    $ifUnmodifiedSince = if ($lc.ContainsKey('if-unmodified-since')) { $lc['if-unmodified-since'] } else { '' }
-    $range             = if ($lc.ContainsKey('range'))               { $lc['range'] }               else { '' }
-
-    return @(
-        $Method
-        ''                  # Content-Encoding
-        ''                  # Content-Language
-        $clLine
-        $ContentMd5
-        $ContentType
-        ''                  # Date — using x-ms-date instead
-        $ifModifiedSince
-        $ifMatch
-        $ifNoneMatch
-        $ifUnmodifiedSince
-        $range
-        $canHeaders
-        $CanonicalResource
-    ) -join "`n"
-}
-
-function Get-TableStringToSign {
-    <#
-    .SYNOPSIS
-        Builds the 5-line StringToSign for Table service SharedKey auth.
-        Tables do NOT use the same recipe as Blob/Queue/File — only these
-        5 lines, no x-ms-* canonicalized headers, no extra blanks.
-
-        https://learn.microsoft.com/rest/api/storageservices/authentication-for-the-azure-storage-services#table-service-shared-key-authorization
-    #>
-    param(
-        [Parameter(Mandatory)][string] $Method,
-        [Parameter(Mandatory)][string] $Date,
-        [Parameter(Mandatory)][string] $CanonicalResource,
-        [string] $ContentType = '',
-        [string] $ContentMd5  = ''
-    )
-    return @(
-        $Method
-        $ContentMd5
-        $ContentType
-        $Date
-        $CanonicalResource
-    ) -join "`n"
-}
-
-function Get-BlobCanonicalResource {
-    <#
-    .SYNOPSIS
-        Builds the CanonicalizedResource for Blob/Queue/File SharedKey auth:
-        "/<account><path>" followed by each query parameter on its own line as
-        "name:value" (name lower-cased, params sorted by name).
-
-        NOTE: this is the Blob/Queue/File recipe. The Table service uses a
-        different "?comp=value" form — see Build-TableCanonicalResource. Mixing
-        them up yields an AuthenticationFailed MAC mismatch.
-    #>
-    param(
-        [Parameter(Mandatory)][string] $Account,
-        [Parameter(Mandatory)][string] $Path,
-        [string] $Query = ''
-    )
-    $can = "/$Account$Path"
-    if ($Query) {
-        $params = @{}
-        foreach ($pair in $Query -split '&') {
-            if ($pair -match '^([^=]+)=(.*)$') {
-                $name = [Uri]::UnescapeDataString($matches[1]).ToLowerInvariant()
-                $val  = [Uri]::UnescapeDataString($matches[2])
-                if ($params.ContainsKey($name)) { $params[$name] += ",$val" } else { $params[$name] = $val }
-            }
-        }
-        $sorted = ($params.GetEnumerator() | Sort-Object { $_.Key } | ForEach-Object { "$($_.Key):$($_.Value)" }) -join "`n"
-        $can = "$can`n$sorted"
-    }
-    return $can
-}
-
-function script:Get-HmacSignature {
-    param([Parameter(Mandatory)][string]$StringToSign, [Parameter(Mandatory)][string]$Base64Key)
-    $hmac = [System.Security.Cryptography.HMACSHA256]::new([Convert]::FromBase64String($Base64Key))
-    try {
-        return [Convert]::ToBase64String($hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($StringToSign)))
-    }
-    finally { $hmac.Dispose() }
-}
-
-function script:New-SharedKeySignature {
-    <#
-    .SYNOPSIS
-        Returns the "SharedKey <account>:<sig>" Authorization header value
-        for Blob / Queue / File.
-    #>
-    param(
-        [Parameter(Mandatory)][string] $Method,
-        [Parameter(Mandatory)][string] $CanonicalResource,
-        [hashtable] $Headers = @{},
-        [int]       $ContentLength = 0,
-        [string]    $ContentType   = '',
-        [string]    $ContentMd5    = ''
-    )
-    $sp = Get-StorageParts
-    $stringToSign = Get-BlobStringToSign `
-        -Method            $Method `
-        -CanonicalResource $CanonicalResource `
-        -Headers           $Headers `
-        -ContentLength     $ContentLength `
-        -ContentType       $ContentType `
-        -ContentMd5        $ContentMd5
-    $sig = Get-HmacSignature -StringToSign $stringToSign -Base64Key $sp.Key
-    return "SharedKey $($sp.Account):$sig"
+    return "Bearer $(Get-ManagedIdentityToken -Resource 'https://storage.azure.com/')"
 }
 
 #endregion
 
-#region ── Blob REST (Shared Key) ───────────────────────────────────────────────
+#region ── Blob REST ────────────────────────────────────────────────────────────
 
 function Invoke-BlobRest {
     <#
     .SYNOPSIS
-        Calls Azure Blob Storage with Shared Key auth derived from
-        AzureWebJobsStorage. Used for the distributed lock blob lease.
+        Calls Azure Blob Storage, authenticated per Get-StorageAuthHeader
+        (managed identity by default). Used for the distributed lock blob lease.
     #>
     param(
         [Parameter(Mandatory)][string] $Method,
@@ -417,18 +337,7 @@ function Invoke-BlobRest {
     }
     foreach ($k in $ExtraHeaders.Keys) { $headers[$k] = $ExtraHeaders[$k] }
 
-    $len = if ($BodyBytes) { $BodyBytes.Length } else { 0 }
-
-    # CanonicalResource for Shared Key: "/account/container[/blob]" then each
-    # query param on its own "name:value" line (NOT "?key=value").
-    $canResource = Get-BlobCanonicalResource -Account $sp.Account -Path $path -Query $Query
-
-    $headers.Authorization = New-SharedKeySignature `
-        -Method            $Method `
-        -CanonicalResource $canResource `
-        -Headers           $headers `
-        -ContentLength     $len `
-        -ContentType       $ContentType
+    $headers.Authorization = Get-StorageAuthHeader
 
     $params = @{
         Method  = $Method
@@ -507,34 +416,14 @@ function New-Container {
 
 #endregion
 
-#region ── Table REST (Shared Key) ──────────────────────────────────────────────
-
-function Build-TableCanonicalResource {
-    <#
-    .SYNOPSIS
-        Builds CanonicalResource for Table SharedKey signing:
-            /<account>/<resource-path>[?comp=<value>]
-        Note: ONLY the comp parameter goes in. Other query string params
-        ($filter, $top, etc.) are NOT included in the signature.
-    #>
-    param(
-        [Parameter(Mandatory)][string] $AccountName,
-        [Parameter(Mandatory)][string] $Path,
-        [string] $Query = ''
-    )
-    $can = "/$AccountName$Path"
-    if ($Query) {
-        $compMatch = [regex]::Match($Query, '(?:^|&)comp=([^&]+)')
-        if ($compMatch.Success) { $can = "$can`?comp=$($compMatch.Groups[1].Value)" }
-    }
-    return $can
-}
+#region ── Table REST ───────────────────────────────────────────────────────────
 
 function Invoke-TableRest {
     <#
     .SYNOPSIS
-        Calls Azure Table Storage with SharedKey auth derived from
-        AzureWebJobsStorage. Used for the JIT rules table (active rule store).
+        Calls Azure Table Storage, authenticated per Get-StorageAuthHeader
+        (managed identity by default). Used for the JIT rules table (active
+        rule store) and the audit history table.
 
     .PARAMETER Path
         e.g. "/Tables" or "/JITRules(PartitionKey='subA',RowKey='jit-123')"
@@ -565,8 +454,13 @@ function Invoke-TableRest {
 
     $contentType = if ($null -ne $Body) { 'application/json' } else { '' }
 
+    # 2020-12-06 is the minimum version Microsoft documents for AAD (Bearer)
+    # auth against the Table service. The old 2019-02-02 does still answer a
+    # plain entity query with a Bearer token, so this is not the thing that was
+    # broken — but staying on a version that predates documented AAD support is
+    # a trap for whichever operation stops being lenient first, so pin forward.
     $headers = @{
-        'x-ms-version'         = '2019-02-02'
+        'x-ms-version'         = '2020-12-06'
         'x-ms-date'            = $date
         'Accept'               = 'application/json;odata=nometadata'
         'DataServiceVersion'   = '3.0;NetFx'
@@ -574,14 +468,7 @@ function Invoke-TableRest {
     }
     foreach ($k in $ExtraHeaders.Keys) { $headers[$k] = $ExtraHeaders[$k] }
 
-    $canResource  = Build-TableCanonicalResource -AccountName $sp.Account -Path $Path -Query $Query
-    $stringToSign = Get-TableStringToSign `
-        -Method            $Method `
-        -Date              $date `
-        -CanonicalResource $canResource `
-        -ContentType       $contentType
-    $sig = Get-HmacSignature -StringToSign $stringToSign -Base64Key $sp.Key
-    $headers.Authorization = "SharedKey $($sp.Account):$sig"
+    $headers.Authorization = Get-StorageAuthHeader
 
     $params = @{
         Method      = $Method
@@ -608,9 +495,4 @@ Export-ModuleMember -Function @(
     'New-Container'
     'Invoke-TableRest'
     'Get-StatusFromError'
-    # Exposed for unit tests + reuse by JITHelpers' lease signing:
-    'Get-BlobStringToSign'
-    'Get-BlobCanonicalResource'
-    'Get-TableStringToSign'
-    'Build-TableCanonicalResource'
 )

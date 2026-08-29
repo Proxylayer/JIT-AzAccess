@@ -1,7 +1,7 @@
 {
   "docType": "todos",
   "idPrefix": "TODO",
-  "nextId": 16,
+  "nextId": 24,
   "items": [
     {
       "id": "TODO-0001",
@@ -300,6 +300,134 @@
       "comments": [],
       "created": "2026-07-24T02:37:27Z",
       "updated": "2026-07-24T02:37:27Z"
+    },
+    {
+      "id": "TODO-0016",
+      "title": "FIXED: Grant-JITPermissions role-definition update KeyError roleName + swallowed az errors",
+      "state": "done",
+      "tags": [
+        "jit",
+        "scripts",
+        "bug"
+      ],
+      "description": "az role definition UPDATE failed with KeyError:'roleName' because both role update paths (Manager + Requester) sent create-schema payload (Name+Id, no roleName); and az failures were swallowed (no LASTEXITCODE check) so script printed false 'Role updated.'. FIX (verified vs installed az 2.86.0 by disassembling the CLI module): update payloads now send roleName=<display>+name=<GUID>+id + lowercase-first keys (assignableScopes/actions/...); create paths kept in PascalCase; added LASTEXITCODE!=0 throw after all az role definition create/update + role assignment create. Idempotent re-run re-applies Manager actions + adds the 2 missing JIT-Requester scopes (74e22077, d5dc1696). Uncommitted with the rest of the working tree. FOLLOW-UP: Manager $roleActions here is source of truth; adding asset types to plugin AssetTypeCatalog requires syncing Actions here (see TODO drift note).",
+      "links": [],
+      "comments": [],
+      "created": "2026-07-24T19:51:16Z",
+      "updated": "2026-07-24T19:51:16Z"
+    },
+    {
+      "id": "TODO-0017",
+      "title": "Wire target handler Details into the JIT audit rows",
+      "state": "done",
+      "tags": [
+        "jit",
+        "functionapp",
+        "audit"
+      ],
+      "description": "Every JIT target handler returns a Details hashtable, but nothing consumes it: Write-JITAuditEvent is never passed Details from Request-JITAccess/run.ps1, Remove-ExpiredRules/run.ps1, or Revoke-JITAccess/run.ps1. Discovered while implementing FEAT-0004 (App Service slot coverage), which relies on Details.slotFailures / slotEnumerationFailed as the compensating control for a partial revoke. Until Details reaches the audit row, that partial-failure signal is Write-Warning log-only, which undercuts the tradeoff of returning the site outcome when slot enumeration fails. Wire Details into the JITGranted / JITExpired / JITRevoked audit rows.",
+      "links": [],
+      "comments": [
+        {
+          "id": "c1",
+          "author": "developer",
+          "date": "2026-07-27T21:44:09Z",
+          "text": "Implemented. Two similarly-named functions existed and both prior reports were right about different ones: Write-JITAuditEvent (JITHelpers.psm1:514-552) is the stdout logger and is unchanged; Add-JITAuditRow (:960-1030) is the table writer and is what changed. New internal ConvertTo-JITAuditDetails (:909-958) serializes, bounds, and never throws; Add-JITAuditRow gained an optional [hashtable] Details param stored in a Details column. Deliberately NOT routed through -Extra: -Extra is a flat scalar merge done by the caller, so reusing it would duplicate serialize+truncate+try/catch across all eight call sites, and the never-break-the-operation guarantee is only enforceable in one place. -Extra is untouched and composes alongside Details. JSON depth 6. Truncation cap 8192 chars with 1024-char preview, replaced by a still-valid JSON envelope {_truncated,_originalLength,_preview} rather than a chopped string. Empty or null Details omits the column entirely. Wired 8 call sites, not the 3 named: Request-JITAccess Grant/Extend/AlreadyExternal/SkippedOpen, Revoke-JITAccess Revoke/RemoveFailed, Remove-ExpiredRules Expire/RemoveFailed."
+        },
+        {
+          "id": "c2",
+          "author": "testcase",
+          "date": "2026-07-27T21:44:10Z",
+          "text": "21 new tests in src/functionapp/tests/JITHelpers.Audit.Tests.ps1 (extended, reusing its existing Invoke-TableRest body-capture harness), all passing. Suite 199 -> 220 tests; the 21 failures are byte-identical to baseline, and the 2 JITHelpers.Tests.ps1 failures did not shift despite the psm1 edit. No product bugs. Note: the App Service Details shape survives even at ConvertTo-Json's default depth 2, so it does not by itself prove depth 6 - a separate 5-level-deep test is the real guard. The intentional no-Details omission on the Remove-ExpiredRules outer catch is pinned by AST assertions over the entry points rather than the broken timer harness, so it survives TODO-0006 being fixed later."
+        }
+      ],
+      "created": "2026-07-27T21:25:29Z",
+      "updated": "2026-07-27T21:44:30Z"
+    },
+    {
+      "id": "TODO-0018",
+      "title": "Two failing JITHelpers tests outside TODO-0006's scope",
+      "state": "proposed",
+      "tags": [
+        "tests",
+        "functionapp"
+      ],
+      "description": "Baseline suite has 21 failures, but TODO-0006 only covers the 19 in Remove-ExpiredRules.Tests.ps1. Two more live in JITHelpers.Tests.ps1 and are untracked: 'Invoke-JwtValidation > rejects an empty string token (parameter binding rejects it)' and 'Get-AvailableNsgPriority > throws when every priority in the range is occupied'. Both predate FEAT-0004. Note for whoever picks this up: Pester 3.4.0's 'Should Throw' is broken under PowerShell 7 on this machine - a minimal repro of { throw 'boom' } | Should Throw fails - so both of these may be harness artifacts rather than product bugs. AppService.Tests.ps1 works around it with a local Test-Throws try/catch helper; reuse that pattern.",
+      "links": [],
+      "comments": [],
+      "created": "2026-07-27T21:25:31Z",
+      "updated": "2026-07-27T21:25:31Z"
+    },
+    {
+      "id": "TODO-0019",
+      "title": "build.ps1 does not validate the PowerShell function app",
+      "state": "proposed",
+      "tags": [
+        "build",
+        "functionapp"
+      ],
+      "description": "build.ps1 only builds the C# plugin (AzureTray.Plugin.JITAzAccess), so the bulk of this repo - src/functionapp/**/*.ps1 - gets no build-time validation at all. Surfaced during FEAT-0004, where the developer had to hand-run [Parser]::ParseFile over the changed files to get any signal. Add a -Target FunctionApp mode that parse-checks every function app .ps1 and optionally runs PSScriptAnalyzer, so the convention script actually covers the project.",
+      "links": [],
+      "comments": [],
+      "created": "2026-07-27T21:25:32Z",
+      "updated": "2026-07-27T21:25:32Z"
+    },
+    {
+      "id": "TODO-0020",
+      "title": "Stale $removeResult in the Remove-ExpiredRules outer catch",
+      "state": "proposed",
+      "tags": [
+        "functionapp",
+        "correctness"
+      ],
+      "description": "The timer's outer catch in src/functionapp/Remove-ExpiredRules/run.ps1 (~:146-173) sits inside a foreach over rows, so $removeResult still holds the PREVIOUS iteration's value when the handler throws. Nothing reads it there today, so it is currently harmless - TODO-0017 deliberately omitted -Details from that RemoveFailed audit call for exactly this reason, and the omission is pinned by an AST assertion in JITHelpers.Audit.Tests.ps1. But it is a live trap: the next person to reference $removeResult in that block will silently attribute one resource's state to another. Null the variable at the top of each loop iteration, or scope it so the catch cannot see a stale value.",
+      "links": [],
+      "comments": [],
+      "created": "2026-07-27T21:44:33Z",
+      "updated": "2026-07-27T21:44:34Z"
+    },
+    {
+      "id": "TODO-0021",
+      "title": "Split JITHelpers.psm1 - multi-responsibility module at ~1030 lines",
+      "state": "proposed",
+      "tags": [
+        "functionapp",
+        "refactor"
+      ],
+      "description": "src/functionapp/Modules/JITHelpers/JITHelpers.psm1 is now roughly 1030 lines and holds JWT validation, RBAC checks, Graph tag lookups, blob locking, table CRUD, audit writers (both the stdout Write-JITAuditEvent and the table Add-JITAuditRow), and caller-IP extraction. Well past the 500-line flag threshold and a genuine multi-responsibility module rather than a formatting issue. Flagged during TODO-0017. Wants a design pass on the split before anyone starts moving functions - the module is imported by all four entry points, so the seams matter.",
+      "links": [],
+      "comments": [],
+      "created": "2026-07-27T21:44:34Z",
+      "updated": "2026-07-27T21:44:34Z"
+    },
+    {
+      "id": "TODO-0022",
+      "title": "Pester 3.4 + PowerShell 7 gotchas for this repo's tests",
+      "state": "proposed",
+      "tags": [
+        "tests",
+        "functionapp",
+        "reference"
+      ],
+      "description": "Two harness traps confirmed on this machine, both of which cost real debugging time and will hit the next person writing tests here. (1) 'Should Throw' is broken: a minimal repro of { throw 'boom' } | Should Throw fails. Use a local Test-Throws try/catch helper instead - src/functionapp/tests/AppService.Tests.ps1 has one, and JITHelpers.Audit.Tests.ps1 copies it. (2) Mocks declared inside an It are torn down at Describe/Context exit, NOT per-It, so a failure-injection mock (e.g. a throwing ConvertTo-Json) leaks forward into later Its in the same block. Quarantine any such mock in its own Context. Worth folding into CLAUDE.md or a testing README rather than leaving as a tracking item, if there is a natural home for it.",
+      "links": [],
+      "comments": [],
+      "created": "2026-07-27T21:44:35Z",
+      "updated": "2026-07-27T21:44:35Z"
+    },
+    {
+      "id": "TODO-0023",
+      "title": "Guard against the single-added-scope StrictMode crash pattern",
+      "state": "proposed",
+      "tags": [
+        "scripts",
+        "correctness"
+      ],
+      "description": "Grant-JITPermissions.ps1's assignable-scope merge used $added = $scopes | Where-Object {...} then $added.Count. Under Set-StrictMode -Version Latest, a single match returns a bare [string] and .Count is a terminating error - so the scope-merge path had never actually worked in the single-added-subscription case, which is the most common one. Fixed in place by wrapping both $added and $addedReq in @(). Worth a sweep of the other scripts in src/scripts/ for the same unguarded pipeline-result-dot-Count pattern, since they all run under StrictMode.",
+      "links": [],
+      "comments": [],
+      "created": "2026-07-30T01:11:12Z",
+      "updated": "2026-07-30T01:11:12Z"
     }
   ]
 }

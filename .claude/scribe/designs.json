@@ -1,7 +1,7 @@
 {
   "docType": "designs",
   "idPrefix": "DES",
-  "nextId": 2,
+  "nextId": 3,
   "items": [
     {
       "id": "DES-0001",
@@ -23,6 +23,21 @@
       "comments": [],
       "created": "2026-07-16T21:09:30Z",
       "updated": "2026-07-16T21:40:01Z"
+    },
+    {
+      "id": "DES-0002",
+      "title": "Role-definition JSON shape for az role definition create/update",
+      "state": "done",
+      "tags": [
+        "rbac",
+        "scripts",
+        "azcli"
+      ],
+      "description": "DECISION: the role-definition hashtables in src/scripts/Grant-JITPermissions.ps1 are written in explicit camelCase and carry BOTH 'name' and 'roleName'. Anyone editing them must keep both keys - dropping roleName silently breaks only the UPDATE path, which is the path every re-run takes. Evidence, verified against az 2.86.0 on this machine (the role module ships as custom.pyc only, so it was disassembled): _create_update_role_definition lowercases the first char of every PascalCase key (Name -> name), then on the update-with-id path reads role_definition['roleName'] at line 116, while the create path reads role_definition.get('name') at line 129. There is no name -> roleName alias. A PascalCase 'Name' therefore works on create and raises KeyError: 'roleName' on update. Also confirmed RoleApiHelper.create_role_definition line 2014/2016 hard-subscripts assignableScopes, and _init_individual_permission reads flat actions/notActions/dataActions/notDataActions off the top-level object, so the flat (non-nested-permissions) shape is correct. Stdin delivery via --role-definition '@-' is fine: _load_file in azure/cli/core/commands/__init__.py line 78 reads sys.stdin when path == '-'. NOTE: an older in-file comment blaming a temp-file + nested permissions[] form for unreliable role creation was misdiagnosed - _init_permissions supports nested permissions arrays; the real fault was the missing roleName. That comment has been replaced.",
+      "links": [],
+      "comments": [],
+      "created": "2026-07-30T01:11:10Z",
+      "updated": "2026-07-30T01:11:10Z"
     }
   ]
 }

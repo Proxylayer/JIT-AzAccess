@@ -672,6 +672,11 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
 
                 foreach (var url in urls.AllUrls)
                 {
+                    // Once-then-quiet per URL: an unhealthy function app fails
+                    // identically every poll; only the transitions get loud lines.
+                    if (!state.RuleFetchGates.TryGetValue(url, out var gate))
+                        state.RuleFetchGates[url] = gate = new FetchFailureGate();
+
                     try
                     {
                         var result = await client
@@ -683,6 +688,8 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                         if (!string.IsNullOrEmpty(result.CallerIp))
                             callerIp = result.CallerIp;
                         anySucceeded = true;
+                        if (gate.RecordSuccess())
+                            context.Logger.LogInformation("JIT: rules refresh recovered for {Url}.", url);
                         context.Logger.LogDebug(
                             "JIT: refreshed {Count} active rule(s) from {Url}.", result.Rules.Count, url);
                     }
@@ -693,11 +700,20 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                     }
                     catch (JitHttpException ex) when (ex.StatusCode is 401 or 403)
                     {
+                        // NotifyAuthBlocked reports this condition itself (toast +
+                        // once-per-streak log); the gate just tracks the streak so
+                        // recovery is still announced once.
+                        gate.RecordFailure(knownCondition: true);
                         NotifyAuthBlocked(state, ex, url);
                     }
                     catch (Exception ex)
                     {
-                        context.Logger.LogWarning(ex, "JIT: rules refresh failed for {Url}.", url);
+                        if (gate.RecordFailure(knownCondition: false) == FetchFailureGate.FailureLog.WarnWithException)
+                            context.Logger.LogWarning(ex, "JIT: rules refresh failed for {Url}.", url);
+                        else
+                            context.Logger.LogDebug(
+                                "JIT: rules refresh still failing for {Url}: {ExceptionType}: {Message}",
+                                url, ex.GetType().Name, ex.Message);
                     }
                 }
 
@@ -1475,6 +1491,12 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         public DateTime              TargetsAt   { get; set; } = DateTime.MinValue;
         public DateTime              RulesAt     { get; set; } = DateTime.MinValue;
         public string?               CallerIp    { get; set; }
+
+        // Once-then-quiet logging state for the rules poll, one gate per
+        // function-app URL. Touched only inside PollTenantAsync while the
+        // Polling CAS guard is held, so no locking needed.
+        public Dictionary<string, FetchFailureGate> RuleFetchGates { get; } =
+            new(StringComparer.OrdinalIgnoreCase);
 
         public bool PollSuspended     { get; set; }
         public bool AuthBlocked       { get; set; }
