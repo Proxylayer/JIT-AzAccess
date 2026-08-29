@@ -22,7 +22,7 @@
         - The string the plugin reports to the host at runtime
           (via JitAzAccessPlugin.Version, which reads AssemblyInformationalVersion).
     -->
-    <Version>0.8.1</Version>
+    <Version>0.9.0</Version>
     <PackageDescription>
       JIT (Just-in-Time) Azure IP access plugin for AzureTray.
       Grants temporary firewall rules on NSG, Azure SQL Server, Storage Accounts,
@@ -68,7 +68,7 @@
       are picked up immediately. Switch back to PackageReference before
       publishing by pointing at the released NuGet version.
     -->
-    <PackageReference Include="AzureTray.Plugin.Contracts" Version="1.3.0" PrivateAssets="all" />
+    <PackageReference Include="AzureTray.Plugin.Contracts" Version="1.5.0" PrivateAssets="all" />
   </ItemGroup>
 
   <Target Name="PackTransitiveAssets">
