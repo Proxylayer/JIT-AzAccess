@@ -841,17 +841,24 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
             }
         }
 
+        // Glyphs live in the Icon slot, never in Text: the host binds the row's
+        // accessible name to Text, so baked-in emoji are spoken verbatim by
+        // screen readers. The warn state is spelled out in words for the same
+        // reason. Key gives the host stable identity for in-place refresh
+        // re-anchoring across all three label variants.
         var label = warn
-            ? "🔑  JIT Access  ⚠"
+            ? "JIT Access — attention needed"
             : total > 0
-                ? $"🔑  JIT Access  ({total})"
-                : "🔑  JIT Access";
+                ? $"JIT Access ({total})"
+                : "JIT Access";
 
         return new[] {
             new PluginMenuItem(
                 Text:              label,
+                Icon:              "🔑",
                 SearchProvider:    BuildSearchItems,
                 SearchPlaceholder: "Filter by name or environment…")
+            { Key = "jit.root" }
         };
     }
 
@@ -868,7 +875,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
             .ToArray();
 
         if (states.Length == 0)
-            return new[] { new PluginMenuItem("⚙ Sign in to a tenant to enable JIT access.", IsEnabled: false) };
+            return new[] { new PluginMenuItem("Sign in to a tenant to enable JIT access.", IsEnabled: false) };
 
         var multiTenant = states.Length > 1;
         var items       = new List<PluginMenuItem>();
@@ -916,24 +923,28 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         {
             if (!hasQuery)
             {
-                body.Add(new PluginMenuItem($"{indent}⚠ JIT function app URL not yet discovered.",  IsEnabled: false));
-                body.Add(new PluginMenuItem($"{indent}  Deploy the JIT function app in this tenant.", IsEnabled: false));
+                body.Add(new PluginMenuItem(
+                    $"{indent}JIT function app not discovered — deploy it in this tenant",
+                    IsEnabled: false,
+                    Icon:      "⚠"));
                 body.Add(new PluginMenuItem(
                     Text:         $"{indent}Retry discovery",
                     Invoke:       () => _ = RetryDiscoveryAsync(state),
                     Icon:         "↻",
-                    KeepMenuOpen: true));
+                    KeepMenuOpen: true)
+                { Key = $"jit.retryDiscovery.{state.Tenant.TenantId}" });
             }
         }
         else
         {
             if (authBlocked && !hasQuery)
                 body.Add(new PluginMenuItem(
-                    $"{indent}⚠ Missing '{JitRequesterRoleNameDefault}' role — see notification.", IsEnabled: false));
+                    $"{indent}Missing '{JitRequesterRoleNameDefault}' role — see notification.",
+                    IsEnabled: false, Icon: "⚠"));
 
             if (pollSuspended && !hasQuery)
                 body.Add(new PluginMenuItem(
-                    $"{indent}⚠ Tenant not enabled for this plugin.", IsEnabled: false));
+                    $"{indent}Tenant not enabled for this plugin.", IsEnabled: false, Icon: "⚠"));
 
             if (targets.Count == 0 && targetsAt == DateTime.MinValue)
             {
@@ -968,13 +979,14 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                     Text:         $"{indent}Refresh",
                     Invoke:       () => RefreshTenant(state),
                     Icon:         "↻",
-                    KeepMenuOpen: true));
+                    KeepMenuOpen: true)
+                { Key = $"jit.refresh.{state.Tenant.TenantId}" });
         }
 
         if (body.Count == 0) return;   // nothing to show for this tenant
 
         if (multiTenant)
-            items.Add(new PluginMenuItem($"— {state.Tenant.DisplayName} —", IsEnabled: false));
+            items.Add(new PluginMenuItem(state.Tenant.DisplayName, IsEnabled: false));
         items.AddRange(body);
         if (multiTenant)
             items.Add(PluginMenuItem.Separator);
@@ -1026,9 +1038,10 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
             var r         = activeRule;
             var remaining = r.ExpiresUtc - DateTime.UtcNow;
             // Greyed-out row with the "active" suffix + countdown. Right-click
-            // reveals Copy rule ID and Revoke.
+            // reveals Copy rule ID and Revoke. Status glyph lives in the Icon
+            // slot only (Text is the accessible name).
             return new PluginMenuItem(
-                Text:             $"{indent}  ✓ {envBadge}{target.DisplayName}  — active ({FormatTimeRemaining(remaining)})",
+                Text:             $"{indent}{envBadge}{target.DisplayName} — active, {FormatTimeRemaining(remaining)} remaining",
                 IsEnabled:        false,
                 Icon:             remaining.TotalMinutes < 30 ? "⚠" : "✓",
                 IsFavorite:       isFavorite,
@@ -1036,14 +1049,16 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                 ContextItems:     new[]
                 {
                     new PluginMenuItem(
-                        Text:         "  📋 Copy rule ID",
-                        Invoke:       () => _context?.Clipboard.SetText(r.RuleId),
-                        KeepMenuOpen: true),
+                        Text:   "Copy rule ID",
+                        Icon:   "📋",
+                        Invoke: () => _context?.Clipboard.SetText(r.RuleId)),
                     PluginMenuItem.Separator,
                     new PluginMenuItem(
-                        Text:   "  🗑 Revoke access",
+                        Text:   "Revoke access",
+                        Icon:   "🗑",
                         Invoke: () => _ = ConfirmRevokeAsync(state, r)),
-                });
+                })
+            { Key = $"jit.target.{target.Id}" };
         }
 
         // Already permanently whitelisted? If the caller's current IP is an
@@ -1053,11 +1068,12 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
             (target.WhitelistedIps.Contains(callerIp) || target.WhitelistedIps.Contains(callerIp + "/32")))
         {
             return new PluginMenuItem(
-                Text:             $"{indent}  ✓ {envBadge}{target.DisplayName}  — IP already allowed",
+                Text:             $"{indent}{envBadge}{target.DisplayName} — IP already allowed",
                 IsEnabled:        false,
                 Icon:             "✓",
                 IsFavorite:       isFavorite,
-                OnToggleFavorite: ToggleFavorite);
+                OnToggleFavorite: ToggleFavorite)
+            { Key = $"jit.target.{target.Id}" };
         }
 
         // Single-click target rows. Duration is asked via a ChoiceRequest popup.
@@ -1067,14 +1083,15 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
 
         var isProd = string.Equals(target.Environment, "prod", StringComparison.OrdinalIgnoreCase);
         return new PluginMenuItem(
-            Text:             $"{indent}  {envBadge}{target.DisplayName}",
+            Text:             $"{indent}{envBadge}{target.DisplayName}",
             Icon:             isProd ? "⚠" : null,
             Invoke:           isBusy ? null : () => _ = PromptAndGrantAsync(state, target),
             IsEnabled:        !isBusy,
             IsBusy:           isBusy,
             KeepMenuOpen:     false,
             IsFavorite:       isFavorite,
-            OnToggleFavorite: ToggleFavorite);
+            OnToggleFavorite: ToggleFavorite)
+        { Key = $"jit.target.{target.Id}" };
     }
 
     /// <summary>
@@ -1160,7 +1177,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         {
             var confirm = await context.Notifier.ShowAsync(
                 new YesNoRequest(
-                    Title:   "⚠ Production Resource",
+                    Title:   "Production Resource",
                     Message: $"You are about to grant yourself {durationHours}h access to the PRODUCTION resource " +
                              $"\"{target.DisplayName}\" ({target.TargetType}: {target.ResourceName}).\n\nContinue?"),
                 CancellationToken.None).ConfigureAwait(false);
@@ -1285,7 +1302,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         var confirm = await context.Notifier.ShowAsync(
             new YesNoRequest(
                 Title:   "Revoke JIT Access",
-                Message: $"Remove the active rule for {rule.TargetType}: {rule.ResourceName}?\n" +
+                Message: $"Remove the active rule for {TargetTypeLabel(rule.TargetType)}: {rule.ResourceName}?\n" +
                          $"Rule {rule.RuleId} — expires {rule.ExpiresUtc:HH:mm} UTC"),
             CancellationToken.None).ConfigureAwait(false);
 
@@ -1328,7 +1345,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
             _ = context.Notifier.ShowAsync(
                 new InformationRequest(
                     Title:   "JIT Access Revoked",
-                    Message: $"{rule.TargetType}: {rule.ResourceName} — rule {rule.RuleId} removed.")
+                    Message: $"{TargetTypeLabel(rule.TargetType)}: {rule.ResourceName} — rule {rule.RuleId} removed.")
                 { Severity = NotificationSeverity.Success },
                 CancellationToken.None);
         }
@@ -1392,7 +1409,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                     grant.RuleId, grant.ResourceName);
                 _ = context.Notifier.ShowAsync(
                     new InformationRequest(
-                        Title:   "✅ JIT Access Granted",
+                        Title:   "JIT Access Granted",
                         Message: $"{target.DisplayName} — {durationHours}h access confirmed.\n" +
                                  $"Your IP ({grant.CallerIp}) is present in the Azure resource.\n{expiry}")
                     { Severity = NotificationSeverity.Success },
@@ -1405,7 +1422,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                     grant.RuleId, grant.ResourceName);
                 _ = context.Notifier.ShowAsync(
                     new InformationRequest(
-                        Title:   "⚠ Whitelist Verification Failed",
+                        Title:   "Whitelist Verification Failed",
                         Message: "The grant was accepted but the rule is not yet visible via ARM.\n" +
                                  "Access may still propagate — wait 30s and retry if needed.")
                     {
