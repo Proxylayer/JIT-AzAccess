@@ -10,6 +10,14 @@ name: Publish plugin
 #       → opportunistic: builds at the csproj <Version>;
 #         --skip-duplicate makes it a no-op if that version is already
 #         on NuGet.
+#
+# NOTE on the trigger shape: `paths:` used to sit under `push:`, but a path
+# filter applies to EVERY push event, tags included. So a `v*` tag on a commit
+# that happened not to touch the plugin folder matched the tag trigger and was
+# then filtered straight back out — the workflow never ran, silently, which
+# contradicts the "the tag IS the version-of-record" contract above. The path
+# filter is now applied per-event in the job instead: tags and manual runs
+# always publish, branch pushes publish only when the plugin folder changed.
 #   - workflow_dispatch → manual run with an optional version override
 #     (for retry / out-of-band republish).
 #
@@ -21,8 +29,6 @@ name: Publish plugin
 on:
   push:
     branches: [main]
-    paths:
-      - 'src/plugin/AzureTray.Plugin.JITAzAccess/**'
     tags:
       - 'v*'
   workflow_dispatch:
@@ -46,7 +52,52 @@ env:
   CSPROJ: src/plugin/AzureTray.Plugin.JITAzAccess/AzureTray.Plugin.JITAzAccess.csproj
 
 jobs:
+  # Replaces the old `paths:` trigger filter, which also (wrongly) applied to
+  # tag pushes. A tag push or a manual run always proceeds; a branch push only
+  # when the plugin folder actually changed.
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.should.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Should this run publish?
+        id: should
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          $run = $true
+
+          if ($env:EVENT_NAME -eq 'push' -and $env:REF -notlike 'refs/tags/*') {
+            $run = $false
+            # A force-push or a new branch gives an all-zero/absent "before";
+            # fall back to running rather than silently skipping a publish.
+            if ([string]::IsNullOrWhiteSpace($env:BEFORE) -or $env:BEFORE -match '^0{40}$') {
+              Write-Host "No usable 'before' SHA - running."
+              $run = $true
+            } else {
+              $changed = git diff --name-only "$env:BEFORE" "$env:SHA"
+              if ($changed | Where-Object { $_ -like 'src/plugin/AzureTray.Plugin.JITAzAccess/*' }) {
+                Write-Host "Plugin folder changed - running."
+                $run = $true
+              } else {
+                Write-Host "Branch push did not touch the plugin folder - skipping."
+              }
+            }
+          }
+
+          "run=$($run.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+
   publish:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
     runs-on: windows-latest
 
     steps:
@@ -140,18 +191,21 @@ jobs:
         with:
           subject-path: NuGet/*.nupkg
 
-      - name: Check NuGet config
-        id: nugetcfg
+      # Previously this set an "enabled" flag and the push step was skipped
+      # when the secret was absent — so a release tag produced a fully GREEN
+      # run that published nothing. A publish workflow that cannot publish is
+      # a failure; it must say so.
+      - name: Require the NuGet API key
         shell: pwsh
         env:
           NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
         run: |
-          $enabled = -not [string]::IsNullOrWhiteSpace($env:NUGET_API_KEY)
-          "enabled=$($enabled.ToString().ToLower())" >> $env:GITHUB_OUTPUT
-          Write-Host "Push to nuget.org enabled: $enabled"
+          if ([string]::IsNullOrWhiteSpace($env:NUGET_API_KEY)) {
+            throw "NUGET_API_KEY is not configured for this repository, so this run cannot publish. Set the secret, then re-run."
+          }
+          Write-Host "NuGet API key present."
 
       - name: Push to nuget.org
-        if: steps.nugetcfg.outputs.enabled == 'true'
         shell: pwsh
         env:
           NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}

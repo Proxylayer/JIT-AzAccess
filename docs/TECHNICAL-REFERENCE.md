@@ -24,7 +24,12 @@ loaded by the host. This repo only contains the plugin, not the host.
 The function app uses **no `Az.*` PowerShell modules** (`src/functionapp/profile.ps1:3`,
 `host.json` `managedDependency.enabled=false` at `src/functionapp/host.json:3-5`). Every
 Azure call is `Invoke-RestMethod` via `Modules/HttpHelpers/HttpHelpers.psm1`: MI bearer
-tokens for ARM/Graph, Shared-Key signing for Blob/Table data-plane. This drops ~400 MB
+tokens for ARM/Graph **and for the Blob/Table data plane**. There is no Shared-Key path
+and there must never be one — the storage account is deployed with
+`allowSharedKeyAccess: false`, and the policy note plus the eight-day outage that a
+Shared-Key attempt caused are recorded at `HttpHelpers.psm1:11-38`. (This line previously
+read "Shared-Key signing for Blob/Table data-plane", which was both false and a
+description of the one thing this project cannot do.) Going Az-module-free drops ~400 MB
 resident + ~5 s cold start (`HttpHelpers.psm1:10`).
 
 ### Data flow — grant (POST Request-JITAccess)
@@ -507,8 +512,10 @@ thrown error -> `JITRemoveFailed`/`RemoveFailed` audit + **keep** row for next-t
 
 ## 8. Storage tables
 
-Both tables live in `AzureWebJobsStorage` (Shared-Key via `Invoke-TableRest`,
-`HttpHelpers.psm1:533`). Table names cannot contain hyphens (Azure constraint).
+Both tables live in the account named by `AzureWebJobsStorage__accountName`, reached with
+an Entra bearer token for the storage audience via `Invoke-TableRest` /
+`Invoke-TableRestRaw` (`HttpHelpers.psm1`). Not Shared-Key: the account is deployed with
+`allowSharedKeyAccess: false`. Table names cannot contain hyphens (Azure constraint).
 
 ### JITRules — CURRENTLY-active rules (one row per active grant)
 Name from env `JIT_TABLE_NAME`, default `JITRules`. Created on demand by `Get-JITTableName`
@@ -635,7 +642,7 @@ everything else is derived at runtime. **Env var wins whenever set.**
 | `JIT_MAX_RULES_PER_RESOURCE` | `20` | Request `:44` |
 | `AZURETRAY_APP_REGISTRATION_OBJECT_ID` | (set by Deploy.ps1 Step 0) — object id of the AzureTray app reg | profile `:20-22`, `Get-AzureTrayAppRegTags` `:575` |
 | `AZURETRAY_APP_REGISTRATION_NAME` | informational, template `:176` | (scripts only) |
-| `AzureWebJobsStorage` | connection string (template `:165-166`) | `Get-StorageParts` `HttpHelpers.psm1:220-238` |
+| `AzureWebJobsStorage__accountName` | storage ACCOUNT NAME, not a connection string — identity-based access, since the account has `allowSharedKeyAccess: false` (template appSettings) | `Get-StorageParts` `HttpHelpers.psm1:220-238` |
 | `IDENTITY_ENDPOINT` / `IDENTITY_HEADER` | platform-injected (MI) | `Get-ManagedIdentityToken` `HttpHelpers.psm1:45-53` |
 | `WEBSITE_HOSTNAME` / `WEBSITE_OWNER_NAME` / `WEBSITE_RESOURCE_GROUP` / `WEBSITE_SITE_NAME` | platform-injected | profile / derivation helpers |
 
@@ -744,7 +751,13 @@ All in `src/scripts/`. `Deploy.ps1`, `Grant-JITPermissions.ps1`, `Remove-JITDepl
 `-ResourceGroupName` `rg-jit-azaccess`, `-AzureTrayAppRegistrationName` `AzureTray`,
 `-ParametersFile`, `-TargetSubscriptionIds`, `-SkipGraphPermission`). Order: Step 0 resolve
 AzureTray app-reg object id via Graph -> Step 1 `az deployment sub create` (azuredeploy.json)
--> Step 2 zip-deploy code (`Compress-Archive` + `az functionapp deployment source config-zip`)
+-> Step 2 package and upload the code (`Compress-Archive` of the function app WITHOUT
+`tests/`, then `az storage blob upload --auth-mode login` to the `deployments` container;
+the app runs it via `WEBSITE_RUN_FROM_PACKAGE`). Deliberately NOT
+`az functionapp deployment source config-zip`: the blob write is invisible to the host,
+which is why the restart and the explicit `syncfunctiontriggers` call that follow are
+required rather than optional — skipping the sync is how the expiry timer silently stops
+firing while HTTP keeps working. Both are fatal to the deploy if they fail.
 -> Step 3a `Grant-JITPermissions.ps1` -> Step 3b Graph `Application.ReadWrite.OwnedBy` + app-reg
 ownership for the MI -> Step 3c write the `jit-baseurl` tag now -> Step 4 restart + warmup probe.
 

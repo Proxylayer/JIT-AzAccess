@@ -21,7 +21,9 @@
          an unauthenticated probe).
       6. Function app has the env vars the new design depends on
          (JIT_SITE_RESOURCE_ID, JIT_SUBSCRIPTION_ID,
-          AZURETRAY_APP_REGISTRATION_OBJECT_ID, JIT_REQUESTER_ROLE_NAME).
+          AZURETRAY_APP_REGISTRATION_OBJECT_ID, FUNCTIONS_WORKER_RUNTIME,
+          APPLICATIONINSIGHTS_CONNECTION_STRING, AzureWebJobsStorage__accountName,
+          JIT_TABLE_NAME).
       7. Function app MI has Microsoft Graph 'Application.ReadWrite.OwnedBy'
          app role assignment, AND is an owner of the AzureTray app reg.
          (Both are required by profile.ps1 to PATCH the discovery notes.)
@@ -30,7 +32,9 @@
          for visibility (multi-deploy aware).
 
 .PARAMETER AppName
-    Short lowercase alphanumeric name used to derive resource names. Default: jitazaccess
+    Short lowercase alphanumeric name used to derive resource names. Default: pgjitazaccess
+    (must match Deploy.ps1's -AppName default, or this script probes an app that
+    does not exist and reports a healthy deployment as broken).
 
 .PARAMETER ResourceGroupName
     Resource group that contains the function app. Default: rg-jit-azaccess
@@ -59,7 +63,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]   $AppName                       = 'jitazaccess',
+    [string]   $AppName                       = 'pgjitazaccess',
     [string]   $ResourceGroupName             = 'rg-jit-azaccess',
     [string]   $SubscriptionId,
     [string[]] $TargetSubscriptionIds,
@@ -150,11 +154,19 @@ if ($currentUserType -eq 'user') {
 if (-not $userOid) {
     Fail "Could not resolve current user object ID."
 } else {
+    # Scope matters here. The server calls
+    # Test-CallerHasJitRequesterRole -SubscriptionId <the TARGET resource's
+    # subscription>, so a site-scoped check answers a different question than
+    # the one the endpoint actually asks and can pass while a real grant is
+    # refused. Check the subscription scope, which is what Deploy.ps1 assigns
+    # at and what the server evaluates against.
+    $subscriptionScope = "/subscriptions/$SubscriptionId"
     Info "User object ID : $userOid"
-    Info "Checking role assignments at $siteResourceId (incl. inherited)..."
+    Info "Checking role assignments at $subscriptionScope (incl. inherited)..."
+    Info "  (the server evaluates this against whichever subscription a request targets)"
 
     $assignmentsJson = az rest --method GET `
-        --uri "https://management.azure.com$siteResourceId/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&`$filter=assignedTo('$userOid')" `
+        --uri "https://management.azure.com$subscriptionScope/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&`$filter=assignedTo('$userOid')" `
         --output json 2>$null
     $assignments = if ($assignmentsJson) { @(($assignmentsJson | ConvertFrom-Json).value) } else { @() }
 
@@ -175,10 +187,10 @@ if (-not $userOid) {
         Pass "Role '$JitRequesterRoleName' assigned (assignment $($matched.name) at scope $($matched.properties.scope))."
     }
     else {
-        Fail "User '$currentUserUpn' does NOT hold '$JitRequesterRoleName' at or above the function app site."
+        Fail "User '$currentUserUpn' does NOT hold '$JitRequesterRoleName' in subscription $SubscriptionId."
         Warn "  Fix:"
         Warn "    az role assignment create --assignee-object-id '$userOid' --assignee-principal-type User \"
-        Warn "        --role '$JitRequesterRoleName' --scope '$siteResourceId'"
+        Warn "        --role '$JitRequesterRoleName' --scope '$subscriptionScope'"
     }
 }
 
@@ -339,11 +351,28 @@ if (-not $hostname) {
 
 Step 'Check 6: required env vars on the function app'
 
+# Settings the template sets and the app needs. JIT_REQUESTER_ROLE_NAME used to
+# be in this list and is read by nothing in the app or the template, so Check 6
+# failed on every healthy deployment. JIT_SITE_RESOURCE_ID / JIT_SUBSCRIPTION_ID
+# came out for the same reason: they are overrides, and the app derives both at
+# runtime (Get-JitSiteResourceId / Get-JitSubscriptionId) when they are absent,
+# which is the normal case.
 $expected = @(
+    'AZURETRAY_APP_REGISTRATION_OBJECT_ID'
+    'FUNCTIONS_WORKER_RUNTIME'
+    'APPLICATIONINSIGHTS_CONNECTION_STRING'
+    'AzureWebJobsStorage__accountName'
+    'JIT_TABLE_NAME'
+)
+
+# Present only when an operator has pinned them; absence is correct, not a fault.
+$optionalOverrides = @(
     'JIT_SITE_RESOURCE_ID'
     'JIT_SUBSCRIPTION_ID'
-    'AZURETRAY_APP_REGISTRATION_OBJECT_ID'
-    'JIT_REQUESTER_ROLE_NAME'
+    'JIT_RESOURCE_GROUP'
+    'JIT_SITE_NAME'
+    'JIT_ALLOWED_CLIENT_APPIDS'
+    'JIT_TRUSTED_XFF_DEPTH'
 )
 
 $settingsJson = az functionapp config appsettings list `
@@ -360,6 +389,12 @@ foreach ($name in $expected) {
     } else {
         Pass "$name = $($settingsMap[$name])"
         if ($name -eq 'AZURETRAY_APP_REGISTRATION_OBJECT_ID') { $expectedAppRegObjId = $settingsMap[$name] }
+    }
+}
+
+foreach ($name in $optionalOverrides) {
+    if ($settingsMap.ContainsKey($name) -and -not [string]::IsNullOrWhiteSpace($settingsMap[$name])) {
+        Info "$name = $($settingsMap[$name])  (override set)"
     }
 }
 

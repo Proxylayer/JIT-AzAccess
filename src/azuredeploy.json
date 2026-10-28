@@ -60,9 +60,16 @@
         },
         "logAnalyticsWorkspaceId": {
             "type": "string",
-            "defaultValue": "",
+            "minLength": 1,
             "metadata": {
-                "description": "Resource ID of an existing Log Analytics workspace to back the Application Insights component. REQUIRED in practice: the app runs from a package, which disables filesystem log streaming, so App Insights is the only place its logs land. Leave empty only if you are deliberately deploying an app you cannot observe."
+                "description": "Resource ID of an existing Log Analytics workspace to back the Application Insights component. Required: the app runs from a package, which disables filesystem log streaming, so App Insights is the only place its logs land -- and the alert rules below query it. It used to default to empty, which produced what this template's own description called an app you cannot observe."
+            }
+        },
+        "alertEmailAddress": {
+            "type": "string",
+            "minLength": 3,
+            "metadata": {
+                "description": "Address that receives JIT alerts: an orphaned grant, a revocation that keeps failing, or an expiry timer that has stopped running. Required, because an alert nobody receives leaves a permanently-open firewall hole looking exactly like a healthy system -- which is the failure this whole app exists to prevent."
             }
         }
     },
@@ -103,7 +110,8 @@
                     "nsgPriorityMax":               { "value": "[parameters('nsgPriorityMax')]" },
                     "maxRulesPerCaller":            { "value": "[parameters('maxRulesPerCaller')]" },
                     "maxRulesPerResource":          { "value": "[parameters('maxRulesPerResource')]" },
-                    "logAnalyticsWorkspaceId":      { "value": "[parameters('logAnalyticsWorkspaceId')]" }
+                    "logAnalyticsWorkspaceId":      { "value": "[parameters('logAnalyticsWorkspaceId')]" },
+                    "alertEmailAddress":            { "value": "[parameters('alertEmailAddress')]" }
                 },
                 "template": {
                     "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
@@ -121,14 +129,18 @@
                         "nsgPriorityMax":               { "type": "string" },
                         "maxRulesPerCaller":            { "type": "string" },
                         "maxRulesPerResource":          { "type": "string" },
-                        "logAnalyticsWorkspaceId":      { "type": "string" }
+                        "logAnalyticsWorkspaceId":      { "type": "string" },
+                        "alertEmailAddress":            { "type": "string" }
                     },
                     "variables": {
                         "insightsName":   "[format('appi-{0}', parameters('appName'))]",
                         "packageContainer": "deployments",
                         "packageBlob":      "functionapp.zip",
                         "packageUrl":     "[format('https://{0}.blob.core.windows.net/deployments/functionapp.zip', parameters('storageName'))]",
-                        "storageId":      "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageName'))]"
+                        "storageId":      "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageName'))]",
+                        "actionGroupName": "[format('ag-{0}-jit', parameters('appName'))]",
+                        "insightsId":      "[resourceId('Microsoft.Insights/components', format('appi-{0}', parameters('appName')))]",
+                        "siteId":          "[resourceId('Microsoft.Web/sites', parameters('functionName'))]"
                     },
                     "resources": [
                         {
@@ -144,6 +156,7 @@
                                 "allowBlobPublicAccess": false,
                                 "allowSharedKeyAccess": false,
                                 "networkAcls": {
+                                    "_comment": "defaultAction stays Allow DELIBERATELY. The function app is on a Y1 Consumption plan, which has no VNet integration, so its outbound address is an arbitrary IP from the regional pool. Setting Deny here does not survive that: the host loses access to its own content share and to the package blob that WEBSITE_RUN_FROM_PACKAGE points at, and the app stops starting. 'bypass: AzureServices' does not cover a Consumption-plan worker reaching its own storage. Locking this down means moving off Consumption to a plan with VNet integration plus private endpoints, which is a hosting decision, not a template tweak. What IS enforced here is the control that matters most: allowSharedKeyAccess is false, so every data-plane call must present an Entra token from the managed identity.",
                                     "defaultAction": "Allow",
                                     "bypass": "AzureServices"
                                 }
@@ -164,7 +177,7 @@
                             "kind": "web",
                             "properties": {
                                 "Application_Type": "web",
-                                "WorkspaceResourceId": "[if(empty(parameters('logAnalyticsWorkspaceId')), json('null'), parameters('logAnalyticsWorkspaceId'))]"
+                                "WorkspaceResourceId": "[parameters('logAnalyticsWorkspaceId')]"
                             }
                         },
                         {
@@ -195,7 +208,7 @@
                                 "siteConfig": {
                                     "minTlsVersion": "1.2",
                                     "ftpsState": "Disabled",
-                                    "powerShellVersion": "7.2",
+                                    "powerShellVersion": "7.4",
                                     "cors": { "allowedOrigins": [], "supportCredentials": false },
                                     "appSettings": [
                                         { "name": "AzureWebJobsStorage__accountName",       "value": "[parameters('storageName')]" },
@@ -216,6 +229,172 @@
                                         { "name": "AZURETRAY_APP_REGISTRATION_OBJECT_ID",    "value": "[parameters('azureTrayAppRegistrationObjectId')]" }
                                     ]
                                 }
+                            }
+                        },
+                        {
+                            "comments": "Basic (username/password) publishing over SCM and FTP is a second way in that bypasses Entra entirely. Deployment here is WEBSITE_RUN_FROM_PACKAGE out of blob storage, so nothing needs it.",
+                            "type": "Microsoft.Web/sites/basicPublishingCredentialsPolicies",
+                            "apiVersion": "2022-03-01",
+                            "name": "[format('{0}/scm', parameters('functionName'))]",
+                            "dependsOn": [ "[variables('siteId')]" ],
+                            "properties": { "allow": false }
+                        },
+                        {
+                            "type": "Microsoft.Web/sites/basicPublishingCredentialsPolicies",
+                            "apiVersion": "2022-03-01",
+                            "name": "[format('{0}/ftp', parameters('functionName'))]",
+                            "dependsOn": [ "[variables('siteId')]" ],
+                            "properties": { "allow": false }
+                        },
+                        {
+                            "comments": "Where the alerts below go. Without it they would fire into an empty room.",
+                            "type": "Microsoft.Insights/actionGroups",
+                            "apiVersion": "2023-01-01",
+                            "name": "[variables('actionGroupName')]",
+                            "location": "global",
+                            "properties": {
+                                "groupShortName": "jitalerts",
+                                "enabled": true,
+                                "emailReceivers": [
+                                    {
+                                        "name": "jit-operator",
+                                        "emailAddress": "[parameters('alertEmailAddress')]",
+                                        "useCommonAlertSchema": true
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "comments": "A JIT rule that reached a resource but could not be tracked or removed. The firewall hole is open, nothing in the system knows about it, and it will never expire. This is the one alert that always means a human must act.",
+                            "type": "Microsoft.Insights/scheduledQueryRules",
+                            "apiVersion": "2022-06-15",
+                            "name": "[format('{0}-jit-orphaned-or-stuck', parameters('appName'))]",
+                            "location": "[parameters('location')]",
+                            "dependsOn": [
+                                "[variables('insightsId')]",
+                                "[resourceId('Microsoft.Insights/actionGroups', variables('actionGroupName'))]"
+                            ],
+                            "properties": {
+                                "displayName": "JIT: orphaned grant or stuck revocation",
+                                "description": "Write-JITAuditEvent emits one compact JSON object per decision through Write-Host, which lands in the traces table. JITOrphanedGrant means a grant could not be rolled back; JITRemoveStuck means a revocation has been failing past its retry threshold. host.json samples only Exception telemetry out, and this app's trace volume is far below the sampling threshold, so these lines are not dropped.",
+                                "severity": 1,
+                                "enabled": true,
+                                "scopes": [ "[variables('insightsId')]" ],
+                                "evaluationFrequency": "PT5M",
+                                "windowSize": "PT15M",
+                                "autoMitigate": false,
+                                "criteria": {
+                                    "allOf": [
+                                        {
+                                            "query": "traces | where message has '\"auditEvent\":\"JITOrphanedGrant\"' or message has '\"auditEvent\":\"JITRemoveStuck\"'",
+                                            "timeAggregation": "Count",
+                                            "operator": "GreaterThan",
+                                            "threshold": 0,
+                                            "failingPeriods": { "numberOfEvaluationPeriods": 1, "minFailingPeriodsToAlert": 1 }
+                                        }
+                                    ]
+                                },
+                                "actions": { "actionGroups": [ "[resourceId('Microsoft.Insights/actionGroups', variables('actionGroupName'))]" ] }
+                            }
+                        },
+                        {
+                            "comments": "A single failed revocation is retried on the next tick, so this is the lower-severity signal: removals are failing, not yet that one is stuck.",
+                            "type": "Microsoft.Insights/scheduledQueryRules",
+                            "apiVersion": "2022-06-15",
+                            "name": "[format('{0}-jit-remove-failed', parameters('appName'))]",
+                            "location": "[parameters('location')]",
+                            "dependsOn": [
+                                "[variables('insightsId')]",
+                                "[resourceId('Microsoft.Insights/actionGroups', variables('actionGroupName'))]"
+                            ],
+                            "properties": {
+                                "displayName": "JIT: rule removal failing",
+                                "severity": 2,
+                                "enabled": true,
+                                "scopes": [ "[variables('insightsId')]" ],
+                                "evaluationFrequency": "PT15M",
+                                "windowSize": "PT1H",
+                                "autoMitigate": true,
+                                "criteria": {
+                                    "allOf": [
+                                        {
+                                            "query": "traces | where message has '\"auditEvent\":\"JITRemoveFailed\"'",
+                                            "timeAggregation": "Count",
+                                            "operator": "GreaterThan",
+                                            "threshold": 2,
+                                            "failingPeriods": { "numberOfEvaluationPeriods": 1, "minFailingPeriodsToAlert": 1 }
+                                        }
+                                    ]
+                                },
+                                "actions": { "actionGroups": [ "[resourceId('Microsoft.Insights/actionGroups', variables('actionGroupName'))]" ] }
+                            }
+                        },
+                        {
+                            "comments": "The expiry timer runs every 5 minutes and prints 'JIT cleanup started'. If that line stops appearing, nothing is revoking anything and every live grant quietly becomes permanent. That is the eight-day outage recorded at the top of HttpHelpers.psm1, which a missed trigger sync caused.",
+                            "type": "Microsoft.Insights/scheduledQueryRules",
+                            "apiVersion": "2022-06-15",
+                            "name": "[format('{0}-jit-timer-silent', parameters('appName'))]",
+                            "location": "[parameters('location')]",
+                            "dependsOn": [
+                                "[variables('insightsId')]",
+                                "[resourceId('Microsoft.Insights/actionGroups', variables('actionGroupName'))]"
+                            ],
+                            "properties": {
+                                "displayName": "JIT: expiry timer has not run",
+                                "severity": 1,
+                                "enabled": true,
+                                "scopes": [ "[variables('insightsId')]" ],
+                                "evaluationFrequency": "PT5M",
+                                "windowSize": "PT15M",
+                                "autoMitigate": true,
+                                "criteria": {
+                                    "allOf": [
+                                        {
+                                            "query": "traces | where message has 'JIT cleanup started'",
+                                            "timeAggregation": "Count",
+                                            "operator": "LessThanOrEqual",
+                                            "threshold": 0,
+                                            "failingPeriods": { "numberOfEvaluationPeriods": 1, "minFailingPeriodsToAlert": 1 }
+                                        }
+                                    ]
+                                },
+                                "actions": { "actionGroups": [ "[resourceId('Microsoft.Insights/actionGroups', variables('actionGroupName'))]" ] }
+                            }
+                        },
+                        {
+                            "comments": "Server errors on the three HTTP endpoints. A 5xx from Request-JITAccess is the compensating-remove path or worse.",
+                            "type": "Microsoft.Insights/metricAlerts",
+                            "apiVersion": "2018-03-01",
+                            "name": "[format('{0}-jit-5xx', parameters('appName'))]",
+                            "location": "global",
+                            "dependsOn": [
+                                "[variables('siteId')]",
+                                "[resourceId('Microsoft.Insights/actionGroups', variables('actionGroupName'))]"
+                            ],
+                            "properties": {
+                                "description": "The JIT function app is returning server errors.",
+                                "severity": 2,
+                                "enabled": true,
+                                "scopes": [ "[variables('siteId')]" ],
+                                "evaluationFrequency": "PT5M",
+                                "windowSize": "PT15M",
+                                "criteria": {
+                                    "odata.type": "Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria",
+                                    "allOf": [
+                                        {
+                                            "name": "Http5xx",
+                                            "metricNamespace": "Microsoft.Web/sites",
+                                            "metricName": "Http5xx",
+                                            "operator": "GreaterThan",
+                                            "threshold": 0,
+                                            "timeAggregation": "Total",
+                                            "criterionType": "StaticThresholdCriterion"
+                                        }
+                                    ]
+                                },
+                                "actions": [
+                                    { "actionGroupId": "[resourceId('Microsoft.Insights/actionGroups', variables('actionGroupName'))]" }
+                                ]
                             }
                         }
                     ],

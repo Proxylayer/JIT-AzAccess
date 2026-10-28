@@ -1,0 +1,145 @@
+name: CI
+
+# Gates every push and PR. Before this existed nothing ran the test suite, and
+# `dotnet build` never saw src/functionapp at all -- the entire server side had
+# no build-time validation.
+
+on:
+  push:
+    branches: [main, release]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned so a new Pester major cannot turn a green CI red overnight, and so
+  # local and CI runs agree. test.ps1 accepts anything >= 5.5.0.
+  PESTER_VERSION: '6.2.0'
+  PSSA_VERSION: '1.22.0'
+
+jobs:
+  powershell:
+    name: Function app (parse, lint, Pester)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache PowerShell modules
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/powershell/Modules
+          key: psmodules-${{ runner.os }}-${{ env.PESTER_VERSION }}-${{ env.PSSA_VERSION }}
+
+      - name: Install Pester and PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Module -ListAvailable Pester | Where-Object Version -eq $env:PESTER_VERSION)) {
+            Install-Module Pester -RequiredVersion $env:PESTER_VERSION -Scope CurrentUser -Force -SkipPublisherCheck
+          }
+          if (-not (Get-Module -ListAvailable PSScriptAnalyzer | Where-Object Version -eq $env:PSSA_VERSION)) {
+            Install-Module PSScriptAnalyzer -RequiredVersion $env:PSSA_VERSION -Scope CurrentUser -Force
+          }
+
+      - name: Parse and lint the function app
+        shell: pwsh
+        run: ./build.ps1 -Target FunctionApp
+
+      - name: Run the Pester suite
+        shell: pwsh
+        # The C# project is covered by the dotnet job; this one has no SDK.
+        run: ./test.ps1 -SkipDotNet
+
+  dotnet:
+    name: Plugin (build, analyzers, xUnit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build
+        shell: pwsh
+        # Directory.Build.props sets TreatWarningsAsErrors, so an analyzer
+        # finding fails here rather than being scrolled past locally.
+        run: ./build.ps1
+
+      - name: Test
+        run: dotnet test src/plugin/AzureTray.Plugin.JITAzAccess.Tests/AzureTray.Plugin.JITAzAccess.Tests.csproj --nologo
+
+  template:
+    name: ARM template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate azuredeploy.json
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $problems = 0
+
+          $templatePath = 'src/azuredeploy.json'
+          $examplePath  = 'src/azuredeploy.parameters.example.json'
+
+          # 1. It has to be JSON before anything else is worth checking.
+          try {
+            $template = Get-Content $templatePath -Raw | ConvertFrom-Json
+          } catch {
+            Write-Host "::error file=$templatePath::not valid JSON - $_"
+            exit 1
+          }
+
+          # 2. Every parameter without a defaultValue must appear in the
+          #    example parameters file. Otherwise the documented happy path
+          #    does not deploy -- which is how logAnalyticsWorkspaceId came to
+          #    be optional and absent, producing what the template's own
+          #    description calls "an app you cannot observe".
+          if (-not (Test-Path $examplePath)) {
+            Write-Host "::error::$examplePath is missing"
+            exit 1
+          }
+
+          $example  = Get-Content $examplePath -Raw | ConvertFrom-Json
+          $supplied = $example.parameters.PSObject.Properties.Name
+
+          foreach ($p in $template.parameters.PSObject.Properties) {
+            $hasDefault = $null -ne $p.Value.PSObject.Properties['defaultValue']
+            if (-not $hasDefault -and $p.Name -notin $supplied) {
+              Write-Host "::error file=$examplePath::required parameter '$($p.Name)' has no default and is not in the example parameters file"
+              $problems++
+            }
+          }
+
+          # 3. Nothing that looks like a committed secret.
+          $raw = Get-Content $templatePath -Raw
+          foreach ($pattern in @('AccountKey=', 'SharedAccessSignature', 'password":\s*"[^"]{6,}')) {
+            if ($raw -match $pattern) {
+              Write-Host "::error file=$templatePath::template appears to contain a literal secret (matched /$pattern/)"
+              $problems++
+            }
+          }
+
+          # 4. Entra-only storage auth is a hard constraint for this project
+          #    (see the policy note at the top of HttpHelpers.psm1 and the
+          #    eight-day outage it records). Assert the template still sets it.
+          if ($raw -notmatch '"allowSharedKeyAccess"\s*:\s*false') {
+            Write-Host "::error file=$templatePath::allowSharedKeyAccess must be explicitly false"
+            $problems++
+          }
+
+          if ($problems -gt 0) { exit 1 }
+          Write-Host "azuredeploy.json OK"
+
+      # A full `az deployment sub validate` needs Azure credentials, which this
+      # repo does not grant to CI. The checks above are what can be done
+      # offline; a real validate still happens in Deploy.ps1 against the
+      # target subscription.

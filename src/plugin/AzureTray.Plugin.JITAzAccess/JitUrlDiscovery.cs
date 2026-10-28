@@ -42,6 +42,8 @@ internal sealed class JitUrlDiscovery
     /// </summary>
     internal const string DefaultAllowedHostSuffixes = ".azurewebsites.net";
 
+    private static readonly char[] HostSuffixSeparators = { ',', ';' };
+
     private readonly IPluginContext _context;
     private readonly Func<IReadOnlyList<string>> _allowedHostSuffixes;
 
@@ -64,7 +66,7 @@ internal sealed class JitUrlDiscovery
 
         // Separators are comma and semicolon; surrounding whitespace is
         // handled by the Trim below, so no whitespace chars are needed here.
-        var parts = raw.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries);
+        var parts = raw.Split(HostSuffixSeparators, StringSplitOptions.RemoveEmptyEntries);
         var list = new List<string>(parts.Length);
         foreach (var part in parts)
         {
@@ -139,7 +141,7 @@ internal sealed class JitUrlDiscovery
         var allowed = false;
         foreach (var entry in allowedHostSuffixes)
         {
-            if (entry.StartsWith(".", StringComparison.Ordinal))
+            if (entry.StartsWith('.'))
             {
                 if (host.EndsWith(entry, StringComparison.OrdinalIgnoreCase)) { allowed = true; break; }
             }
