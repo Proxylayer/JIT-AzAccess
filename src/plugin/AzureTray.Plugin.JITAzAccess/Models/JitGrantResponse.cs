@@ -29,6 +29,7 @@ public sealed record JitGrantResponse
     public string? Port { get; init; }
 
     [JsonPropertyName("expiresUtc")]
+    [JsonConverter(typeof(UtcDateTimeConverter))]
     public DateTime ExpiresUtc { get; init; }
 
     [JsonPropertyName("requestedBy")]

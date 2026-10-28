@@ -195,11 +195,16 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
     // Seeded with every option's default so the keys exist before the host
     // hydrates persisted values (SetValue ignores unknown keys), and so the
     // typed accessors below always resolve.
-    private readonly Dictionary<string, object?> _optionValues = BuildDefaultValues();
+    //
+    // Concurrent because the host writes it from its config thread (SetValue)
+    // while the poll thread reads it (SelectedAssetTypes, AllowedBackendHosts)
+    // — a plain Dictionary can corrupt its buckets under that, and the value
+    // being read is a security control (the backend host allowlist).
+    private readonly ConcurrentDictionary<string, object?> _optionValues = BuildDefaultValues();
 
-    private static Dictionary<string, object?> BuildDefaultValues()
+    private static ConcurrentDictionary<string, object?> BuildDefaultValues()
     {
-        var values = new Dictionary<string, object?>(StringComparer.Ordinal)
+        var values = new ConcurrentDictionary<string, object?>(StringComparer.Ordinal)
         {
             [DefaultDurationOptionKey]  = DefaultDurationHoursValue,
             [AllowedDurationsOptionKey] = DefaultAllowedDurations,
@@ -211,7 +216,11 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         return values;
     }
 
-    public IReadOnlyDictionary<string, object?> Values => _optionValues;
+    // A snapshot, not the live instance: the host persists this on its own
+    // schedule, and handing it the mutable backing store means it can serialise
+    // a dictionary that SetValue is halfway through updating.
+    public IReadOnlyDictionary<string, object?> Values =>
+        new Dictionary<string, object?>(_optionValues, StringComparer.Ordinal);
 
     public void SetValue(string key, object? value)
     {
@@ -427,7 +436,6 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
     private IPluginContext?    _context;
     private JitClient?         _client;
     private ArmVerifier?       _verifier;
-    private ActiveRulesStore?  _localStore;
     private JitUrlDiscovery?   _discovery;
     private ResourceDiscovery? _resources;
     private FavoritesStore?    _favorites;
@@ -438,10 +446,16 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
     private readonly ConcurrentDictionary<string, TenantState> _tenants =
         new(StringComparer.OrdinalIgnoreCase);
 
-    // Busy keys are tenant-scoped: "{tenantId}|{type}|{sub}|{rg}|{name}|{hours}".
+    // Targets with a grant in flight — see BusyKey. Claimed before the first
+    // prompt and held until the grant finishes, so the row stays disabled for
+    // the whole flow rather than only for the HTTP call at the end of it.
     private readonly object          _busyLock = new();
     private readonly HashSet<string> _busyKeys = new(StringComparer.Ordinal);
 
+    // Guards _pollTimer. StartPollTimer is reached from tenant discovery and
+    // from the manual retry, so a bare "??=" can construct two timers and leak
+    // the loser — which then polls forever with no handle to dispose it.
+    private readonly object _pollTimerLock = new();
     private Timer? _pollTimer;
 
     private static readonly TimeSpan TargetsTtl = TimeSpan.FromMinutes(5);
@@ -458,7 +472,6 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         _context    = context;
         _client     = new JitClient(context);
         _verifier   = new ArmVerifier(context);
-        _localStore = new ActiveRulesStore(context.DataDir, context.Logger);
         _discovery  = new JitUrlDiscovery(context, () => AllowedBackendHosts);
         _resources  = new ResourceDiscovery(context);
         _favorites  = new FavoritesStore(context.DataDir, context.Logger);
@@ -479,19 +492,26 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
 
     private void StartPollTimer()
     {
-        _pollTimer ??= new Timer(_ => _ = PollAllAsync(), null,
-            TimeSpan.Zero, TimeSpan.FromSeconds(90));
+        lock (_pollTimerLock)
+        {
+            _pollTimer ??= new Timer(
+                _ => FireAndForget(PollAllAsync(), "poll timer"), null,
+                TimeSpan.Zero, TimeSpan.FromSeconds(90));
+        }
     }
 
     public async Task ShutdownAsync(CancellationToken cancellationToken)
     {
         _context?.Logger.LogInformation("JIT Azure Access plugin shutting down.");
 
-        if (_pollTimer is not null)
+        Timer? timer;
+        lock (_pollTimerLock)
         {
-            await _pollTimer.DisposeAsync().ConfigureAwait(false);
+            timer      = _pollTimer;
             _pollTimer = null;
         }
+        if (timer is not null)
+            await timer.DisposeAsync().ConfigureAwait(false);
 
         if (_context is not null)
         {
@@ -510,8 +530,11 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         // wasn't called — otherwise the host's IPluginContext keeps this
         // instance alive via the event handlers after a hot-reload. Idempotent:
         // ShutdownAsync nulls _context, so a later Dispose is a no-op here.
-        _pollTimer?.Dispose();
-        _pollTimer = null;
+        lock (_pollTimerLock)
+        {
+            _pollTimer?.Dispose();
+            _pollTimer = null;
+        }
         if (_context is not null)
         {
             _context.TenantReady   -= OnTenantReady;
@@ -523,21 +546,16 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
 
     private void OnTenantReady(PluginTenant tenant)
     {
-        var added = false;
-        var state = _tenants.GetOrAdd(tenant.TenantId, _ =>
-        {
-            added = true;
-            return new TenantState(tenant);
-        });
+        // TryAdd, not GetOrAdd with a side-effecting factory: ConcurrentDictionary
+        // may invoke that factory on more than one thread and keep only one
+        // result, so a concurrent re-fire would set "added" twice and run
+        // discovery twice for the same tenant.
+        var state = new TenantState(tenant);
+        if (!_tenants.TryAdd(tenant.TenantId, state)) return;   // already tracked
 
-        // Only kick off discovery on first sight of the tenant; a re-fire while
-        // the tenant is already tracked is a no-op (the poll timer keeps it fresh).
-        if (added)
-        {
-            _context?.Logger.LogInformation(
-                "JIT: tracking tenant {TenantId} ({DisplayName}).", tenant.TenantId, tenant.DisplayName);
-            _ = DiscoverAndPollAsync(state);
-        }
+        _context?.Logger.LogInformation(
+            "JIT: tracking tenant {TenantId} ({DisplayName}).", tenant.TenantId, tenant.DisplayName);
+        FireAndForget(DiscoverAndPollAsync(state), "initial discovery");
     }
 
     private void OnTenantRemoved(string tenantId)
@@ -684,11 +702,11 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
             lock (state.Lock) rulesAt = state.RulesAt;
             if (now - rulesAt > RulesTtl)
             {
-                var allRules     = new List<JitServerRule>();
-                var anySucceeded = false;
+                var pollUrls     = urls.AllUrls.ToArray();
+                var fetched      = new Dictionary<string, List<JitServerRule>>(StringComparer.OrdinalIgnoreCase);
                 string? callerIp = null;
 
-                foreach (var url in urls.AllUrls)
+                foreach (var url in pollUrls)
                 {
                     // Once-then-quiet per URL: an unhealthy function app fails
                     // identically every poll; only the transitions get loud lines.
@@ -701,11 +719,11 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                             .GetActiveRulesAsync(tenantId, url, CancellationToken.None)
                             .ConfigureAwait(false);
                         // Tag each rule with the URL it came from so Revoke can route correctly.
-                        foreach (var rule in result.Rules)
-                            allRules.Add(rule with { SourceFunctionAppUrl = url });
+                        fetched[url] = result.Rules
+                            .Select(rule => rule with { SourceFunctionAppUrl = url })
+                            .ToList();
                         if (!string.IsNullOrEmpty(result.CallerIp))
                             callerIp = result.CallerIp;
-                        anySucceeded = true;
                         if (gate.RecordSuccess())
                             context.Logger.LogInformation("JIT: rules refresh recovered for {Url}.", url);
                         context.Logger.LogDebug(
@@ -735,14 +753,39 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                     }
                 }
 
-                if (anySucceeded)
+                if (fetched.Count > 0)
                 {
+                    List<string> unanswered;
                     lock (state.Lock)
                     {
-                        state.ServerRules = allRules;
+                        // Merge per URL rather than replacing the whole set with
+                        // whatever answered. A wholesale replace meant one
+                        // unreachable function app erased every rule from the
+                        // menu and the badge — including live grants from the
+                        // deployments that DID answer. That tells the user they
+                        // hold no access when they do, and takes the Revoke
+                        // action for those grants away with it.
+                        foreach (var pair in fetched)
+                            state.RulesByUrl[pair.Key] = pair.Value;
+
+                        // Drop deployments that are no longer discovered, so a
+                        // retired function app's rules don't linger forever.
+                        var live = new HashSet<string>(pollUrls, StringComparer.OrdinalIgnoreCase);
+                        foreach (var gone in state.RulesByUrl.Keys.Where(k => !live.Contains(k)).ToList())
+                            state.RulesByUrl.Remove(gone);
+
+                        state.ServerRules = state.RulesByUrl.Values.SelectMany(r => r).ToList();
                         state.RulesAt     = now;
                         if (callerIp is not null) state.CallerIp = callerIp;
+
+                        unanswered = pollUrls.Where(u => !fetched.ContainsKey(u)).ToList();
                     }
+
+                    if (unanswered.Count > 0)
+                        context.Logger.LogDebug(
+                            "JIT: {Count} deployment(s) did not answer this poll; keeping their last known " +
+                            "rules ({Urls}).", unanswered.Count, string.Join(", ", unanswered));
+
                     changed = true;
                     ClearAuthBlocked(state);
                 }
@@ -811,7 +854,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
             "JIT: {Operation} returned {Status} from {Url}: {Server}",
             ex.Operation, ex.StatusCode, url, ex.ServerError ?? "(no body)");
 
-        _ = context.Notifier.ShowAsync(
+        FireAndForget(context.Notifier.ShowAsync(
             new InformationRequest(Title: title, Message: body)
             {
                 Severity = NotificationSeverity.Warning,
@@ -823,7 +866,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                     new NotificationDetail("Server",   ex.ServerError ?? ex.Message),
                 },
             },
-            CancellationToken.None);
+            CancellationToken.None), "NotifyAuthBlocked notification");
 
         MenuChanged?.Invoke();
     }
@@ -947,7 +990,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                     Icon:      "⚠"));
                 body.Add(new PluginMenuItem(
                     Text:         $"{indent}Retry discovery",
-                    Invoke:       () => _ = RetryDiscoveryAsync(state),
+                    Invoke:       () => FireAndForget(RetryDiscoveryAsync(state), "discovery retry"),
                     Icon:         "↻",
                     KeepMenuOpen: true)
                 { Key = $"jit.retryDiscovery.{state.Tenant.TenantId}" });
@@ -1024,7 +1067,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
             state.TargetsAt = DateTime.MinValue;
             state.RulesAt   = DateTime.MinValue;
         }
-        _ = PollTenantAsync(state);
+        FireAndForget(PollTenantAsync(state), "manual refresh");
     }
 
     // ── Target row ────────────────────────────────────────────────────────────
@@ -1032,7 +1075,9 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
     private PluginMenuItem BuildTargetItem(
         TenantState state, JitTarget target, IReadOnlyList<JitServerRule> rules, string? callerIp, string indent)
     {
-        var envBadge   = string.IsNullOrEmpty(target.Environment) ? string.Empty : $"[{target.Environment.ToUpper()}] ";
+        var envBadge   = string.IsNullOrEmpty(target.Environment)
+            ? string.Empty
+            : $"[{target.Environment.ToUpperInvariant()}] ";
         var isFavorite = _favorites?.IsFavorite(target.Id) ?? false;
 
         // Toggled by the host when the user clicks the row's favorite star.
@@ -1046,7 +1091,12 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                 now == true ? "added" : "removed", target.ResourceName, target.Id);
         }
 
+        // TargetType is part of the identity: an NSG and a storage account can
+        // share a name within one resource group, and without it one resource's
+        // grant greys out the other's row — so the user cannot request access
+        // they do not have, and the Revoke on that row targets the wrong rule.
         var activeRule = rules.FirstOrDefault(r =>
+            string.Equals(r.TargetType,     target.TargetType,     StringComparison.OrdinalIgnoreCase) &&
             string.Equals(r.SubscriptionId, target.SubscriptionId, StringComparison.OrdinalIgnoreCase) &&
             string.Equals(r.ResourceGroup,  target.ResourceGroup,  StringComparison.OrdinalIgnoreCase) &&
             string.Equals(r.ResourceName,   target.ResourceName,   StringComparison.OrdinalIgnoreCase));
@@ -1074,7 +1124,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                     new PluginMenuItem(
                         Text:   "Revoke access",
                         Icon:   "🗑",
-                        Invoke: () => _ = ConfirmRevokeAsync(state, r)),
+                        Invoke: () => FireAndForget(ConfirmRevokeAsync(state, r), "revoke")),
                 })
             { Key = $"jit.target.{target.Id}" };
         }
@@ -1095,15 +1145,16 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         }
 
         // Single-click target rows. Duration is asked via a ChoiceRequest popup.
-        var targetPrefix = $"{state.Tenant.TenantId}|{target.TargetType}|{target.SubscriptionId}|{target.ResourceGroup}|{target.ResourceName}|";
         bool isBusy;
-        lock (_busyLock) isBusy = _busyKeys.Any(k => k.StartsWith(targetPrefix, StringComparison.Ordinal));
+        lock (_busyLock) isBusy = _busyKeys.Contains(BusyKey(state, target));
 
         var isProd = string.Equals(target.Environment, "prod", StringComparison.OrdinalIgnoreCase);
         return new PluginMenuItem(
             Text:             $"{indent}{envBadge}{target.DisplayName}",
             Icon:             isProd ? "⚠" : null,
-            Invoke:           isBusy ? null : () => _ = PromptAndGrantAsync(state, target),
+            Invoke:           isBusy
+                                  ? null
+                                  : () => FireAndForget(PromptAndGrantAsync(state, target), "grant"),
             IsEnabled:        !isBusy,
             IsBusy:           isBusy,
             KeepMenuOpen:     false,
@@ -1111,6 +1162,16 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
             OnToggleFavorite: ToggleFavorite)
         { Key = $"jit.target.{target.Id}" };
     }
+
+    /// <summary>
+    /// Identifies one target within one tenant for the busy set. Deliberately
+    /// excludes the requested duration: the point is to stop a second grant for
+    /// the same resource, and two clicks that pick different durations are
+    /// exactly the case worth stopping.
+    /// </summary>
+    private static string BusyKey(TenantState state, JitTarget target) =>
+        $"{state.Tenant.TenantId}|{target.TargetType}|{target.SubscriptionId}|" +
+        $"{target.ResourceGroup}|{target.ResourceName}";
 
     /// <summary>
     /// Single-click entry point on a target row. Pops a ChoiceRequest asking for
@@ -1121,43 +1182,63 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         var context = _context;
         if (context is null) return;
 
-        // A resource that declares its own durations wins; otherwise offer the
-        // configured list. The configured default is pre-selected either way.
-        var offered   = target.AllowedDurations is { Length: > 0 } ? target.AllowedDurations : OfferedDurations;
-        var durations = BuildDurationList(DurationHoursDefault, offered);
-        var choices   = durations.Select(h => h == 1 ? "1 hour" : $"{h} hours").ToArray();
-
-        var result = await context.Notifier.ShowAsync(
-            new ChoiceRequest(
-                Title:   $"Grant JIT access — {target.DisplayName}",
-                Message: $"How long? ({TargetTypeLabel(target.TargetType)}: {target.ResourceName})",
-                Choices: choices),
-            CancellationToken.None).ConfigureAwait(false);
-
-        if (result is not ChoiceResult { SelectedChoice: { Length: > 0 } picked })
+        // Claim the row BEFORE the first prompt. The busy key used to be taken
+        // only once every dialog had been answered, so the row stayed live and
+        // clickable for as long as the user left the duration, justification or
+        // production-confirm prompt open — and a second click started a second
+        // grant for the same resource.
+        var requestKey = BusyKey(state, target);
+        lock (_busyLock)
         {
-            context.Logger.LogInformation(
-                "JIT: duration prompt cancelled for {ResourceName}.", target.ResourceName);
-            return;
+            if (!_busyKeys.Add(requestKey)) return;
         }
+        MenuChanged?.Invoke();
 
-        // Map the selected label back to hours via index — safer than parsing.
-        var idx = Array.IndexOf(choices, picked);
-        if (idx < 0 || idx >= durations.Length)
+        try
         {
-            context.Logger.LogWarning(
-                "JIT: unknown duration choice '{Choice}' for {ResourceName}.", picked, target.ResourceName);
-            return;
-        }
+            // A resource that declares its own durations wins; otherwise offer the
+            // configured list. The configured default is pre-selected either way.
+            var offered   = target.AllowedDurations is { Length: > 0 } ? target.AllowedDurations : OfferedDurations;
+            var durations = BuildDurationList(DurationHoursDefault, offered);
+            var choices   = durations.Select(h => h == 1 ? "1 hour" : $"{h} hours").ToArray();
 
-        var hours      = durations[idx];
-        var requestKey = $"{state.Tenant.TenantId}|{target.TargetType}|{target.SubscriptionId}|{target.ResourceGroup}|{target.ResourceName}|{hours}";
-        await GrantFromTargetAsync(state, target, hours, requestKey).ConfigureAwait(false);
+            var result = await context.Notifier.ShowAsync(
+                new ChoiceRequest(
+                    Title:   $"Grant JIT access — {target.DisplayName}",
+                    Message: $"How long? ({TargetTypeLabel(target.TargetType)}: {target.ResourceName})",
+                    Choices: choices),
+                CancellationToken.None).ConfigureAwait(false);
+
+            if (result is not ChoiceResult { SelectedChoice: { Length: > 0 } picked })
+            {
+                context.Logger.LogInformation(
+                    "JIT: duration prompt cancelled for {ResourceName}.", target.ResourceName);
+                return;
+            }
+
+            // Map the selected label back to hours via index — safer than parsing.
+            var idx = Array.IndexOf(choices, picked);
+            if (idx < 0 || idx >= durations.Length)
+            {
+                context.Logger.LogWarning(
+                    "JIT: unknown duration choice '{Choice}' for {ResourceName}.", picked, target.ResourceName);
+                return;
+            }
+
+            await GrantFromTargetAsync(state, target, durations[idx]).ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_busyLock) _busyKeys.Remove(requestKey);
+            MenuChanged?.Invoke();
+        }
     }
 
     // ── Grant flow ───────────────────────────────────────────────────────────
 
-    private async Task GrantFromTargetAsync(TenantState state, JitTarget target, int durationHours, string requestKey)
+    // Caller (PromptAndGrantAsync) owns the busy key for the whole flow,
+    // including the prompts above, so this method never touches it.
+    private async Task GrantFromTargetAsync(TenantState state, JitTarget target, int durationHours)
     {
         var context = _context;
         var client  = _client;
@@ -1165,13 +1246,16 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
 
         var tenantId = state.Tenant.TenantId;
 
+        JitUrlDiscoveryResult urls;
+        lock (state.Lock) urls = state.Urls;
+
         // Justification is required on EVERY grant by default. It becomes optional
         // only when the tenant opted out via the JustificationRequired:false app-reg
         // tag — but a resource-level RequiresJustification still forces the prompt
         // even in an opt-out tenant. The server enforces this authoritatively; this
         // is the matching client-side UX.
         string? justification = null;
-        if (!state.Urls.JustificationOptional || target.RequiresJustification)
+        if (!urls.JustificationOptional || target.RequiresJustification)
         {
             var result = await context.Notifier.ShowAsync(
                 new TextInputRequest(
@@ -1208,28 +1292,20 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
             }
         }
 
-        lock (_busyLock)
-        {
-            if (!_busyKeys.Add(requestKey)) return;
-        }
-        MenuChanged?.Invoke();
-
         // Route the grant to the function app responsible for this target's
         // subscription. Falls back to the legacy single URL if no per-sub
         // entry exists (single-deploy setups).
-        var grantUrl = state.Urls.UrlForSubscription(target.SubscriptionId);
+        var grantUrl = urls.UrlForSubscription(target.SubscriptionId);
         if (string.IsNullOrEmpty(grantUrl))
         {
             context.Logger.LogError(
                 "JIT: no function app URL discovered for subscription {SubscriptionId}.", target.SubscriptionId);
-            _ = context.Notifier.ShowAsync(
+            FireAndForget(context.Notifier.ShowAsync(
                 new InformationRequest(
                     Title:   "JIT Access Failed",
                     Message: $"No JIT function app is registered for subscription {target.SubscriptionId}.")
                 { Severity = NotificationSeverity.Error },
-                CancellationToken.None);
-            lock (_busyLock) _busyKeys.Remove(requestKey);
-            MenuChanged?.Invoke();
+                CancellationToken.None), "grant-no-url notification");
             return;
         }
 
@@ -1248,18 +1324,6 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                 .RequestAccessAsync(tenantId, grantUrl, request, CancellationToken.None)
                 .ConfigureAwait(false);
 
-            _localStore?.Add(new ActiveRule(
-                RuleId:         response.RuleId,
-                TenantId:       tenantId,
-                TargetType:     response.TargetType,
-                SubscriptionId: target.SubscriptionId,
-                ResourceGroup:  target.ResourceGroup,
-                ResourceName:   target.ResourceName,
-                Port:           response.Port,
-                DurationHours:  durationHours,
-                GrantedUtc:     DateTime.UtcNow,
-                ExpiryUtc:      response.ExpiresUtc));
-
             context.Logger.LogInformation(
                 "JIT access granted: {TargetType} {ResourceName}, rule {RuleId}, expires {ExpiresUtc}.",
                 response.TargetType, target.ResourceName, response.RuleId, response.ExpiresUtc);
@@ -1267,7 +1331,9 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
             // Sole post-grant user feedback is raised by VerifyAndNotifyAsync
             // (exactly one toast per outcome). No success toast fires here —
             // green is reserved for a real ARM-confirmed grant.
-            _ = VerifyAndNotifyAsync(response, target, context, tenantId, durationHours);
+            FireAndForget(
+                VerifyAndNotifyAsync(response, target, context, tenantId, durationHours),
+                "post-grant verification");
         }
         catch (JitHttpException ex) when (ex.StatusCode == 400)
         {
@@ -1278,7 +1344,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
             context.Logger.LogWarning(ex,
                 "JIT grant rejected (400) for {ResourceName}: {ServerError}.",
                 target.ResourceName, serverMessage);
-            _ = context.Notifier.ShowAsync(
+            FireAndForget(context.Notifier.ShowAsync(
                 new InformationRequest(
                     Title:   "JIT Access Not Granted",
                     Message: $"{target.DisplayName} — the request was rejected by the server.\n{serverMessage}")
@@ -1286,12 +1352,12 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                     Severity = NotificationSeverity.Warning,
                     Details  = new[] { new NotificationDetail("Server", serverMessage) },
                 },
-                CancellationToken.None);
+                CancellationToken.None), "GrantFromTargetAsync notification");
         }
         catch (Exception ex)
         {
             context.Logger.LogError(ex, "JIT grant failed for {ResourceName}.", target.ResourceName);
-            _ = context.Notifier.ShowAsync(
+            FireAndForget(context.Notifier.ShowAsync(
                 new InformationRequest(
                     Title:   "JIT Access Failed",
                     Message: $"{target.DisplayName} — request rejected.")
@@ -1299,13 +1365,12 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                     Severity = NotificationSeverity.Error,
                     Details  = new[] { new NotificationDetail("Error", ex.Message) },
                 },
-                CancellationToken.None);
+                CancellationToken.None), "GrantFromTargetAsync notification");
         }
         finally
         {
-            lock (_busyLock) _busyKeys.Remove(requestKey);
             lock (state.Lock) state.RulesAt = DateTime.MinValue;
-            _ = PollTenantAsync(state);
+            FireAndForget(PollTenantAsync(state), "post-grant refresh");
         }
     }
 
@@ -1334,21 +1399,24 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         // Route the revoke to the function app the rule was originally fetched
         // from. SourceFunctionAppUrl is tagged during the poll; fall back to the
         // per-sub map if it's somehow missing.
+        JitUrlDiscoveryResult urls;
+        lock (state.Lock) urls = state.Urls;
+
         var revokeUrl = !string.IsNullOrEmpty(rule.SourceFunctionAppUrl)
             ? rule.SourceFunctionAppUrl
-            : state.Urls.UrlForSubscription(rule.SubscriptionId);
+            : urls.UrlForSubscription(rule.SubscriptionId);
 
         if (string.IsNullOrEmpty(revokeUrl))
         {
             context.Logger.LogError(
                 "JIT: cannot determine which function app to call to revoke rule {RuleId} " +
                 "(subscription {SubscriptionId}).", rule.RuleId, rule.SubscriptionId);
-            _ = context.Notifier.ShowAsync(
+            FireAndForget(context.Notifier.ShowAsync(
                 new InformationRequest(
                     Title:   "Revoke Failed",
                     Message: $"No JIT function app URL known for rule {rule.RuleId}.")
                 { Severity = NotificationSeverity.Error },
-                CancellationToken.None);
+                CancellationToken.None), "ConfirmRevokeAsync notification");
             return;
         }
 
@@ -1360,17 +1428,17 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
 
             context.Logger.LogInformation("JIT rule revoked: {RuleId} via {Url}.", rule.RuleId, revokeUrl);
 
-            _ = context.Notifier.ShowAsync(
+            FireAndForget(context.Notifier.ShowAsync(
                 new InformationRequest(
                     Title:   "JIT Access Revoked",
                     Message: $"{TargetTypeLabel(rule.TargetType)}: {rule.ResourceName} — rule {rule.RuleId} removed.")
                 { Severity = NotificationSeverity.Success },
-                CancellationToken.None);
+                CancellationToken.None), "ConfirmRevokeAsync notification");
         }
         catch (Exception ex)
         {
             context.Logger.LogError(ex, "JIT revoke failed for {RuleId}.", rule.RuleId);
-            _ = context.Notifier.ShowAsync(
+            FireAndForget(context.Notifier.ShowAsync(
                 new InformationRequest(
                     Title:   "Revoke Failed",
                     Message: $"Could not revoke rule {rule.RuleId}.")
@@ -1378,12 +1446,12 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                     Severity = NotificationSeverity.Error,
                     Details  = new[] { new NotificationDetail("Error", ex.Message) },
                 },
-                CancellationToken.None);
+                CancellationToken.None), "ConfirmRevokeAsync notification");
         }
         finally
         {
             lock (state.Lock) state.RulesAt = DateTime.MinValue;
-            _ = PollTenantAsync(state);
+            FireAndForget(PollTenantAsync(state), "post-revoke refresh");
         }
     }
 
@@ -1408,12 +1476,12 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
             // toast anyway rather than leaving the grant silent.
             context.Logger.LogWarning(
                 "JIT ARM verification skipped: verifier unavailable for rule {RuleId}.", grant.RuleId);
-            _ = context.Notifier.ShowAsync(
+            FireAndForget(context.Notifier.ShowAsync(
                 new InformationRequest(
                     Title:   "JIT Access Granted",
                     Message: $"{target.DisplayName} — {durationHours}h access granted.\n{expiry}")
                 { Severity = NotificationSeverity.Info },
-                CancellationToken.None);
+                CancellationToken.None), "VerifyAndNotifyAsync notification");
             return;
         }
 
@@ -1425,20 +1493,20 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                 context.Logger.LogInformation(
                     "JIT ARM verification confirmed: rule {RuleId} visible in {ResourceName}.",
                     grant.RuleId, grant.ResourceName);
-                _ = context.Notifier.ShowAsync(
+                FireAndForget(context.Notifier.ShowAsync(
                     new InformationRequest(
                         Title:   "JIT Access Granted",
                         Message: $"{target.DisplayName} — {durationHours}h access confirmed.\n" +
                                  $"Your IP ({grant.CallerIp}) is present in the Azure resource.\n{expiry}")
                     { Severity = NotificationSeverity.Success },
-                    CancellationToken.None);
+                    CancellationToken.None), "VerifyAndNotifyAsync notification");
                 break;
 
             case VerificationResult.NotFound:
                 context.Logger.LogWarning(
                     "JIT ARM verification: rule {RuleId} NOT found in {ResourceName} after grant.",
                     grant.RuleId, grant.ResourceName);
-                _ = context.Notifier.ShowAsync(
+                FireAndForget(context.Notifier.ShowAsync(
                     new InformationRequest(
                         Title:   "Whitelist Verification Failed",
                         Message: "The grant was accepted but the rule is not yet visible via ARM.\n" +
@@ -1447,47 +1515,73 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                         Severity = NotificationSeverity.Warning,
                         Details  = new[] { new NotificationDetail("Rule ID", grant.RuleId) },
                     },
-                    CancellationToken.None);
+                    CancellationToken.None), "VerifyAndNotifyAsync notification");
                 break;
 
             case VerificationResult.Timeout:
                 context.Logger.LogWarning("JIT ARM verification timed out for rule {RuleId}.", grant.RuleId);
-                _ = context.Notifier.ShowAsync(
+                FireAndForget(context.Notifier.ShowAsync(
                     new InformationRequest(
                         Title:   "JIT Access Granted",
                         Message: "Access granted; verification timed out — it may still be propagating.\n" +
                                  expiry)
                     { Severity = NotificationSeverity.Info },
-                    CancellationToken.None);
+                    CancellationToken.None), "VerifyAndNotifyAsync notification");
                 break;
 
             case VerificationResult.Skipped:
                 context.Logger.LogInformation(
                     "JIT ARM verification skipped for {TargetType} rule {RuleId} (type not auto-verifiable).",
                     grant.TargetType, grant.RuleId);
-                _ = context.Notifier.ShowAsync(
+                FireAndForget(context.Notifier.ShowAsync(
                     new InformationRequest(
                         Title:   "JIT Access Granted",
                         Message: "Access granted. This resource type can't be auto-verified.\n" + expiry)
                     { Severity = NotificationSeverity.Info },
-                    CancellationToken.None);
+                    CancellationToken.None), "VerifyAndNotifyAsync notification");
                 break;
 
             case VerificationResult.Error:
             default:
                 context.Logger.LogWarning(
                     "JIT ARM verification could not complete for rule {RuleId}.", grant.RuleId);
-                _ = context.Notifier.ShowAsync(
+                FireAndForget(context.Notifier.ShowAsync(
                     new InformationRequest(
                         Title:   "JIT Access Granted",
                         Message: "Access granted; verification could not complete.\n" + expiry)
                     { Severity = NotificationSeverity.Info },
-                    CancellationToken.None);
+                    CancellationToken.None), "VerifyAndNotifyAsync notification");
                 break;
         }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Runs a task nobody awaits, and logs it if it faults.
+    /// </summary>
+    /// <remarks>
+    /// A bare <c>_ = SomeAsync()</c> drops the exception on the floor: the task
+    /// faults, nothing observes it, and the user sees a grant that silently
+    /// never happened or a toast that silently never appeared. Everything the
+    /// plugin starts without awaiting — the poll timer, menu invokes,
+    /// post-grant verification, every notification — goes through here so a
+    /// fault leaves a line in the host log instead of nothing at all.
+    /// </remarks>
+    private void FireAndForget(Task task, string operation)
+    {
+        // Capture the logger now rather than reading _context in the
+        // continuation: shutdown nulls _context, which is exactly when a
+        // cancelled-mid-flight task is most likely to fault.
+        var logger = _context?.Logger;
+
+        task.ContinueWith(
+            t => logger?.LogError(
+                t.Exception, "JIT: background operation '{Operation}' faulted.", operation),
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
 
     private static string FormatTimeRemaining(TimeSpan remaining)
     {
@@ -1522,10 +1616,18 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
 
         public JitUrlDiscoveryResult Urls        { get; set; } = JitUrlDiscoveryResult.Empty;
         public List<JitTarget>       Targets     { get; set; } = new();
-        public List<JitServerRule>   ServerRules { get; set; } = new();
         public DateTime              TargetsAt   { get; set; } = DateTime.MinValue;
         public DateTime              RulesAt     { get; set; } = DateTime.MinValue;
         public string?               CallerIp    { get; set; }
+
+        // Last known rules per function-app URL, so a deployment that fails one
+        // poll keeps its rules on screen instead of vanishing. ServerRules is
+        // the flattened view the menu and badge read; both are written together
+        // under Lock.
+        public Dictionary<string, List<JitServerRule>> RulesByUrl { get; } =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        public List<JitServerRule> ServerRules { get; set; } = new();
 
         // Once-then-quiet logging state for the rules poll, one gate per
         // function-app URL. Touched only inside PollTenantAsync while the
