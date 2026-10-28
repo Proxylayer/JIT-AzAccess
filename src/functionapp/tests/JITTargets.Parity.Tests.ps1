@@ -110,6 +110,27 @@ Describe 'Supported target-type parity' {
         ($missing -join ',') | Should -Be ''
     }
 
+    It 'every Remove handler falls back to a usable identifier when RuleIdentifier is blank' {
+        # Request-JITAccess writes its reservation row with an EMPTY
+        # RuleIdentifier, because only the grant knows what the handler
+        # actually used. Cleanup of an abandoned reservation therefore depends
+        # on every handler resolving a per-type key from the rest of the row:
+        # RowKey for a named rule, CallerIp for an IP-identified entry. A
+        # handler added without that fallback silently cannot clean up its own
+        # abandoned reservations.
+        $dir = Join-Path $PSScriptRoot '../Modules/JITTargets/Targets'
+        $bad = @()
+        foreach ($f in Get-ChildItem -Path $dir -Filter '*.ps1' -File) {
+            if ($f.BaseName -eq '_Shared') { continue }
+            $text = Get-Content $f.FullName -Raw
+            if ($text -notmatch 'function\s+Remove-JIT\w+') { continue }
+            if ($text -notmatch 'if \(\$Row\.RuleIdentifier\) \{ \$Row\.RuleIdentifier \} else \{ \$Row\.(RowKey|CallerIp) \}') {
+                $bad += $f.BaseName
+            }
+        }
+        ($bad -join ', ') | Should -Be ''
+    }
+
     It 'exports a Remove handler reachable for every supported type' {
         # Every type must resolve through the shared dispatcher to a command
         # that actually exists in the module.

@@ -167,6 +167,17 @@ Describe 'Revoke-JITAccess' {
 
     Context 'ownership and authorization' {
 
+        It "does not reveal an in-progress grant to a caller who doesn't own it" {
+            # Ownership is checked first, so a non-owner gets the 403 they are
+            # entitled to rather than confirmation that the rule exists and is
+            # mid-grant.
+            $global:__Row.State       = 'Pending'
+            $global:__Row.RequestedBy = 'bob@contoso.com'
+            . $script:RunScript -Request (New-Request)
+            $global:__Resp.StatusCode | Should -Be ([System.Net.HttpStatusCode]::Forbidden)
+            (Get-RespBody).status | Should -Not -Be 'InProgress'
+        }
+
         It 'refuses to revoke a reservation that is still being granted' {
             # State='Pending' means Request-JITAccess has claimed the slot and
             # is mid-flight against ARM. Removing the row now would race that
