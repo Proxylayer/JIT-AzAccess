@@ -450,10 +450,14 @@ Validation gate order: bearer present (401) -> JWT valid (403 `TokenValidationFa
 ≤ 500 chars (400) -> **RBAC** (403 `MissingJitRequesterRole`) -> caller IP determinable +
 not loopback + format (400) -> abuse checks.
 
-Abuse checks (`run.ps1:247-317`, **fail-closed** -> 503 on Storage error):
+Abuse checks (**fail-closed** -> 503 on a Storage error, and now evaluated inside a blob
+lease keyed `caller-<oid>` so they cannot be raced — see "Reservations" under JITRules):
 `JIT_MAX_RULES_PER_CALLER` (default 5) -> 429; `JIT_MAX_RULES_PER_RESOURCE` (default 20) ->
-429; cooldown (an active rule already exists for this caller+resource+sub) -> 409 with
-`existingRuleId`/`expiresUtc`.
+429; cooldown -> 409 with `existingRuleId`/`expiresUtc`, except where the active rule is
+for the SAME caller IP, which returns 200 `AlreadyActive` without extending the expiry
+(transport retries re-send the POST, and a grant that succeeded must not come back as a
+conflict). A request that finds a `State='Pending'` row for the same resource gets 409
+`InProgress`. Passing all three claims a reservation row before the ARM call.
 
 Rule id: `jit-<callerUser>-<8hex>` where `callerUser` = UPN local-part, alnum-only, lower,
 ≤20 chars (`run.ps1:322-326`). Port stored `'*'` when omitted.
@@ -535,11 +539,49 @@ Name from env `JIT_TABLE_NAME`, default `JITRules`. Created on demand by `Get-JI
 | `RequestedBy` | UPN (ownership + Get filter) |
 | `ExpiryUtc` | ISO-8601 `o` UTC — drives expiry + active filtering |
 | `Justification` | free-text or `''` |
+| `State` | `Pending` while a grant is in flight, `Active` once it lands. Absent on rows written before reservations existed, which reads as active |
+| `ReservedUtc` | ISO-8601 `o` UTC — when the slot was claimed (diagnostics only) |
 
-Written by `Add-JITTableRow` (`Request-JITAccess/run.ps1:538-551`); expiry refreshed by
-`Update-JITTableRow` (MERGE, `If-Match:*`; `Request-JITAccess/run.ps1:470`); deleted by
-`Remove-JITTableRow` (Revoke `run.ps1:227`, timer `run.ps1:178`); read by `Get-JITTableRows`
-(Get, Revoke lookup, abuse checks, timer scan). Helpers: `JITHelpers.psm1:796-867`.
+#### Reservations
+
+A row is now inserted **before** the ARM call, not after it. `Request-JITAccess` takes a
+blob lease keyed on the caller (`caller-<oid>`), re-reads the per-caller and per-resource
+counts and the cooldown, and — if they pass — inserts the row immediately with
+`State='Pending'` and a short `ExpiryUtc` (`JIT_RESERVATION_TTL_MINUTES`, default 15).
+The lease is released before the grant runs.
+
+That ordering is the point. The limits used to be read in one place and the row written
+several hundred lines later, after a call that can take minutes, so two concurrent
+requests from one caller both passed the check and both inserted — the caller ended up
+over the limit. Claiming the slot inside the same lock that reads the counts makes the
+two steps atomic. The lock deliberately does **not** span the ARM call: the lease is 60
+seconds with no renewal, so a lock held across an LRO-backed grant would expire mid-flight
+and stop excluding anything.
+
+Lifecycle:
+
+* grant succeeds → `Update-JITTableRow` promotes the row to `State='Active'`, writes the
+  real `ExpiryUtc`, and records the identifier the handler actually used;
+* grant fails, is skipped (`SkippedOpen`), extends an existing row, or finds an
+  externally-managed entry → the reservation is deleted;
+* the worker dies in between → nothing special happens, which is the design: the row is
+  an ordinary one with a short expiry, so `Remove-ExpiredRules` picks it up, attempts the
+  removal (idempotent — the handlers answer `NotFound` if the rule was never created) and
+  deletes it.
+
+`Get-JITRules` filters `State='Pending'` out (the rule may not exist yet, so listing it
+would report access the caller does not have) and `Revoke-JITAccess` answers 409
+`InProgress` for one rather than racing the grant that owns it.
+
+**Residual, stated plainly:** the lock is per caller, so the per-**resource** limit is
+still best-effort when two *different* callers race on one resource. Closing that needs a
+second lease, ordered caller-then-resource to stay deadlock-free. The per-caller limit and
+the cooldown are exact.
+
+Written by `Add-JITTableRow` (the reservation) and promoted by `Update-JITTableRow`
+(MERGE, `If-Match:*`), which also refreshes expiry on the extend path; deleted by
+`Remove-JITTableRow` (reservation release, Revoke, timer); read by `Get-JITTableRows`
+(Get, Revoke lookup, abuse checks, timer scan). Helpers: `JITHelpers.psm1`.
 
 ### JITRulesAudit — append-only lifecycle history (one row per event)
 Name from env `JIT_AUDIT_TABLE_NAME`, default `JITRulesAudit`
@@ -640,6 +682,11 @@ everything else is derived at runtime. **Env var wins whenever set.**
 | `JIT_NSG_PRIORITY_MAX` | `3900` | Request `:42` |
 | `JIT_MAX_RULES_PER_CALLER` | `5` | Request `:43` |
 | `JIT_MAX_RULES_PER_RESOURCE` | `20` | Request `:44` |
+| `JIT_RESERVATION_TTL_MINUTES` | `15` — how long a `State='Pending'` reservation stays valid before the timer reaps it. Must exceed `functionTimeout` (9 min) so a slow grant is not reaped mid-flight | Request `:46` |
+| `JIT_TRUSTED_XFF_DEPTH` | `0` — trusted proxies in front of the app; the caller IP is read that many entries in from the RIGHT of `X-Forwarded-For` | `Resolve-JITCallerIp` |
+| `JIT_ALLOWED_CLIENT_APPIDS` | unset — when set, the token's `appid`/`azp` must be in the list | `Invoke-JwtValidation` |
+| `JIT_REMOVE_STUCK_THRESHOLD` | `12` — failed removal attempts before a row raises `JITRemoveStuck` | timer |
+| `JIT_CLEANUP_BUDGET_SECONDS` | `430` — the timer stops starting new removals past this, and logs what it deferred | timer |
 | `AZURETRAY_APP_REGISTRATION_OBJECT_ID` | (set by Deploy.ps1 Step 0) — object id of the AzureTray app reg | profile `:20-22`, `Get-AzureTrayAppRegTags` `:575` |
 | `AZURETRAY_APP_REGISTRATION_NAME` | informational, template `:176` | (scripts only) |
 | `AzureWebJobsStorage__accountName` | storage ACCOUNT NAME, not a connection string — identity-based access, since the account has `allowSharedKeyAccess: false` (template appSettings) | `Get-StorageParts` `HttpHelpers.psm1:220-238` |

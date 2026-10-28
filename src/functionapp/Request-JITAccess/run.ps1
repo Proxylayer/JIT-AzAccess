@@ -1,4 +1,4 @@
-﻿# Request-jitazaccess/run.ps1
+# Request-jitazaccess/run.ps1
 #
 # HTTP POST — Grants a caller's IP address temporary access on a supported target resource.
 #
@@ -42,6 +42,12 @@ $priorityMin         = if ($env:JIT_NSG_PRIORITY_MIN)      { [int]$env:JIT_NSG_P
 $priorityMax         = if ($env:JIT_NSG_PRIORITY_MAX)      { [int]$env:JIT_NSG_PRIORITY_MAX }  else { 3900 }
 $maxRulesPerCaller   = if ($env:JIT_MAX_RULES_PER_CALLER)   { [int]$env:JIT_MAX_RULES_PER_CALLER }   else { 5 }
 $maxRulesPerResource = if ($env:JIT_MAX_RULES_PER_RESOURCE) { [int]$env:JIT_MAX_RULES_PER_RESOURCE } else { 20 }
+
+# How long a reservation row stays valid before the expiry timer treats it as
+# abandoned and cleans it up. Must comfortably exceed the function timeout
+# (host.json functionTimeout, 9 minutes) so a slow-but-live grant is never
+# reaped out from under itself.
+$reservationTtlMinutes = if ($env:JIT_RESERVATION_TTL_MINUTES) { [int]$env:JIT_RESERVATION_TTL_MINUTES } else { 15 }
 
 #endregion
 
@@ -264,121 +270,285 @@ Write-Host "Caller IP: $callerIp"
 
 #endregion
 
-#region ── 3b. Abuse prevention ─────────────────────────────────────────────────────────────
+#region ── 3b. Abuse prevention (serialised per caller) ─────────────────────────────────────
 
-try {
-    Get-JITTableName -TableName $tableName | Out-Null
-
-    # Count active (non-expired) rules for this caller across all resources
-    $callerActive = (Get-JITTableRows -TableName $tableName `
-        -Filter "RequestedBy eq '$oDataRequestedBy'") |
-        Where-Object { $e = ConvertTo-JITUtc $_.ExpiryUtc; $e -and $e -gt [DateTime]::UtcNow }
-
-    if ($callerActive.Count -ge $maxRulesPerCaller) {
-        Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp $callerIp `
-            -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
-            -SubscriptionId $subscriptionId -DenyReason 'MaxRulesPerCallerExceeded' `
-            -Extra @{ activeCount = $callerActive.Count; limit = $maxRulesPerCaller }
-        Write-JsonResponse -Status TooManyRequests -Body @{
-            error       = "You have $($callerActive.Count) active JIT rule(s). Maximum is $maxRulesPerCaller."
-            activeRules = $callerActive.Count
-        }
-        return
-    }
-
-    # Count active rules on the target resource
-    $resourceActive = (Get-JITTableRows -TableName $tableName `
-        -Filter "ResourceName eq '$resourceName' and ResourceRg eq '$resourceGroup'") |
-        Where-Object { $e = ConvertTo-JITUtc $_.ExpiryUtc; $e -and $e -gt [DateTime]::UtcNow }
-
-    if ($resourceActive.Count -ge $maxRulesPerResource) {
-        Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp $callerIp `
-            -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
-            -SubscriptionId $subscriptionId -DenyReason 'MaxRulesPerResourceExceeded' `
-            -Extra @{ activeCount = $resourceActive.Count; limit = $maxRulesPerResource }
-        Write-JsonResponse -Status TooManyRequests -Body @{
-            error       = "Resource '$resourceName' has $($resourceActive.Count) active JIT rule(s). Maximum is $maxRulesPerResource."
-            activeRules = $resourceActive.Count
-        }
-        return
-    }
-
-    # Cooldown: block re-requesting the same resource while a rule is already active for this caller.
-    $cooldownRow = ($callerActive | Where-Object {
-        $_.ResourceName -eq $resourceName -and $_.SubscriptionId -eq $subscriptionId
-    } | Select-Object -First 1)
-
-    if ($cooldownRow) {
-        # IDEMPOTENCY. The AzureTray host wraps its HTTP clients in a resilience
-        # handler that RETRIES, and the plugin can neither see nor disable it
-        # (AzureTray Program.cs: 30s per attempt, 100s total). A slow
-        # LRO-backed grant therefore gets re-sent — and the second attempt
-        # lands here, finds the row the FIRST attempt just wrote, and used to
-        # answer 409. A grant that actually succeeded was reported to the user
-        # as a conflict. Double-clicking the menu item did the same thing.
-        #
-        # So: if the active rule is for the SAME caller IP, the caller already
-        # has exactly what they asked for. Return it as success rather than an
-        # error. Matching on IP rather than a time window also covers the
-        # genuine conflict — if their IP has CHANGED, the existing rule does
-        # not help them and the cooldown below is the right answer.
-        #
-        # Deliberately does NOT extend the expiry: a retried request must be
-        # indistinguishable from the original, not a way to roll the clock.
-        if ($cooldownRow.CallerIp -eq $callerIp) {
-            Write-Host "Request for '$resourceName' already satisfied by rule '$($cooldownRow.RowKey)' for $callerIp — returning it (idempotent)."
-            Write-JsonResponse -Status OK -Body @{
-                status         = 'AlreadyActive'
-                message        = 'An active JIT rule already covers this resource for your IP.'
-                ruleId         = $cooldownRow.RowKey
-                ruleIdentifier = $cooldownRow.RuleIdentifier
-                targetType     = $cooldownRow.TargetType
-                resourceName   = $resourceName
-                resourceGroup  = $resourceGroup
-                subscriptionId = $subscriptionId
-                callerIp       = $callerIp
-                expiresUtc     = $cooldownRow.ExpiryUtc
-                requestedBy    = $requestedBy
-            }
-            return
-        }
-
-        Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp $callerIp `
-            -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
-            -SubscriptionId $subscriptionId -DenyReason 'CooldownActive' `
-            -Extra @{ existingRuleId = $cooldownRow.RowKey; expiresUtc = $cooldownRow.ExpiryUtc; existingCallerIp = $cooldownRow.CallerIp }
-        Write-JsonResponse -Status Conflict -Body @{
-            error          = 'An active JIT rule already exists for this resource, granted to a different IP address. Wait for it to expire or revoke it first.'
-            existingRuleId = $cooldownRow.RowKey
-            expiresUtc     = $cooldownRow.ExpiryUtc
-        }
-        return
-    }
-}
-catch {
-    # Fail CLOSED: if the rules table can't be read we cannot verify the
-    # per-caller / per-resource limits or the cooldown, so deny rather than
-    # allow unbounded rule creation during a Storage outage.
-    Write-Error "Abuse-prevention check failed: $_"
-    Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp $callerIp `
-        -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
-        -SubscriptionId $subscriptionId -DenyReason 'AbuseCheckError'
-    Write-JsonResponse -Status ServiceUnavailable -Body @{
-        error = 'Could not verify request limits right now. Please retry shortly.'
-    }
-    return
-}
-
-# Embed the caller's username in the rule id so rules are identifiable at a
-# glance and in the portal (e.g. jit-jbland-cc5d7ef8). Take the local part of
-# the UPN, strip to alphanumerics (NSG/SQL rule names disallow most symbols),
-# lowercase, and cap the length so the full name stays within Azure's limits.
+# Identity for this grant. Computed BEFORE the limit check, because the
+# reservation row that closes the race below is written under this rule id.
+#
+# The username is embedded so rules are identifiable at a glance and in the
+# portal (e.g. jit-jbland-cc5d7ef8): take the local part of the UPN, strip to
+# alphanumerics (NSG/SQL rule names disallow most symbols), lowercase, and cap
+# the length so the full name stays within Azure's limits.
 $callerUser = ((($requestedBy -split '@')[0]) -replace '[^A-Za-z0-9]', '').ToLowerInvariant()
 if (-not $callerUser)            { $callerUser = 'user' }
 if ($callerUser.Length -gt 20)   { $callerUser = $callerUser.Substring(0, 20) }
 $ruleId  = "jit-$callerUser-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
 $portVal = if ($port) { $port } else { '*' }
 $expiry  = [DateTime]::UtcNow.AddHours($durationHours)
+
+# THE RACE THIS CLOSES
+#
+# The limits used to be evaluated here and the row written several hundred
+# lines later, after an ARM call that can take minutes. Two requests from one
+# caller both read "4 active, limit 5", both passed, both granted, and both
+# inserted - so the caller ended up with 6. The cooldown had the same hole:
+# two simultaneous requests for one resource both saw no existing rule.
+#
+# The fix is to make "check the limits" and "claim a slot" one atomic step.
+# Inside a lock keyed on the caller, re-read the counts and, if they pass,
+# immediately insert a RESERVATION row: a normal JITRules row carrying
+# State='Pending' and a short ExpiryUtc. A concurrent request for the same
+# caller blocks on the lock, then counts the reservation and is refused.
+#
+# The lock does NOT span the ARM call. That is deliberate: the lease is 60
+# seconds with no renewal, so a lock held across an LRO-backed grant would
+# expire mid-flight and stop excluding anything. Here the critical section is
+# two table reads and one insert.
+#
+# A reservation that is never finalised (worker killed between the grant and
+# the finalise) needs no special handling: it is an ordinary row with a short
+# expiry, so Remove-ExpiredRules picks it up, attempts the removal - which is
+# idempotent and answers NotFound if the rule was never created - and deletes
+# the row. That is strictly better than the pre-reservation behaviour, where
+# the same crash left a live rule with nothing tracking it at all.
+#
+# RESIDUAL, stated plainly: the lock is per caller, so the per-RESOURCE limit
+# is still only best-effort when two DIFFERENT callers race on one resource.
+# Closing that needs a second lock, ordered caller-then-resource to stay
+# deadlock-free, and it is a bigger change than this one. The per-caller limit
+# and the cooldown - the two the abuse-prevention design actually leans on -
+# are now exact.
+$callerLockName = "caller-$($callerObjectId -replace '[^A-Za-z0-9-]', '')"
+
+try {
+    Get-JITTableName -TableName $tableName | Out-Null
+
+    # The scriptblock runs in a child scope, so it RETURNS a decision rather
+    # than writing the response itself; everything below acts on that outside
+    # the lock, keeping the critical section as short as possible.
+    $gate = Invoke-WithBlobLock -LockName $callerLockName -Action {
+
+        $nowUtc = [DateTime]::UtcNow
+
+        # Every not-yet-expired row this caller holds, reservations included -
+        # counting those is the whole point.
+        $callerActive = @(Get-JITTableRows -TableName $tableName `
+            -Filter "RequestedBy eq '$oDataRequestedBy'" |
+            Where-Object { $e = ConvertTo-JITUtc $_.ExpiryUtc; $e -and $e -gt $nowUtc })
+
+        if ($callerActive.Count -ge $maxRulesPerCaller) {
+            return @{ Verdict = 'DenyCallerLimit'; Count = $callerActive.Count }
+        }
+
+        $resourceActive = @(Get-JITTableRows -TableName $tableName `
+            -Filter "ResourceName eq '$resourceName' and ResourceRg eq '$resourceGroup'" |
+            Where-Object { $e = ConvertTo-JITUtc $_.ExpiryUtc; $e -and $e -gt $nowUtc })
+
+        if ($resourceActive.Count -ge $maxRulesPerResource) {
+            return @{ Verdict = 'DenyResourceLimit'; Count = $resourceActive.Count }
+        }
+
+        # Cooldown / idempotency: does this caller already hold something for
+        # this exact resource?
+        $existing = $callerActive | Where-Object {
+            $_.ResourceName -eq $resourceName -and $_.SubscriptionId -eq $subscriptionId
+        } | Select-Object -First 1
+
+        if ($existing) {
+            if ($existing.State -eq 'Pending') {
+                # Another request for the same resource is mid-grant. Neither
+                # "you already have it" nor "409 conflict" is true yet.
+                return @{ Verdict = 'InProgress'; Row = $existing }
+            }
+            if ($existing.CallerIp -eq $callerIp) {
+                # IDEMPOTENCY. The AzureTray host wraps its HTTP clients in a
+                # resilience handler that RETRIES, and the plugin can neither
+                # see nor disable it (AzureTray Program.cs: 30s per attempt,
+                # 100s total). A slow LRO-backed grant therefore gets re-sent,
+                # and the second attempt lands here and finds the row the
+                # first one wrote. Answering 409 reported a grant that
+                # actually succeeded as a conflict. Double-clicking the menu
+                # item did the same thing.
+                #
+                # Matching on IP rather than a time window also covers the
+                # genuine conflict: if their IP has CHANGED, the existing rule
+                # does not help them and the cooldown below is right.
+                #
+                # Deliberately does NOT extend the expiry: a retried request
+                # must be indistinguishable from the original, not a way to
+                # roll the clock.
+                return @{ Verdict = 'Idempotent'; Row = $existing }
+            }
+            return @{ Verdict = 'Cooldown'; Row = $existing }
+        }
+
+        # Claim the slot. Short expiry so an abandoned reservation clears
+        # itself; the real expiry is written when the grant is finalised.
+        Add-JITTableRow -TableName $tableName -Properties @{
+            PartitionKey   = $subscriptionId
+            RowKey         = $ruleId
+            TargetType     = $targetType
+            ResourceName   = $resourceName
+            ResourceRg     = $resourceGroup
+            SubscriptionId = $subscriptionId
+            RuleIdentifier = $ruleId
+            CallerIp       = $callerIp
+            Port           = $portVal
+            RequestedBy    = $requestedBy
+            ExpiryUtc      = $nowUtc.AddMinutes($reservationTtlMinutes).ToString('o')
+            Justification  = if ($justification) { $justification } else { '' }
+            State          = 'Pending'
+            ReservedUtc    = $nowUtc.ToString('o')
+        }
+
+        return @{ Verdict = 'Reserved' }
+    }
+}
+catch {
+    # Fail CLOSED. If the table cannot be read, or the lock cannot be taken,
+    # the limits and the cooldown are unverifiable - so deny rather than allow
+    # unbounded rule creation during a Storage outage.
+    Write-Error "Abuse-prevention check failed [correlationId=$correlationId]: $_"
+    Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp $callerIp `
+        -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
+        -SubscriptionId $subscriptionId -DenyReason 'AbuseCheckError' `
+        -Extra @{ correlationId = $correlationId }
+    Write-JsonResponse -Status ServiceUnavailable -Body @{
+        error         = 'Could not verify request limits right now. Please retry shortly.'
+        correlationId = $correlationId
+    }
+    return
+}
+
+# A scriptblock returns everything it emits, so if any statement inside the
+# gate ever stops swallowing its output $gate silently becomes an array and
+# $gate.Verdict becomes $null - which would fall straight through the switch
+# and grant. Normalise, then refuse anything unrecognised. This gate decides
+# whether a firewall opens; it does not get to fail open on a typo.
+if ($gate -is [System.Array]) { $gate = $gate[-1] }
+
+if (-not $gate -or -not $gate.Verdict) {
+    Write-Error "Abuse-prevention gate returned no verdict [correlationId=$correlationId]."
+    Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp $callerIp `
+        -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
+        -SubscriptionId $subscriptionId -DenyReason 'AbuseCheckError' `
+        -Extra @{ correlationId = $correlationId; reason = 'no-verdict' }
+    Write-JsonResponse -Status ServiceUnavailable -Body @{
+        error         = 'Could not verify request limits right now. Please retry shortly.'
+        correlationId = $correlationId
+    }
+    return
+}
+
+switch ($gate.Verdict) {
+
+    'DenyCallerLimit' {
+        Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp $callerIp `
+            -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
+            -SubscriptionId $subscriptionId -DenyReason 'MaxRulesPerCallerExceeded' `
+            -Extra @{ activeCount = $gate.Count; limit = $maxRulesPerCaller }
+        Write-JsonResponse -Status TooManyRequests -Body @{
+            error       = "You have $($gate.Count) active JIT rule(s). Maximum is $maxRulesPerCaller."
+            activeRules = $gate.Count
+        }
+        return
+    }
+
+    'DenyResourceLimit' {
+        Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp $callerIp `
+            -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
+            -SubscriptionId $subscriptionId -DenyReason 'MaxRulesPerResourceExceeded' `
+            -Extra @{ activeCount = $gate.Count; limit = $maxRulesPerResource }
+        Write-JsonResponse -Status TooManyRequests -Body @{
+            error       = "Resource '$resourceName' has $($gate.Count) active JIT rule(s). Maximum is $maxRulesPerResource."
+            activeRules = $gate.Count
+        }
+        return
+    }
+
+    'InProgress' {
+        Write-Host "Request for '$resourceName' is already being granted under '$($gate.Row.RowKey)' - refusing the duplicate."
+        Write-JsonResponse -Status Conflict -Body @{
+            error          = 'A JIT request for this resource is already in progress. Retry in a moment.'
+            existingRuleId = $gate.Row.RowKey
+        }
+        return
+    }
+
+    'Idempotent' {
+        $row = $gate.Row
+        Write-Host "Request for '$resourceName' already satisfied by rule '$($row.RowKey)' for $callerIp - returning it (idempotent)."
+        Write-JsonResponse -Status OK -Body @{
+            status         = 'AlreadyActive'
+            message        = 'An active JIT rule already covers this resource for your IP.'
+            ruleId         = $row.RowKey
+            ruleIdentifier = $row.RuleIdentifier
+            targetType     = $row.TargetType
+            resourceName   = $resourceName
+            resourceGroup  = $resourceGroup
+            subscriptionId = $subscriptionId
+            callerIp       = $callerIp
+            expiresUtc     = $row.ExpiryUtc
+            requestedBy    = $requestedBy
+        }
+        return
+    }
+
+    'Cooldown' {
+        $row = $gate.Row
+        Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp $callerIp `
+            -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
+            -SubscriptionId $subscriptionId -DenyReason 'CooldownActive' `
+            -Extra @{ existingRuleId = $row.RowKey; expiresUtc = $row.ExpiryUtc; existingCallerIp = $row.CallerIp }
+        Write-JsonResponse -Status Conflict -Body @{
+            error          = 'An active JIT rule already exists for this resource, granted to a different IP address. Wait for it to expire or revoke it first.'
+            existingRuleId = $row.RowKey
+            expiresUtc     = $row.ExpiryUtc
+        }
+        return
+    }
+
+    'Reserved' {
+        # The only verdict that continues to the grant below.
+    }
+
+    default {
+        # Unreachable unless a verdict is added above without a branch here.
+        # Deny rather than fall through into a grant.
+        Write-Error "Abuse-prevention gate returned unknown verdict '$($gate.Verdict)' [correlationId=$correlationId]."
+        Write-JsonResponse -Status ServiceUnavailable -Body @{
+            error         = 'Could not verify request limits right now. Please retry shortly.'
+            correlationId = $correlationId
+        }
+        return
+    }
+}
+
+# From here the reservation row exists and this request owns it. Every exit
+# path below must either finalise it or remove it - leaving it behind would
+# consume one of the caller's slots until it expires.
+Write-Host "Reserved slot '$ruleId' for $requestedBy on '$resourceName'."
+
+# Releases the slot claimed above. Called on every path that does NOT end in a
+# tracked rule: a failed grant, and the three outcomes that deliberately leave
+# nothing to revoke (SkippedOpen, an extend of an existing row, and an
+# externally-managed whitelist entry).
+function Remove-JITReservation {
+    param([Parameter(Mandatory)][string]$Why)
+    try {
+        Remove-JITTableRow -TableName $tableName -PartitionKey $subscriptionId -RowKey $ruleId
+        Write-Host "  Released reservation '$ruleId' ($Why)."
+    }
+    catch {
+        # Not fatal. The reservation carries a short expiry, so the timer
+        # clears it; until then it costs the caller one slot. Saying so beats
+        # failing a request whose access decision has already been made.
+        Write-Warning "Could not release reservation '$ruleId' ($Why); it will expire on its own: $_"
+    }
+}
+
+#endregion
+
 
 try {
     $addParams = @{
@@ -432,6 +602,7 @@ catch {
     if ($errMsg -like 'PRIVATE_SERVER_REJECTED:*') {
         $clientMsg = ($errMsg -replace '^PRIVATE_SERVER_REJECTED:\s*', '')
         Write-Error "JIT target modification denied (private server): $clientMsg"
+        Remove-JITReservation -Why 'private server rejected'
         Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp $callerIp `
             -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
             -SubscriptionId $subscriptionId -RuleId $ruleId -DenyReason 'PrivateServerNotSupported'
@@ -442,6 +613,7 @@ catch {
     # Log the detail; return only the correlation id. The exception text can
     # carry ARM URLs, resource ids and raw resource-provider error bodies.
     Write-Error "JIT target modification failed [correlationId=$correlationId]: $_"
+    Remove-JITReservation -Why 'grant failed'
     Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp $callerIp `
         -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
         -SubscriptionId $subscriptionId -RuleId $ruleId -DenyReason 'TargetModificationFailed' `
@@ -479,6 +651,8 @@ switch ($grantStatus) {
         # open cluster, or an unconfigured resource firewall). Adding a single
         # Allow rule would have *restricted* it, so we intentionally did nothing —
         # the caller already has access. No JITRules row, no scheduled removal.
+        Remove-JITReservation -Why 'target already open'
+
         try {
             Add-JITAuditRow -Action 'SkippedOpen' `
                 -SubscriptionId $subscriptionId -TargetType $targetType `
@@ -514,13 +688,22 @@ switch ($grantStatus) {
             $filter = "PartitionKey eq '$subscriptionId' and ResourceName eq '$resourceName' " +
                       "and ResourceRg eq '$resourceGroup' and TargetType eq '$targetType' " +
                       "and CallerIp eq '$callerIp'"
-            $existingRow = Get-JITTableRows -TableName $tableName -Filter $filter | Select-Object -First 1
+            # Excluding $ruleId matters: this request's own reservation row
+            # matches that filter exactly, and treating it as the pre-existing
+            # rule would "extend" the row we are about to finalise and report
+            # the grant as an extension of itself.
+            $existingRow = Get-JITTableRows -TableName $tableName -Filter $filter |
+                Where-Object { $_.RowKey -ne $ruleId } | Select-Object -First 1
         }
         catch {
             Write-Warning "AlreadyPresent lookup failed for '$resourceName'/${callerIp}: $_"
         }
 
         if ($existingRow) {
+            # A pre-existing JIT row covers this already, so the slot this
+            # request claimed is not needed.
+            Remove-JITReservation -Why 'extending an existing rule'
+
             # Ours — refresh the expiry in place (no duplicate row).
             try {
                 Update-JITTableRow -TableName $tableName `
@@ -557,6 +740,8 @@ switch ($grantStatus) {
         }
 
         # External/manual entry — leave it alone and track nothing.
+        Remove-JITReservation -Why 'whitelist entry is not JIT-managed'
+
         try {
             Add-JITAuditRow -Action 'AlreadyExternal' `
                 -SubscriptionId $subscriptionId -TargetType $targetType `
@@ -589,32 +774,33 @@ switch ($grantStatus) {
             -Extra @{ expiresUtc = $expiry.ToString('o'); port = $portVal; durationHours = $durationHours; justification = $justification }
 
         try {
-            Get-JITTableName -TableName $tableName | Out-Null
-
-            Add-JITTableRow -TableName $tableName -Properties @{
-                PartitionKey   = $subscriptionId
-                RowKey         = $ruleId
-                TargetType     = $targetType
-                ResourceName   = $resourceName
-                ResourceRg     = $resourceGroup
-                SubscriptionId = $subscriptionId
-                RuleIdentifier = $ruleIdentifier
-                CallerIp       = $callerIp
-                Port           = $portVal
-                RequestedBy    = $requestedBy
-                ExpiryUtc      = $expiry.ToString('o')
-                Justification  = if ($justification) { $justification } else { '' }
-            }
+            # FINALISE the reservation rather than insert: the row already
+            # exists from the slot claimed in region 3b. This promotes it from
+            # Pending to Active, swaps the short reservation TTL for the real
+            # expiry, and records the identifier the handler actually used
+            # (which can differ from $ruleId - array-type resources identify
+            # the entry by IP).
+            Update-JITTableRow -TableName $tableName `
+                -PartitionKey $subscriptionId -RowKey $ruleId `
+                -Properties @{
+                    State          = 'Active'
+                    RuleIdentifier = $ruleIdentifier
+                    ExpiryUtc      = $expiry.ToString('o')
+                }
         }
         catch {
-            # WORST CASE: the rule is LIVE on the resource but nothing is
-            # tracking it, so Remove-ExpiredRules will never revoke it — a
-            # firewall hole open forever. Previously this was a Write-Warning
-            # and the endpoint still answered "200 Created".
+            # The rule is LIVE on the resource and could not be promoted out
+            # of Pending. Undo the grant rather than report success for access
+            # whose expiry was never recorded. (Before the compensating remove
+            # existed this was a Write-Warning and the endpoint still answered
+            # "200 Created".)
             #
-            # Undo the grant instead of reporting success for access that can
-            # never expire.
-            Write-Error "Table write failed for rule '$ruleIdentifier' [correlationId=$correlationId]: $_"
+            # Note what the reservation buys here: the row from region 3b is
+            # still in the table with its short TTL and RuleIdentifier set to
+            # $ruleId, so even if everything below fails the rule is TRACKED
+            # and Remove-ExpiredRules will attempt it again at that expiry.
+            # The pre-reservation version of this path left nothing at all.
+            Write-Error "Could not finalise reservation for rule '$ruleIdentifier' [correlationId=$correlationId]: $_"
 
             # Shaped like a JITRules row so the Remove handlers read it the
             # same way the timer and Revoke-JITAccess do.
@@ -651,6 +837,11 @@ switch ($grantStatus) {
             }
 
             if ($rolledBack) {
+                # The rule is off the resource, so the slot should not stay
+                # claimed. If this delete fails the row expires on its own and
+                # the timer finds nothing to remove - safe either way.
+                Remove-JITReservation -Why 'grant rolled back'
+
                 Write-JITAuditEvent -EventType JITGrantRolledBack -Caller $requestedBy -CallerIp $callerIp `
                     -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
                     -SubscriptionId $subscriptionId -RuleId $ruleId `
@@ -677,16 +868,22 @@ switch ($grantStatus) {
                 }
             }
             else {
-                # Nothing else in the system knows this rule exists. Loudest
-                # possible signal: a human has to remove it by hand.
+                # The rule is still live. KEEP the reservation row: with the
+                # grant un-undoable it is the only record that the rule
+                # exists, and leaving it means the expiry timer will retry the
+                # removal rather than the rule being lost entirely. Still the
+                # loudest possible signal, because a 15-minute retry is not a
+                # substitute for someone looking.
                 Write-JITAuditEvent -EventType JITOrphanedGrant -Caller $requestedBy -CallerIp $callerIp `
                     -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
                     -SubscriptionId $subscriptionId -RuleId $ruleId `
                     -Extra @{ correlationId = $correlationId; reason = 'RulesTableWriteFailed'; rollback = 'failed' }
                 Write-Error ("ORPHANED JIT GRANT: rule '$ruleIdentifier' ($targetType) is live on " +
-                             "'$resourceName' in subscription $subscriptionId for IP $callerIp, is NOT " +
-                             "tracked in '$tableName', and could not be rolled back. It will never expire. " +
-                             "Remove it manually. [correlationId=$correlationId]")
+                             "'$resourceName' in subscription $subscriptionId for IP $callerIp and could " +
+                             "NOT be rolled back. Its reservation row '$ruleId' is still in '$tableName' " +
+                             "with a short expiry, so the cleanup timer will retry the removal - but that " +
+                             "retry is a backstop, not a fix. Confirm the rule is gone, by hand if " +
+                             "necessary. [correlationId=$correlationId]")
 
                 try {
                     Add-JITAuditRow -Action 'OrphanedGrant' `
