@@ -6,41 +6,26 @@
 #   • Table record is deleted only after a successful resource removal
 #   • Failed removal leaves the table record so it retries on the next tick
 #   • Correct audit events are written (JITExpired / JITRemoveFailed)
-#   • Remove-JITNsgRule calls the Azure SDK correctly and is idempotent
+#   • Remove-JITNsgRule issues the right ARM DELETE and is idempotent
 #
-# Pester 3.4.0 compatible — Assert-MockCalled uses -Scope It to prevent
-# mock call counts from accumulating across It blocks in the same Describe.
+# Pester 5+ (setup in BeforeAll, `Should -Verb` syntax). `Should -Invoke` uses
+# -Scope It so mock call counts do not accumulate across It blocks.
+#
+# There are no Az.* stubs here any more. This app makes every Azure call over
+# REST (see the no-Az-module policy at the top of HttpHelpers.psm1), so tests
+# that mocked Get-AzTableRow / Remove-AzTableRow / Get-AzNetworkSecurityGroup
+# were asserting against an API the code had already stopped calling — they
+# were the bulk of the long-standing red in this suite (TODO-0006). The table
+# layer is Get-JITTableName / Get-JITTableRows / Remove-JITTableRow, and NSG
+# removal is a single ARM DELETE through Invoke-ArmRest.
 #
 # Run:  Invoke-Pester ./src/functionapp/tests/Remove-ExpiredRules.Tests.ps1
 
+BeforeAll {
+
+Import-Module "$PSScriptRoot/../Modules/HttpHelpers/HttpHelpers.psm1" -Force -DisableNameChecking
 Import-Module "$PSScriptRoot/../Modules/JITHelpers/JITHelpers.psm1" -Force
 Import-Module "$PSScriptRoot/../Modules/JITTargets/JITTargets.psm1" -Force
-
-# ── Azure cmdlet stubs ────────────────────────────────────────────────────────
-# Pester 3 can only mock commands that already exist in the session.
-# The Az cmdlets below are not loaded in the test environment, so we declare
-# lightweight stubs here that the Mocks in BeforeEach will replace at runtime.
-if (-not (Get-Command Get-AzTableRow              -ErrorAction SilentlyContinue)) { function global:Get-AzTableRow              { } }
-if (-not (Get-Command Remove-AzTableRow           -ErrorAction SilentlyContinue)) { function global:Remove-AzTableRow           { } }
-if (-not (Get-Command Set-AzContext               -ErrorAction SilentlyContinue)) { function global:Set-AzContext               { } }
-if (-not (Get-Command Get-AzNetworkSecurityGroup  -ErrorAction SilentlyContinue)) { function global:Get-AzNetworkSecurityGroup  { } }
-
-# These two stubs are ALWAYS redefined (without the -not check) because the real
-# Az cmdlets have strongly-typed [PSNetworkSecurityGroup] pipeline parameters that
-# reject PSCustomObject mocks.  Untyped stubs let Pester intercept pipeline calls.
-function global:Remove-AzNetworkSecurityRuleConfig {
-    [CmdletBinding()] param(
-        [Parameter(ValueFromPipeline=$true)] $NetworkSecurityGroup,
-        [string]$Name, [string]$ErrorAction
-    )
-    process { return $NetworkSecurityGroup }
-}
-function global:Set-AzNetworkSecurityGroup {
-    [CmdletBinding()] param(
-        [Parameter(ValueFromPipeline=$true)] $NetworkSecurityGroup
-    )
-    process { return $NetworkSecurityGroup }
-}
 
 $script:RunScript = "$PSScriptRoot/../Remove-ExpiredRules/run.ps1"
 
@@ -67,22 +52,24 @@ function script:New-ActiveRow {
     return $row
 }
 
+}   # end BeforeAll
+
 # ─────────────────────────────────────────────────────────────────────────────
 Describe 'Remove-ExpiredRules timer trigger' {
 
     BeforeEach {
-        $script:MockTable = [PSCustomObject]@{ Name = 'JITRules' }
-
         # Suppress the run.ps1's own Import-Module calls
         Mock Import-Module { }
 
-        Mock Get-JITCloudTable             { return $script:MockTable }
-        Mock Get-AzTableRow                { return @() }
+        # The table helpers run.ps1 actually calls (all Invoke-TableRest-backed),
+        # so nothing touches storage.
+        Mock Get-JITTableName              { return 'JITRules' }
+        Mock Get-JITTableRows              { return @() }
+        Mock Remove-JITTableRow            { }
         Mock Remove-JITNsgRule             { }
         Mock Remove-JITSqlFirewallRule     { }
         Mock Remove-JITStorageNetworkRule  { }
         Mock Remove-JITKeyVaultNetworkRule { }
-        Mock Remove-AzTableRow             { }
         Mock Write-JITAuditEvent           { }
 
         $Timer = [PSCustomObject]@{ IsPastDue = $false }
@@ -91,21 +78,21 @@ Describe 'Remove-ExpiredRules timer trigger' {
     # ── Happy path — NSG ──────────────────────────────────────────────────────
 
     It 'calls Remove-JITNsgRule for an expired NSG rule' {
-        Mock Get-AzTableRow { return @(New-ExpiredRow -TargetType 'nsg') }
+        Mock Get-JITTableRows { return @(New-ExpiredRow -TargetType 'nsg') }
         . $script:RunScript
-        Assert-MockCalled Remove-JITNsgRule -Times 1 -Scope It
+        Should -Invoke -CommandName Remove-JITNsgRule -Times 1 -Scope It
     }
 
     It 'deletes the table record after a successful NSG removal' {
-        Mock Get-AzTableRow { return @(New-ExpiredRow -TargetType 'nsg') }
+        Mock Get-JITTableRows { return @(New-ExpiredRow -TargetType 'nsg') }
         . $script:RunScript
-        Assert-MockCalled Remove-AzTableRow -Times 1 -Scope It
+        Should -Invoke -CommandName Remove-JITTableRow -Times 1 -Scope It
     }
 
     It 'writes a JITExpired audit event on successful NSG removal' {
-        Mock Get-AzTableRow { return @(New-ExpiredRow -TargetType 'nsg') }
+        Mock Get-JITTableRows { return @(New-ExpiredRow -TargetType 'nsg') }
         . $script:RunScript
-        Assert-MockCalled Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter {
+        Should -Invoke -CommandName Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter {
             $EventType -eq 'JITExpired'
         }
     }
@@ -113,17 +100,17 @@ Describe 'Remove-ExpiredRules timer trigger' {
     # ── Failure path — retry semantics ────────────────────────────────────────
 
     It 'does NOT delete the table record when NSG removal throws' {
-        Mock Get-AzTableRow    { return @(New-ExpiredRow -TargetType 'nsg') }
+        Mock Get-JITTableRows    { return @(New-ExpiredRow -TargetType 'nsg') }
         Mock Remove-JITNsgRule { throw 'ARM API error' }
         . $script:RunScript
-        Assert-MockCalled Remove-AzTableRow -Exactly -Times 0 -Scope It
+        Should -Invoke -CommandName Remove-JITTableRow -Exactly -Times 0 -Scope It
     }
 
     It 'writes a JITRemoveFailed audit event when NSG removal throws' {
-        Mock Get-AzTableRow    { return @(New-ExpiredRow -TargetType 'nsg') }
+        Mock Get-JITTableRows    { return @(New-ExpiredRow -TargetType 'nsg') }
         Mock Remove-JITNsgRule { throw 'ARM API error' }
         . $script:RunScript
-        Assert-MockCalled Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter {
+        Should -Invoke -CommandName Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter {
             $EventType -eq 'JITRemoveFailed'
         }
     }
@@ -131,14 +118,14 @@ Describe 'Remove-ExpiredRules timer trigger' {
     # ── Active rules are left alone ───────────────────────────────────────────
 
     It 'does not remove a rule that has not yet expired' {
-        Mock Get-AzTableRow { return @(New-ActiveRow -TargetType 'nsg') }
+        Mock Get-JITTableRows { return @(New-ActiveRow -TargetType 'nsg') }
         . $script:RunScript
-        Assert-MockCalled Remove-JITNsgRule -Exactly -Times 0 -Scope It
-        Assert-MockCalled Remove-AzTableRow -Exactly -Times 0 -Scope It
+        Should -Invoke -CommandName Remove-JITNsgRule -Exactly -Times 0 -Scope It
+        Should -Invoke -CommandName Remove-JITTableRow -Exactly -Times 0 -Scope It
     }
 
     It 'processes only the expired subset when active and expired rows are mixed' {
-        Mock Get-AzTableRow {
+        Mock Get-JITTableRows {
             return @(
                 (New-ExpiredRow -TargetType 'nsg' -RuleId 'expired-1'),
                 (New-ActiveRow  -TargetType 'nsg' -RuleId 'active-1'),
@@ -146,14 +133,14 @@ Describe 'Remove-ExpiredRules timer trigger' {
             )
         }
         . $script:RunScript
-        Assert-MockCalled Remove-JITNsgRule -Exactly -Times 2 -Scope It
-        Assert-MockCalled Remove-AzTableRow -Exactly -Times 2 -Scope It
+        Should -Invoke -CommandName Remove-JITNsgRule -Exactly -Times 2 -Scope It
+        Should -Invoke -CommandName Remove-JITTableRow -Exactly -Times 2 -Scope It
     }
 
     # ── Multiple expired rows ─────────────────────────────────────────────────
 
     It 'removes all expired NSG rules in one run' {
-        Mock Get-AzTableRow {
+        Mock Get-JITTableRows {
             return @(
                 (New-ExpiredRow -TargetType 'nsg' -RuleId 'expired-1'),
                 (New-ExpiredRow -TargetType 'nsg' -RuleId 'expired-2'),
@@ -161,12 +148,12 @@ Describe 'Remove-ExpiredRules timer trigger' {
             )
         }
         . $script:RunScript
-        Assert-MockCalled Remove-JITNsgRule -Exactly -Times 3 -Scope It
-        Assert-MockCalled Remove-AzTableRow -Exactly -Times 3 -Scope It
+        Should -Invoke -CommandName Remove-JITNsgRule -Exactly -Times 3 -Scope It
+        Should -Invoke -CommandName Remove-JITTableRow -Exactly -Times 3 -Scope It
     }
 
     It 'continues processing remaining rules when one removal fails' {
-        Mock Get-AzTableRow {
+        Mock Get-JITTableRows {
             return @(
                 (New-ExpiredRow -TargetType 'nsg' -RuleId 'fail-rule'),
                 (New-ExpiredRow -TargetType 'nsg' -RuleId 'pass-rule')
@@ -178,45 +165,45 @@ Describe 'Remove-ExpiredRules timer trigger' {
             if ($script:NsgCallNum -eq 1) { throw 'First call fails' }
         }
         . $script:RunScript
-        Assert-MockCalled Remove-JITNsgRule -Exactly -Times 2 -Scope It
-        Assert-MockCalled Remove-AzTableRow -Exactly -Times 1 -Scope It
+        Should -Invoke -CommandName Remove-JITNsgRule -Exactly -Times 2 -Scope It
+        Should -Invoke -CommandName Remove-JITTableRow -Exactly -Times 1 -Scope It
     }
 
     # ── Other target types dispatched correctly ───────────────────────────────
 
     It 'calls Remove-JITSqlFirewallRule for an expired sqlServer rule' {
-        Mock Get-AzTableRow { return @(New-ExpiredRow -TargetType 'sqlServer') }
+        Mock Get-JITTableRows { return @(New-ExpiredRow -TargetType 'sqlServer') }
         . $script:RunScript
-        Assert-MockCalled Remove-JITSqlFirewallRule -Times 1 -Scope It
-        Assert-MockCalled Remove-JITNsgRule         -Exactly -Times 0 -Scope It
+        Should -Invoke -CommandName Remove-JITSqlFirewallRule -Times 1 -Scope It
+        Should -Invoke -CommandName Remove-JITNsgRule         -Exactly -Times 0 -Scope It
     }
 
     It 'calls Remove-JITStorageNetworkRule for an expired storageAccount rule' {
-        Mock Get-AzTableRow { return @(New-ExpiredRow -TargetType 'storageAccount') }
+        Mock Get-JITTableRows { return @(New-ExpiredRow -TargetType 'storageAccount') }
         . $script:RunScript
-        Assert-MockCalled Remove-JITStorageNetworkRule -Times 1 -Scope It
-        Assert-MockCalled Remove-JITNsgRule            -Exactly -Times 0 -Scope It
+        Should -Invoke -CommandName Remove-JITStorageNetworkRule -Times 1 -Scope It
+        Should -Invoke -CommandName Remove-JITNsgRule            -Exactly -Times 0 -Scope It
     }
 
     It 'calls Remove-JITKeyVaultNetworkRule for an expired keyVault rule' {
-        Mock Get-AzTableRow { return @(New-ExpiredRow -TargetType 'keyVault') }
+        Mock Get-JITTableRows { return @(New-ExpiredRow -TargetType 'keyVault') }
         . $script:RunScript
-        Assert-MockCalled Remove-JITKeyVaultNetworkRule -Times 1 -Scope It
-        Assert-MockCalled Remove-JITNsgRule             -Exactly -Times 0 -Scope It
+        Should -Invoke -CommandName Remove-JITKeyVaultNetworkRule -Times 1 -Scope It
+        Should -Invoke -CommandName Remove-JITNsgRule             -Exactly -Times 0 -Scope It
     }
 
     # ── Edge cases ────────────────────────────────────────────────────────────
 
     It 'does nothing and does not throw when the table is empty' {
-        Mock Get-AzTableRow { return @() }
-        { . $script:RunScript } | Should Not Throw
-        Assert-MockCalled Remove-JITNsgRule -Exactly -Times 0 -Scope It
+        Mock Get-JITTableRows { return @() }
+        { . $script:RunScript } | Should -Not -Throw
+        Should -Invoke -CommandName Remove-JITNsgRule -Exactly -Times 0 -Scope It
     }
 
     It 'deletes the table record for an unknown targetType (stale record cleanup)' {
-        Mock Get-AzTableRow { return @(New-ExpiredRow -TargetType 'unknownType') }
+        Mock Get-JITTableRows { return @(New-ExpiredRow -TargetType 'unknownType') }
         . $script:RunScript
-        Assert-MockCalled Remove-AzTableRow -Times 1 -Scope It
+        Should -Invoke -CommandName Remove-JITTableRow -Times 1 -Scope It
     }
 }
 
@@ -226,64 +213,89 @@ Describe 'Remove-ExpiredRules timer trigger' {
 # the module's scope.  Closures (.GetNewClosure()) are used to pass PSCustomObject
 # return values across the module scope boundary.
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Remove-JITNsgRule calls the REAL function inside the JITTargets module, so the
+# mocks use -ModuleName JITTargets to intercept calls made from the module's own
+# scope. The function is one ARM DELETE of the security rule by name; a 404 is
+# success (already gone) and any other status must propagate, because silently
+# swallowing it would delete the tracking row for a rule still on the resource.
+# ─────────────────────────────────────────────────────────────────────────────
 Describe 'Remove-JITNsgRule' {
 
+    BeforeAll {
+        # Get-StatusFromError reads Exception.StatusCode / Exception.Response.StatusCode,
+        # so a bare `throw '404'` would be read as status 0 and rethrown. This builds
+        # the exception Invoke-RestMethod actually raises for an HTTP error.
+        function New-HttpError {
+            param([int]$Status)
+            $response = [System.Net.Http.HttpResponseMessage]::new([System.Net.HttpStatusCode]$Status)
+            return [Microsoft.PowerShell.Commands.HttpResponseException]::new(
+                "Response status code does not indicate success: $Status.", $response)
+        }
+    }
+
     BeforeEach {
-        $script:ExistingRule = [PSCustomObject]@{ Name = 'jit-test-rule'; Direction = 'Inbound' }
-        $script:NsgWithRule  = [PSCustomObject]@{ SecurityRules = @($script:ExistingRule) }
-        $script:NsgEmpty     = [PSCustomObject]@{ SecurityRules = @() }
-
-        # Capture for use in closures (module scope can't see $script: from test)
-        $nsgWithRule = $script:NsgWithRule
-
-        Mock -ModuleName JITTargets Set-AzContext               { }
-        Mock -ModuleName JITTargets Get-AzNetworkSecurityGroup  { return $nsgWithRule }.GetNewClosure()
-        Mock -ModuleName JITTargets Remove-AzNetworkSecurityRuleConfig { return $nsgWithRule }.GetNewClosure()
-        Mock -ModuleName JITTargets Set-AzNetworkSecurityGroup  { }
-
         $script:Row = [PSCustomObject]@{
-            SubscriptionId = 'sub-id'
+            SubscriptionId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
             ResourceName   = 'test-nsg'
             ResourceRg     = 'test-rg'
             RuleIdentifier = 'jit-test-rule'
+            RowKey         = 'jit-test-rule'
+        }
+        Mock -ModuleName JITTargets Invoke-ArmRest { }
+    }
+
+
+    It 'issues a DELETE for the named security rule under the NSG' {
+        Remove-JITNsgRule -Row $script:Row | Out-Null
+        Should -Invoke -CommandName Invoke-ArmRest -ModuleName JITTargets -Exactly -Times 1 -Scope It -ParameterFilter {
+            $Method -eq 'DELETE' -and
+            $Path -eq ('/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/resourceGroups/test-rg' +
+                       '/providers/Microsoft.Network/networkSecurityGroups/test-nsg' +
+                       '/securityRules/jit-test-rule')
         }
     }
 
-    It 'removes the security rule when it exists on the NSG' {
-        Remove-JITNsgRule -Row $script:Row
-        Assert-MockCalled -ModuleName JITTargets Remove-AzNetworkSecurityRuleConfig -Times 1 -Scope It -ParameterFilter {
-            $Name -eq 'jit-test-rule'
+    It 'reports Removed after a successful delete' {
+        $result = Remove-JITNsgRule -Row $script:Row
+        $result.Status | Should -Be 'Removed'
+    }
+
+    It 'falls back to RowKey when RuleIdentifier is missing' {
+        # Older builds could write a null RuleIdentifier; cleanup must still
+        # find the rule rather than strand it on the resource forever.
+        $script:Row.RuleIdentifier = $null
+        Remove-JITNsgRule -Row $script:Row | Out-Null
+        Should -Invoke -CommandName Invoke-ArmRest -ModuleName JITTargets -Exactly -Times 1 -Scope It -ParameterFilter {
+            $Path -like '*/securityRules/jit-test-rule'
         }
     }
 
-    It 'calls Set-AzNetworkSecurityGroup to commit the change' {
-        Remove-JITNsgRule -Row $script:Row
-        Assert-MockCalled -ModuleName JITTargets Set-AzNetworkSecurityGroup -Times 1 -Scope It
+    It 'reports NotFound without calling ARM when the row identifies no rule' {
+        $script:Row.RuleIdentifier = $null
+        $script:Row.RowKey         = $null
+        $result = Remove-JITNsgRule -Row $script:Row -WarningAction SilentlyContinue
+        $result.Status | Should -Be 'NotFound'
+        Should -Invoke -CommandName Invoke-ArmRest -ModuleName JITTargets -Exactly -Times 0 -Scope It
     }
 
-    It 'sets the correct subscription context before making ARM calls' {
-        Remove-JITNsgRule -Row $script:Row
-        Assert-MockCalled -ModuleName JITTargets Set-AzContext -Times 1 -Scope It
+    It 'treats a 404 from ARM as NotFound (idempotent re-run)' {
+        Mock -ModuleName JITTargets Invoke-ArmRest { throw (New-HttpError -Status 404) }
+        $result = Remove-JITNsgRule -Row $script:Row
+        $result.Status | Should -Be 'NotFound'
     }
 
     It 'does not throw when the rule is already absent (idempotent)' {
-        $emptyNsg = $script:NsgEmpty
-        Mock -ModuleName JITTargets Get-AzNetworkSecurityGroup { return $emptyNsg }.GetNewClosure()
-        { Remove-JITNsgRule -Row $script:Row } | Should Not Throw
+        Mock -ModuleName JITTargets Invoke-ArmRest { throw (New-HttpError -Status 404) }
+        { Remove-JITNsgRule -Row $script:Row } | Should -Not -Throw
     }
 
-    It 'does not call Remove-AzNetworkSecurityRuleConfig when rule is already absent' {
-        $emptyNsg = $script:NsgEmpty
-        Mock -ModuleName JITTargets Get-AzNetworkSecurityGroup { return $emptyNsg }.GetNewClosure()
-        Remove-JITNsgRule -Row $script:Row
-        Assert-MockCalled -ModuleName JITTargets Remove-AzNetworkSecurityRuleConfig -Exactly -Times 0 -Scope It
-    }
-
-    It 'does not call Set-AzNetworkSecurityGroup when no change was needed' {
-        $emptyNsg = $script:NsgEmpty
-        Mock -ModuleName JITTargets Get-AzNetworkSecurityGroup { return $emptyNsg }.GetNewClosure()
-        Remove-JITNsgRule -Row $script:Row
-        Assert-MockCalled -ModuleName JITTargets Set-AzNetworkSecurityGroup -Exactly -Times 0 -Scope It
+    It 'propagates a non-404 ARM failure instead of reporting the rule gone' {
+        # The caller deletes the tracking row on a non-throwing return, so
+        # swallowing a 403 here would leave the NSG rule open with nothing
+        # tracking it.
+        Mock -ModuleName JITTargets Invoke-ArmRest { throw (New-HttpError -Status 403) }
+        { Remove-JITNsgRule -Row $script:Row } | Should -Throw
     }
 }
 
@@ -327,28 +339,28 @@ Describe 'Remove-ExpiredRules postgresqlFlexibleServer dispatch' {
     It 'calls Remove-JITPostgresFirewallRule exactly once for an expired postgresqlFlexibleServer rule' {
         Mock Get-JITTableRows { return @(New-ExpiredRow -TargetType 'postgresqlFlexibleServer') }
         . $script:RunScript
-        Assert-MockCalled Remove-JITPostgresFirewallRule -Exactly -Times 1 -Scope It
+        Should -Invoke -CommandName Remove-JITPostgresFirewallRule -Exactly -Times 1 -Scope It
     }
 
     It 'does not invoke other remove handlers for a postgresqlFlexibleServer rule' {
         Mock Get-JITTableRows { return @(New-ExpiredRow -TargetType 'postgresqlFlexibleServer') }
         . $script:RunScript
-        Assert-MockCalled Remove-JITNsgRule             -Exactly -Times 0 -Scope It
-        Assert-MockCalled Remove-JITSqlFirewallRule     -Exactly -Times 0 -Scope It
-        Assert-MockCalled Remove-JITStorageNetworkRule  -Exactly -Times 0 -Scope It
-        Assert-MockCalled Remove-JITKeyVaultNetworkRule -Exactly -Times 0 -Scope It
+        Should -Invoke -CommandName Remove-JITNsgRule             -Exactly -Times 0 -Scope It
+        Should -Invoke -CommandName Remove-JITSqlFirewallRule     -Exactly -Times 0 -Scope It
+        Should -Invoke -CommandName Remove-JITStorageNetworkRule  -Exactly -Times 0 -Scope It
+        Should -Invoke -CommandName Remove-JITKeyVaultNetworkRule -Exactly -Times 0 -Scope It
     }
 
     It 'deletes the table row after a successful postgresqlFlexibleServer removal' {
         Mock Get-JITTableRows { return @(New-ExpiredRow -TargetType 'postgresqlFlexibleServer') }
         . $script:RunScript
-        Assert-MockCalled Remove-JITTableRow -Exactly -Times 1 -Scope It
+        Should -Invoke -CommandName Remove-JITTableRow -Exactly -Times 1 -Scope It
     }
 
     It 'writes a JITExpired audit event on successful postgresqlFlexibleServer removal' {
         Mock Get-JITTableRows { return @(New-ExpiredRow -TargetType 'postgresqlFlexibleServer') }
         . $script:RunScript
-        Assert-MockCalled Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter {
+        Should -Invoke -CommandName Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter {
             $EventType -eq 'JITExpired'
         }
     }
@@ -359,14 +371,14 @@ Describe 'Remove-ExpiredRules postgresqlFlexibleServer dispatch' {
         Mock Get-JITTableRows               { return @(New-ExpiredRow -TargetType 'postgresqlFlexibleServer') }
         Mock Remove-JITPostgresFirewallRule { throw 'ARM async operation failed' }
         . $script:RunScript
-        Assert-MockCalled Remove-JITTableRow -Exactly -Times 0 -Scope It
+        Should -Invoke -CommandName Remove-JITTableRow -Exactly -Times 0 -Scope It
     }
 
     It 'writes a JITRemoveFailed audit event when Remove-JITPostgresFirewallRule throws' {
         Mock Get-JITTableRows               { return @(New-ExpiredRow -TargetType 'postgresqlFlexibleServer') }
         Mock Remove-JITPostgresFirewallRule { throw 'ARM async operation failed' }
         . $script:RunScript
-        Assert-MockCalled Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter {
+        Should -Invoke -CommandName Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter {
             $EventType -eq 'JITRemoveFailed'
         }
     }
@@ -382,14 +394,15 @@ Describe 'Remove-ExpiredRules postgresqlFlexibleServer dispatch' {
 # 19 Remove-JIT*Rule handlers is mocked so each It can assert that EXACTLY the
 # expected handler fired for its targetType and that no other handler was called.
 #
-# The per-type happy-path assertions are data-driven over the 14 new tokens
-# (Pester-3.4-safe: the foreach runs the It blocks inline). A representative
-# failure-path pair is exercised for one child type (mysqlFlexibleServer) and
-# one array-on-resource type (cosmosDb).
+# The per-type happy-path assertions are data-driven over the 14 new tokens via
+# Pester's -ForEach. A representative failure-path pair is exercised for one
+# child type (mysqlFlexibleServer) and one array-on-resource type (cosmosDb).
 # ─────────────────────────────────────────────────────────────────────────────
 
-# targetType -> its own Remove-JIT*Rule handler (mirrors run.ps1's dispatch switch)
-$script:NewDispatchCases = @(
+# targetType -> its own Remove-JIT*Rule handler (mirrors run.ps1's dispatch switch).
+# Deliberately in the script body, NOT BeforeAll: -ForEach is consumed during
+# discovery, which happens before any BeforeAll runs.
+$NewDispatchCases = @(
     @{ Type = 'mysqlFlexibleServer'; Handler = 'Remove-JITMysqlFlexibleServerRule' }
     @{ Type = 'redis';               Handler = 'Remove-JITRedisRule' }
     @{ Type = 'synapse';             Handler = 'Remove-JITSynapseRule' }
@@ -406,17 +419,22 @@ $script:NewDispatchCases = @(
     @{ Type = 'aks';                 Handler = 'Remove-JITAksRule' }
 )
 
-# Every remove handler run.ps1 can dispatch to (5 original + 14 new). Used both to
-# mock them all and to assert non-target handlers stay untouched.
-$script:AllRemoveHandlers = @(
-    'Remove-JITNsgRule'
-    'Remove-JITSqlFirewallRule'
-    'Remove-JITPostgresFirewallRule'
-    'Remove-JITStorageNetworkRule'
-    'Remove-JITKeyVaultNetworkRule'
-) + ($script:NewDispatchCases | ForEach-Object { $_.Handler })
-
 Describe 'Remove-ExpiredRules new target-type dispatch (FEAT-0002)' {
+
+    BeforeAll {
+        # Every remove handler run.ps1 can dispatch to. Read off the module
+        # rather than hand-listed: a hand-list is how a new target type ends up
+        # mocked in the dispatch tests but missing from the "and no other
+        # handler fired" assertion. Script-body variables are not in scope here,
+        # so the discovery-time case table cannot be reused for this.
+        $script:AllRemoveHandlers = @(
+            (Get-Module JITTargets).ExportedFunctions.Keys |
+                Where-Object { $_ -like 'Remove-JIT*' } | Sort-Object
+        )
+        if ($script:AllRemoveHandlers.Count -lt 19) {
+            throw "Expected at least 19 Remove-JIT* handlers, found $($script:AllRemoveHandlers.Count)."
+        }
+    }
 
     BeforeEach {
         # Suppress run.ps1's own Import-Module calls; real modules already imported.
@@ -436,35 +454,32 @@ Describe 'Remove-ExpiredRules new target-type dispatch (FEAT-0002)' {
 
     # ── Happy path — one It per new token, data-driven ─────────────────────────
 
-    foreach ($case in $script:NewDispatchCases) {
-        $caseType    = $case.Type
-        $caseHandler = $case.Handler
+    # -ForEach turns each hashtable key into a variable inside the It body and
+    # expands <Type> / <Handler> in the test name. The previous shape -- a
+    # foreach around the It blocks -- generated the right NAMES but its loop
+    # variables were gone by the time the bodies ran, so every assertion got an
+    # empty command name.
+    It "routes an expired <Type> row to <Handler> exactly once and to no other handler" -ForEach $NewDispatchCases {
+        Mock Get-JITTableRows { return @(New-ExpiredRow -TargetType $Type) }
 
-        It "routes an expired $caseType row to $caseHandler exactly once and to no other handler" {
-            $script:DispatchType    = $caseType
-            $script:DispatchHandler = $caseHandler
-            Mock Get-JITTableRows { return @(New-ExpiredRow -TargetType $script:DispatchType) }
+        . $script:RunScript
 
-            . $script:RunScript
-
-            Assert-MockCalled $script:DispatchHandler -Exactly -Times 1 -Scope It
-            foreach ($other in $script:AllRemoveHandlers) {
-                if ($other -ne $script:DispatchHandler) {
-                    Assert-MockCalled $other -Exactly -Times 0 -Scope It
-                }
+        Should -Invoke -CommandName $Handler -Exactly -Times 1 -Scope It
+        foreach ($other in $script:AllRemoveHandlers) {
+            if ($other -ne $Handler) {
+                Should -Invoke -CommandName $other -Exactly -Times 0 -Scope It
             }
         }
+    }
 
-        It "deletes the table row and writes JITExpired after a successful $caseType removal" {
-            $script:DispatchType = $caseType
-            Mock Get-JITTableRows { return @(New-ExpiredRow -TargetType $script:DispatchType) }
+    It "deletes the table row and writes JITExpired after a successful <Type> removal" -ForEach $NewDispatchCases {
+        Mock Get-JITTableRows { return @(New-ExpiredRow -TargetType $Type) }
 
-            . $script:RunScript
+        . $script:RunScript
 
-            Assert-MockCalled Remove-JITTableRow -Exactly -Times 1 -Scope It
-            Assert-MockCalled Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter {
-                $EventType -eq 'JITExpired'
-            }
+        Should -Invoke -CommandName Remove-JITTableRow -Exactly -Times 1 -Scope It
+        Should -Invoke -CommandName Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter {
+            $EventType -eq 'JITExpired'
         }
     }
 
@@ -474,14 +489,14 @@ Describe 'Remove-ExpiredRules new target-type dispatch (FEAT-0002)' {
         Mock Get-JITTableRows                    { return @(New-ExpiredRow -TargetType 'mysqlFlexibleServer') }
         Mock Remove-JITMysqlFlexibleServerRule   { throw 'ARM firewall-rule delete failed' }
         . $script:RunScript
-        Assert-MockCalled Remove-JITTableRow -Exactly -Times 0 -Scope It
+        Should -Invoke -CommandName Remove-JITTableRow -Exactly -Times 0 -Scope It
     }
 
     It 'writes a JITRemoveFailed audit event when a child-type handler throws (mysqlFlexibleServer)' {
         Mock Get-JITTableRows                    { return @(New-ExpiredRow -TargetType 'mysqlFlexibleServer') }
         Mock Remove-JITMysqlFlexibleServerRule   { throw 'ARM firewall-rule delete failed' }
         . $script:RunScript
-        Assert-MockCalled Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter {
+        Should -Invoke -CommandName Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter {
             $EventType -eq 'JITRemoveFailed'
         }
     }
@@ -492,14 +507,14 @@ Describe 'Remove-ExpiredRules new target-type dispatch (FEAT-0002)' {
         Mock Get-JITTableRows      { return @(New-ExpiredRow -TargetType 'cosmosDb') }
         Mock Remove-JITCosmosDbRule { throw 'ARM read-modify-write did not converge' }
         . $script:RunScript
-        Assert-MockCalled Remove-JITTableRow -Exactly -Times 0 -Scope It
+        Should -Invoke -CommandName Remove-JITTableRow -Exactly -Times 0 -Scope It
     }
 
     It 'writes a JITRemoveFailed audit event when an array-type handler throws (cosmosDb)' {
         Mock Get-JITTableRows      { return @(New-ExpiredRow -TargetType 'cosmosDb') }
         Mock Remove-JITCosmosDbRule { throw 'ARM read-modify-write did not converge' }
         . $script:RunScript
-        Assert-MockCalled Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter {
+        Should -Invoke -CommandName Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter {
             $EventType -eq 'JITRemoveFailed'
         }
     }
@@ -552,21 +567,21 @@ Describe 'Remove-ExpiredRules remove-status branching (FEAT-0003)' {
         Mock Get-JITTableRows  { return @(New-ExpiredRow -TargetType 'nsg') }
         Mock Remove-JITNsgRule { return @{ Status = 'NotFound' } }
         . $script:RunScript
-        Assert-MockCalled Remove-JITTableRow -Exactly -Times 1 -Scope It
+        Should -Invoke -CommandName Remove-JITTableRow -Exactly -Times 1 -Scope It
     }
 
     It "writes an Expire JITRulesAudit row when the handler returns Status='NotFound'" {
         Mock Get-JITTableRows  { return @(New-ExpiredRow -TargetType 'nsg') }
         Mock Remove-JITNsgRule { return @{ Status = 'NotFound' } }
         . $script:RunScript
-        Assert-MockCalled Add-JITAuditRow -Times 1 -Scope It -ParameterFilter { $Action -eq 'Expire' }
+        Should -Invoke -CommandName Add-JITAuditRow -Times 1 -Scope It -ParameterFilter { $Action -eq 'Expire' }
     }
 
     It "writes a JITExpired audit event when the handler returns Status='NotFound'" {
         Mock Get-JITTableRows  { return @(New-ExpiredRow -TargetType 'nsg') }
         Mock Remove-JITNsgRule { return @{ Status = 'NotFound' } }
         . $script:RunScript
-        Assert-MockCalled Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter { $EventType -eq 'JITExpired' }
+        Should -Invoke -CommandName Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter { $EventType -eq 'JITExpired' }
     }
 
     # ── Status = 'Refused' (aks) — keep the row, audit a RemoveFailed ───────────
@@ -575,28 +590,28 @@ Describe 'Remove-ExpiredRules remove-status branching (FEAT-0003)' {
         Mock Get-JITTableRows  { return @(New-ExpiredRow -TargetType 'aks') }
         Mock Remove-JITAksRule { return @{ Status = 'Refused' } }
         . $script:RunScript
-        Assert-MockCalled Remove-JITTableRow -Exactly -Times 0 -Scope It
+        Should -Invoke -CommandName Remove-JITTableRow -Exactly -Times 0 -Scope It
     }
 
     It "writes a RemoveFailed JITRulesAudit row when an aks handler returns Status='Refused'" {
         Mock Get-JITTableRows  { return @(New-ExpiredRow -TargetType 'aks') }
         Mock Remove-JITAksRule { return @{ Status = 'Refused' } }
         . $script:RunScript
-        Assert-MockCalled Add-JITAuditRow -Times 1 -Scope It -ParameterFilter { $Action -eq 'RemoveFailed' }
+        Should -Invoke -CommandName Add-JITAuditRow -Times 1 -Scope It -ParameterFilter { $Action -eq 'RemoveFailed' }
     }
 
     It "writes a JITRemoveFailed audit event when an aks handler returns Status='Refused'" {
         Mock Get-JITTableRows  { return @(New-ExpiredRow -TargetType 'aks') }
         Mock Remove-JITAksRule { return @{ Status = 'Refused' } }
         . $script:RunScript
-        Assert-MockCalled Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter { $EventType -eq 'JITRemoveFailed' }
+        Should -Invoke -CommandName Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter { $EventType -eq 'JITRemoveFailed' }
     }
 
     It "does NOT write an Expire audit row for a refused aks removal" {
         Mock Get-JITTableRows  { return @(New-ExpiredRow -TargetType 'aks') }
         Mock Remove-JITAksRule { return @{ Status = 'Refused' } }
         . $script:RunScript
-        Assert-MockCalled Add-JITAuditRow -Exactly -Times 0 -Scope It -ParameterFilter { $Action -eq 'Expire' }
+        Should -Invoke -CommandName Add-JITAuditRow -Exactly -Times 0 -Scope It -ParameterFilter { $Action -eq 'Expire' }
     }
 
     It 'continues processing later rows after a refused aks removal (does not throw / stop)' {
@@ -610,7 +625,7 @@ Describe 'Remove-ExpiredRules remove-status branching (FEAT-0003)' {
         Mock Remove-JITNsgRule { return @{ Status = 'Removed' } }
         . $script:RunScript
         # The nsg row (Removed) is deleted; the aks row (Refused) is retained.
-        Assert-MockCalled Remove-JITTableRow -Exactly -Times 1 -Scope It
+        Should -Invoke -CommandName Remove-JITTableRow -Exactly -Times 1 -Scope It
     }
 
     # ── Status = 'Removed' — explicit happy path ───────────────────────────────
@@ -619,14 +634,14 @@ Describe 'Remove-ExpiredRules remove-status branching (FEAT-0003)' {
         Mock Get-JITTableRows  { return @(New-ExpiredRow -TargetType 'nsg') }
         Mock Remove-JITNsgRule { return @{ Status = 'Removed' } }
         . $script:RunScript
-        Assert-MockCalled Remove-JITTableRow -Exactly -Times 1 -Scope It
+        Should -Invoke -CommandName Remove-JITTableRow -Exactly -Times 1 -Scope It
     }
 
     It "writes an Expire JITRulesAudit row when the handler returns Status='Removed'" {
         Mock Get-JITTableRows  { return @(New-ExpiredRow -TargetType 'nsg') }
         Mock Remove-JITNsgRule { return @{ Status = 'Removed' } }
         . $script:RunScript
-        Assert-MockCalled Add-JITAuditRow -Times 1 -Scope It -ParameterFilter { $Action -eq 'Expire' }
+        Should -Invoke -CommandName Add-JITAuditRow -Times 1 -Scope It -ParameterFilter { $Action -eq 'Expire' }
     }
 
     # ── Legacy handler returning $null is still treated as Removed ──────────────
@@ -635,7 +650,7 @@ Describe 'Remove-ExpiredRules remove-status branching (FEAT-0003)' {
         Mock Get-JITTableRows  { return @(New-ExpiredRow -TargetType 'nsg') }
         Mock Remove-JITNsgRule { return $null }
         . $script:RunScript
-        Assert-MockCalled Remove-JITTableRow -Exactly -Times 1 -Scope It
-        Assert-MockCalled Add-JITAuditRow -Times 1 -Scope It -ParameterFilter { $Action -eq 'Expire' }
+        Should -Invoke -CommandName Remove-JITTableRow -Exactly -Times 1 -Scope It
+        Should -Invoke -CommandName Add-JITAuditRow -Times 1 -Scope It -ParameterFilter { $Action -eq 'Expire' }
     }
 }

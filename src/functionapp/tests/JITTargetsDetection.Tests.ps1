@@ -20,15 +20,15 @@ Describe 'ConvertTo-JITIpv4Number' {
 
     It 'orders addresses so numeric compare == address compare' {
         InModuleScope JITTargets {
-            (ConvertTo-JITIpv4Number '10.0.0.1') -lt (ConvertTo-JITIpv4Number '10.0.0.2') | Should Be $true
-            (ConvertTo-JITIpv4Number '10.0.1.0') -gt (ConvertTo-JITIpv4Number '10.0.0.255') | Should Be $true
+            (ConvertTo-JITIpv4Number '10.0.0.1') -lt (ConvertTo-JITIpv4Number '10.0.0.2') | Should -Be $true
+            (ConvertTo-JITIpv4Number '10.0.1.0') -gt (ConvertTo-JITIpv4Number '10.0.0.255') | Should -Be $true
         }
     }
 
     It 'computes the big-endian value of a low-octet address' {
         InModuleScope JITTargets {
             # 1.2.3.4 = (1<<24)+(2<<16)+(3<<8)+4 = 16909060
-            ConvertTo-JITIpv4Number '1.2.3.4' | Should Be 16909060
+            ConvertTo-JITIpv4Number '1.2.3.4' | Should -Be 16909060
         }
     }
 
@@ -36,34 +36,34 @@ Describe 'ConvertTo-JITIpv4Number' {
         InModuleScope JITTargets {
             # 200.0.0.0 = 200<<24 = 3355443200, which overflows a signed int32 —
             # the helper must use int64 so the value stays positive and comparable.
-            ConvertTo-JITIpv4Number '200.0.0.0' | Should Be 3355443200
-            (ConvertTo-JITIpv4Number '200.0.0.0') -gt (ConvertTo-JITIpv4Number '127.255.255.255') | Should Be $true
+            ConvertTo-JITIpv4Number '200.0.0.0' | Should -Be 3355443200
+            (ConvertTo-JITIpv4Number '200.0.0.0') -gt (ConvertTo-JITIpv4Number '127.255.255.255') | Should -Be $true
         }
     }
 
     It 'computes the maximum address value (255.255.255.255)' {
         InModuleScope JITTargets {
-            ConvertTo-JITIpv4Number '255.255.255.255' | Should Be 4294967295
+            ConvertTo-JITIpv4Number '255.255.255.255' | Should -Be 4294967295
         }
     }
 
     It 'returns $null for a null/empty input' {
         InModuleScope JITTargets {
-            ConvertTo-JITIpv4Number $null | Should BeNullOrEmpty
-            ConvertTo-JITIpv4Number ''    | Should BeNullOrEmpty
+            ConvertTo-JITIpv4Number $null | Should -BeNullOrEmpty
+            ConvertTo-JITIpv4Number ''    | Should -BeNullOrEmpty
         }
     }
 
     It 'returns $null for a non-IPv4 (IPv6) address' {
         InModuleScope JITTargets {
-            ConvertTo-JITIpv4Number '2001:db8::1' | Should BeNullOrEmpty
+            ConvertTo-JITIpv4Number '2001:db8::1' | Should -BeNullOrEmpty
         }
     }
 
     It 'returns $null for garbage / non-address strings' {
         InModuleScope JITTargets {
-            ConvertTo-JITIpv4Number 'not-an-ip'   | Should BeNullOrEmpty
-            ConvertTo-JITIpv4Number '10.0.0.1/24' | Should BeNullOrEmpty
+            ConvertTo-JITIpv4Number 'not-an-ip'   | Should -BeNullOrEmpty
+            ConvertTo-JITIpv4Number '10.0.0.1/24' | Should -BeNullOrEmpty
         }
     }
 }
@@ -81,7 +81,7 @@ Describe 'Test-JITFirewallRuleCoversIp' {
         InModuleScope JITTargets {
             function New-SqlRule ($s, $e) { [PSCustomObject]@{ properties = [PSCustomObject]@{ startIpAddress = $s; endIpAddress = $e } } }
             $rules = @(New-SqlRule '10.0.0.1' '10.0.0.100')
-            Test-JITFirewallRuleCoversIp -Rules $rules -CallerIp '10.0.0.50' | Should Be $true
+            Test-JITFirewallRuleCoversIp -Rules $rules -CallerIp '10.0.0.50' | Should -Be $true
         }
     }
 
@@ -89,7 +89,7 @@ Describe 'Test-JITFirewallRuleCoversIp' {
         InModuleScope JITTargets {
             function New-SqlRule ($s, $e) { [PSCustomObject]@{ properties = [PSCustomObject]@{ startIpAddress = $s; endIpAddress = $e } } }
             $rules = @(New-SqlRule '10.0.0.1' '10.0.0.100')
-            Test-JITFirewallRuleCoversIp -Rules $rules -CallerIp '10.0.0.1' | Should Be $true
+            Test-JITFirewallRuleCoversIp -Rules $rules -CallerIp '10.0.0.1' | Should -Be $true
         }
     }
 
@@ -97,7 +97,7 @@ Describe 'Test-JITFirewallRuleCoversIp' {
         InModuleScope JITTargets {
             function New-SqlRule ($s, $e) { [PSCustomObject]@{ properties = [PSCustomObject]@{ startIpAddress = $s; endIpAddress = $e } } }
             $rules = @(New-SqlRule '10.0.0.1' '10.0.0.100')
-            Test-JITFirewallRuleCoversIp -Rules $rules -CallerIp '10.0.0.100' | Should Be $true
+            Test-JITFirewallRuleCoversIp -Rules $rules -CallerIp '10.0.0.100' | Should -Be $true
         }
     }
 
@@ -105,7 +105,7 @@ Describe 'Test-JITFirewallRuleCoversIp' {
         InModuleScope JITTargets {
             function New-SqlRule ($s, $e) { [PSCustomObject]@{ properties = [PSCustomObject]@{ startIpAddress = $s; endIpAddress = $e } } }
             $rules = @(New-SqlRule '203.0.113.7' '203.0.113.7')
-            Test-JITFirewallRuleCoversIp -Rules $rules -CallerIp '203.0.113.7' | Should Be $true
+            Test-JITFirewallRuleCoversIp -Rules $rules -CallerIp '203.0.113.7' | Should -Be $true
         }
     }
 
@@ -113,13 +113,13 @@ Describe 'Test-JITFirewallRuleCoversIp' {
         InModuleScope JITTargets {
             function New-SqlRule ($s, $e) { [PSCustomObject]@{ properties = [PSCustomObject]@{ startIpAddress = $s; endIpAddress = $e } } }
             $rules = @(New-SqlRule '10.0.0.1' '10.0.0.100')
-            Test-JITFirewallRuleCoversIp -Rules $rules -CallerIp '10.0.0.200' | Should Be $false
+            Test-JITFirewallRuleCoversIp -Rules $rules -CallerIp '10.0.0.200' | Should -Be $false
         }
     }
 
     It 'returns $false against an empty rule collection' {
         InModuleScope JITTargets {
-            Test-JITFirewallRuleCoversIp -Rules @() -CallerIp '10.0.0.1' | Should Be $false
+            Test-JITFirewallRuleCoversIp -Rules @() -CallerIp '10.0.0.1' | Should -Be $false
         }
     }
 
@@ -128,8 +128,8 @@ Describe 'Test-JITFirewallRuleCoversIp' {
         InModuleScope JITTargets {
             function New-SqlRule ($s, $e) { [PSCustomObject]@{ properties = [PSCustomObject]@{ startIpAddress = $s; endIpAddress = $e } } }
             $rules = @(New-SqlRule '200.0.0.0' '200.0.0.255')
-            Test-JITFirewallRuleCoversIp -Rules $rules -CallerIp '200.0.0.50'  | Should Be $true
-            Test-JITFirewallRuleCoversIp -Rules $rules -CallerIp '201.0.0.0'   | Should Be $false
+            Test-JITFirewallRuleCoversIp -Rules $rules -CallerIp '200.0.0.50'  | Should -Be $true
+            Test-JITFirewallRuleCoversIp -Rules $rules -CallerIp '201.0.0.0'   | Should -Be $false
         }
     }
 
@@ -137,7 +137,7 @@ Describe 'Test-JITFirewallRuleCoversIp' {
         InModuleScope JITTargets {
             function New-SqlRule ($s, $e) { [PSCustomObject]@{ properties = [PSCustomObject]@{ startIpAddress = $s; endIpAddress = $e } } }
             $rules = @(New-SqlRule '10.0.0.1' '10.0.0.100')
-            Test-JITFirewallRuleCoversIp -Rules $rules -CallerIp '2001:db8::1' | Should Be $false
+            Test-JITFirewallRuleCoversIp -Rules $rules -CallerIp '2001:db8::1' | Should -Be $false
         }
     }
 
@@ -145,7 +145,7 @@ Describe 'Test-JITFirewallRuleCoversIp' {
         InModuleScope JITTargets {
             function New-SqlRule ($s, $e) { [PSCustomObject]@{ properties = [PSCustomObject]@{ startIpAddress = $s; endIpAddress = $e } } }
             $rules = @((New-SqlRule 'garbage' 'also-garbage'), (New-SqlRule '10.0.0.1' '10.0.0.100'))
-            Test-JITFirewallRuleCoversIp -Rules $rules -CallerIp '10.0.0.50' | Should Be $true
+            Test-JITFirewallRuleCoversIp -Rules $rules -CallerIp '10.0.0.50' | Should -Be $true
         }
     }
 
@@ -155,7 +155,7 @@ Describe 'Test-JITFirewallRuleCoversIp' {
         InModuleScope JITTargets {
             $rules = @([PSCustomObject]@{ properties = [PSCustomObject]@{ startIP = '10.0.0.1'; endIP = '10.0.0.100' } })
             Test-JITFirewallRuleCoversIp -Rules $rules -CallerIp '10.0.0.50' `
-                -StartField 'startIP' -EndField 'endIP' | Should Be $true
+                -StartField 'startIP' -EndField 'endIP' | Should -Be $true
         }
     }
 
@@ -163,7 +163,7 @@ Describe 'Test-JITFirewallRuleCoversIp' {
         # The helper falls back to the item itself when $r.properties is absent.
         InModuleScope JITTargets {
             $rules = @([PSCustomObject]@{ startIpAddress = '10.0.0.1'; endIpAddress = '10.0.0.100' })
-            Test-JITFirewallRuleCoversIp -Rules $rules -CallerIp '10.0.0.50' | Should Be $true
+            Test-JITFirewallRuleCoversIp -Rules $rules -CallerIp '10.0.0.50' | Should -Be $true
         }
     }
 }

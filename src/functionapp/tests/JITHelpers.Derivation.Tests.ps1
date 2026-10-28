@@ -12,9 +12,14 @@
 # touches the network. Private Get-JitInstanceMetadata and the imported
 # Get-ManagedIdentityToken are mocked inside the module scope.
 #
-# Pester 3.4.0 compatible (no BeforeAll at top level, no Should -Verb syntax).
+# Pester 5+ (setup in BeforeAll, `Should -Verb` syntax). The GUIDs below MUST
+# be set at run time, not discovery time: when they were assigned in the script
+# body several tests compared $null to $null and passed without asserting
+# anything.
 #
 # Run:  Invoke-Pester ./src/functionapp/tests/JITHelpers.Derivation.Tests.ps1
+
+BeforeAll {
 
 # HttpHelpers exports Get-ManagedIdentityToken, which Get-JitTenantId calls and
 # expects to be present in the global scope at runtime. Load it first so the
@@ -61,6 +66,8 @@ function script:Reset-DerivationState {
     }
 }
 
+}   # end BeforeAll
+
 # ─────────────────────────────────────────────────────────────────────────────
 Describe 'Get-JitSubscriptionId' {
 
@@ -71,12 +78,12 @@ Describe 'Get-JitSubscriptionId' {
         $env:JIT_SUBSCRIPTION_ID = $script:EnvSub
         # A parseable WEBSITE_OWNER_NAME must NOT override the explicit env var.
         $env:WEBSITE_OWNER_NAME  = "$script:OwnerSub+my-rg-eastuswebspace"
-        Get-JitSubscriptionId | Should Be $script:EnvSub
+        Get-JitSubscriptionId | Should -Be $script:EnvSub
     }
 
     It 'parses the subscription GUID before the + from WEBSITE_OWNER_NAME' {
         $env:WEBSITE_OWNER_NAME = "$script:OwnerSub+my-rg-eastuswebspace"
-        Get-JitSubscriptionId | Should Be $script:OwnerSub
+        Get-JitSubscriptionId | Should -Be $script:OwnerSub
     }
 
     It 'falls through to IMDS when WEBSITE_OWNER_NAME is not a GUID' {
@@ -85,14 +92,14 @@ Describe 'Get-JitSubscriptionId' {
             [PSCustomObject]@{ subscriptionId = '33333333-3333-3333-3333-333333333333' }
         }
         # Returning the IMDS value proves the IMDS fallback path was taken.
-        Get-JitSubscriptionId | Should Be $script:ImdsSub
+        Get-JitSubscriptionId | Should -Be $script:ImdsSub
     }
 
     It 'falls through to IMDS when WEBSITE_OWNER_NAME is empty' {
         Mock -ModuleName JITHelpers Get-JitInstanceMetadata {
             [PSCustomObject]@{ subscriptionId = '33333333-3333-3333-3333-333333333333' }
         }
-        Get-JitSubscriptionId | Should Be $script:ImdsSub
+        Get-JitSubscriptionId | Should -Be $script:ImdsSub
     }
 }
 
@@ -105,12 +112,12 @@ Describe 'Get-JitResourceGroup' {
     It 'returns JIT_RESOURCE_GROUP when set (env wins)' {
         $env:JIT_RESOURCE_GROUP     = 'rg-override'
         $env:WEBSITE_RESOURCE_GROUP = 'rg-platform'
-        Get-JitResourceGroup | Should Be 'rg-override'
+        Get-JitResourceGroup | Should -Be 'rg-override'
     }
 
     It 'falls back to WEBSITE_RESOURCE_GROUP when JIT_RESOURCE_GROUP is unset' {
         $env:WEBSITE_RESOURCE_GROUP = 'rg-platform'
-        Get-JitResourceGroup | Should Be 'rg-platform'
+        Get-JitResourceGroup | Should -Be 'rg-platform'
     }
 }
 
@@ -123,12 +130,12 @@ Describe 'Get-JitSiteName' {
     It 'returns JIT_SITE_NAME when set (env wins)' {
         $env:JIT_SITE_NAME     = 'site-override'
         $env:WEBSITE_SITE_NAME = 'site-platform'
-        Get-JitSiteName | Should Be 'site-override'
+        Get-JitSiteName | Should -Be 'site-override'
     }
 
     It 'falls back to WEBSITE_SITE_NAME when JIT_SITE_NAME is unset' {
         $env:WEBSITE_SITE_NAME = 'site-platform'
-        Get-JitSiteName | Should Be 'site-platform'
+        Get-JitSiteName | Should -Be 'site-platform'
     }
 }
 
@@ -144,7 +151,7 @@ Describe 'Get-JitSiteResourceId' {
         $env:JIT_SUBSCRIPTION_ID  = $script:EnvSub
         $env:JIT_RESOURCE_GROUP   = 'rg-platform'
         $env:JIT_SITE_NAME        = 'site-platform'
-        Get-JitSiteResourceId | Should Be '/subscriptions/x/resourceGroups/y/providers/Microsoft.Web/sites/z'
+        Get-JitSiteResourceId | Should -Be '/subscriptions/x/resourceGroups/y/providers/Microsoft.Web/sites/z'
     }
 
     It 'assembles the resource id from the derived subscription, resource group, and site' {
@@ -153,7 +160,7 @@ Describe 'Get-JitSiteResourceId' {
         $env:JIT_RESOURCE_GROUP  = 'rg-platform'
         $env:JIT_SITE_NAME       = 'site-platform'
         $expected = "/subscriptions/$script:EnvSub/resourceGroups/rg-platform/providers/Microsoft.Web/sites/site-platform"
-        Get-JitSiteResourceId | Should Be $expected
+        Get-JitSiteResourceId | Should -Be $expected
     }
 }
 
@@ -165,7 +172,7 @@ Describe 'Get-JitTenantId' {
 
     It 'returns AZURE_TENANT_ID when set (env wins)' {
         $env:AZURE_TENANT_ID = $script:EnvTenant
-        Get-JitTenantId | Should Be $script:EnvTenant
+        Get-JitTenantId | Should -Be $script:EnvTenant
     }
 
     It 'decodes the tid claim from the MI ARM token when AZURE_TENANT_ID is unset' {
@@ -173,7 +180,7 @@ Describe 'Get-JitTenantId' {
         Mock -ModuleName JITHelpers Get-ManagedIdentityToken {
             return $global:__JitTidJwt
         }
-        Get-JitTenantId | Should Be $script:TidTenant
+        Get-JitTenantId | Should -Be $script:TidTenant
         Remove-Variable -Name __JitTidJwt -Scope Global -ErrorAction SilentlyContinue
     }
 }
@@ -192,6 +199,6 @@ Describe 'Test-CallerHasJitRequesterRole' {
         Mock -ModuleName JITHelpers Get-JitRequesterRoleDefinitionGuid { $null }
         Test-CallerHasJitRequesterRole `
             -CallerObjectId '00000000-0000-0000-0000-0000000000aa' `
-            -SubscriptionId $script:EnvSub | Should Be $false
+            -SubscriptionId $script:EnvSub | Should -Be $false
     }
 }

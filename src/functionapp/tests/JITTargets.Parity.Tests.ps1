@@ -7,7 +7,12 @@
 #
 # These are AST/metadata assertions, so they need no Azure and no mocks.
 #
-# Pester 3.4.0 compatible (no BeforeAll at top level, no Should -Verb syntax).
+# Pester 5+ (setup in BeforeAll, `Should -Verb` syntax). The type list MUST be
+# built at run time: with it built in the script body, $script:Types was empty
+# inside every It and five of these six guards passed by comparing '' to ''.
+# They are mutation-tested after any change here for exactly that reason.
+
+BeforeAll {
 
 Import-Module "$PSScriptRoot/../Modules/HttpHelpers/HttpHelpers.psm1" -Force -DisableNameChecking
 Import-Module "$PSScriptRoot/../Modules/JITHelpers/JITHelpers.psm1"   -Force
@@ -41,6 +46,8 @@ function script:Get-SwitchTokens {
     return @()
 }
 
+}   # end BeforeAll
+
 Describe 'Supported target-type parity' {
 
     It 'maps every supported type to an exported Add handler' {
@@ -59,31 +66,31 @@ Describe 'Supported target-type parity' {
             else { $bad += "$t -> no Add dispatch arm" }
         }
         if ($script:Exports -notcontains 'Add-JITNsgRule') { $bad += 'nsg -> Add-JITNsgRule (not exported)' }
-        ($bad -join '; ') | Should Be ''
+        ($bad -join '; ') | Should -Be ''
     }
 
     It 'dispatches every supported type in Request-JITAccess' {
         $tokens  = Get-SwitchTokens -RelPath '../Request-JITAccess/run.ps1' -MustContain 'sqlServer'
-        $tokens.Count | Should BeGreaterThan 0
+        $tokens.Count | Should -BeGreaterThan 0
         # NSG is handled before the switch (it needs the blob lock), so it is
         # legitimately absent from the dispatch switch itself.
         $expected = @($script:Types | Where-Object { $_ -ne 'nsg' })
         $missing  = @($expected | Where-Object { $tokens -notcontains $_ })
-        ($missing -join ',') | Should Be ''
+        ($missing -join ',') | Should -Be ''
     }
 
     It 'dispatches every supported type in Remove-ExpiredRules' {
         $tokens  = Get-SwitchTokens -RelPath '../Remove-ExpiredRules/run.ps1' -MustContain 'nsg'
-        $tokens.Count | Should BeGreaterThan 0
+        $tokens.Count | Should -BeGreaterThan 0
         $missing = @($script:Types | Where-Object { $tokens -notcontains $_ })
-        ($missing -join ',') | Should Be ''
+        ($missing -join ',') | Should -Be ''
     }
 
     It 'dispatches every supported type in Revoke-JITAccess' {
         $tokens  = Get-SwitchTokens -RelPath '../Revoke-JITAccess/run.ps1' -MustContain 'nsg'
-        $tokens.Count | Should BeGreaterThan 0
+        $tokens.Count | Should -BeGreaterThan 0
         $missing = @($script:Types | Where-Object { $tokens -notcontains $_ })
-        ($missing -join ',') | Should Be ''
+        ($missing -join ',') | Should -Be ''
     }
 
     It 'dispatches every supported type in the shared Invoke-JITTargetRemove' {
@@ -100,7 +107,7 @@ Describe 'Supported target-type parity' {
             }
         }
         $missing = @($script:Types | Where-Object { $tokens -notcontains $_ })
-        ($missing -join ',') | Should Be ''
+        ($missing -join ',') | Should -Be ''
     }
 
     It 'exports a Remove handler reachable for every supported type' {
@@ -116,6 +123,6 @@ Describe 'Supported target-type parity' {
             }
             else { $bad += "$t -> no dispatcher arm" }
         }
-        ($bad -join '; ') | Should Be ''
+        ($bad -join '; ') | Should -Be ''
     }
 }
