@@ -391,7 +391,22 @@ try {
             ResourceName   = $resourceName
             ResourceRg     = $resourceGroup
             SubscriptionId = $subscriptionId
-            RuleIdentifier = $ruleId
+            # Deliberately EMPTY until the grant reports what it actually
+            # used. Every Remove-JIT*Rule handler falls back from
+            # RuleIdentifier to the right per-type key when it is blank:
+            # RowKey for the seven named-rule types (nsg, sqlServer,
+            # postgres/mysql flexible, redis, synapse, appService) and
+            # CallerIp for the twelve that identify the entry by IP
+            # (storage, keyVault, cosmosDb, acr, aiSearch, cognitive, kusto,
+            # iotHub, signalR, eventHub, serviceBus, aks).
+            #
+            # Writing $ruleId here instead looked harmless and was not: for
+            # those twelve the handler would hunt for an ipRule whose VALUE is
+            # 'jit-alice-abcd1234', never match, report NotFound, and the
+            # timer would then delete the row -- leaving a live rule with
+            # nothing tracking it. That is the exact orphan the reservation
+            # exists to prevent, reintroduced for 12 of the 19 types.
+            RuleIdentifier = ''
             CallerIp       = $callerIp
             Port           = $portVal
             RequestedBy    = $requestedBy

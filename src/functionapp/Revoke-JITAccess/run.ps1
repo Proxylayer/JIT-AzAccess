@@ -98,23 +98,27 @@ if (-not $row) {
     return
 }
 
+# Ownership check — callers can only revoke rules they personally requested.
+if ($row.RequestedBy -ne $requestedBy) {
+    Write-JsonResponse -Status Forbidden -Body @{
+        error = 'You can only revoke rules you personally requested.'
+    }
+    return
+}
+
 # A reservation, not a grant: Request-JITAccess has claimed this slot and is
 # mid-flight against ARM. Removing it now would race that request - we could
 # delete the tracking row while the rule is still being created, which is
 # exactly the untracked-rule case the reservation exists to prevent. The row
 # carries a short expiry, so refusing here cannot strand anything.
+#
+# Placed AFTER the ownership check on purpose: answering 'InProgress' before
+# it would tell any authenticated caller that a given rule id exists and is
+# mid-grant, which is more than the 403 they are entitled to.
 if ($row.State -eq 'Pending') {
     Write-JsonResponse -Status Conflict -Body @{
         error  = "Rule '$ruleId' is still being granted. Retry in a moment."
         status = 'InProgress'
-    }
-    return
-}
-
-# Ownership check — callers can only revoke rules they personally requested.
-if ($row.RequestedBy -ne $requestedBy) {
-    Write-JsonResponse -Status Forbidden -Body @{
-        error = 'You can only revoke rules you personally requested.'
     }
     return
 }

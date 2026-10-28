@@ -410,6 +410,19 @@ Describe 'Request-JITAccess endpoint branching' {
             }
         }
 
+        It 'writes the reservation with NO RuleIdentifier' {
+            # It must stay blank until the grant reports what it actually
+            # used, so each Remove handler falls back to the right per-type
+            # key. Writing $ruleId here makes the twelve IP-identified types
+            # (storage, keyVault, cosmosDb, aks, ...) hunt for an ipRule whose
+            # VALUE is the rule id, find nothing, and report NotFound -- after
+            # which the timer deletes the row and the live rule is orphaned.
+            . $script:RunScript -Request $script:Req
+            Should -Invoke -CommandName Add-JITTableRow -Exactly -Times 1 -Scope It -ParameterFilter {
+                [string]::IsNullOrEmpty($Properties.RuleIdentifier)
+            }
+        }
+
         It 'writes the reservation as Pending with a short expiry, not the requested one' {
             . $script:RunScript -Request $script:Req
             Should -Invoke -CommandName Add-JITTableRow -Exactly -Times 1 -Scope It -ParameterFilter {

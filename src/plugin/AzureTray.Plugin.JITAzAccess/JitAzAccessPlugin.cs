@@ -764,6 +764,17 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                 var fetched      = new Dictionary<string, List<JitServerRule>>(StringComparer.OrdinalIgnoreCase);
                 string? callerIp = null;
 
+                // Set when any URL answers 401/403 this cycle. Without it, a
+                // tenant with two deployments where the caller holds the role
+                // on only one would set auth-blocked (for the failing URL) and
+                // then immediately clear it (because the other URL answered),
+                // every single poll — so the duplicate-prompt suppression never
+                // engaged and the user collected a fresh prompt every 90s. That
+                // was survivable while the prompt was a passive toast; it is
+                // not now that it is an ActionRequest, which never
+                // auto-dismisses.
+                var authFailed = false;
+
                 foreach (var url in pollUrls)
                 {
                     // Once-then-quiet per URL: an unhealthy function app fails
@@ -798,6 +809,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                         // once-per-streak log); the gate just tracks the streak so
                         // recovery is still announced once.
                         gate.RecordFailure(knownCondition: true);
+                        authFailed = true;
                         NotifyAuthBlocked(state, ex, url);
                     }
                     catch (Exception ex)
@@ -845,7 +857,11 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                             "rules ({Urls}).", unanswered.Count, string.Join(", ", unanswered));
 
                     changed = true;
-                    ClearAuthBlocked(state);
+
+                    // Only once NOTHING is auth-failing. Clearing while one
+                    // URL is still 403ing re-arms the prompt for the next
+                    // poll.
+                    if (!authFailed) ClearAuthBlocked(state);
                 }
             }
 
