@@ -166,6 +166,25 @@ Describe 'Get-JITRules' {
             $body[0].ruleId | Should -Be 'jit-alice-active01'
         }
 
+        It 'omits a reservation that has not been granted yet' {
+            # State='Pending' is a slot claimed by an in-flight request. The
+            # rule may not exist on the resource, and may never, so listing it
+            # would tell the caller they hold access they do not have.
+            $row = New-Row
+            $row | Add-Member -NotePropertyName State -NotePropertyValue 'Pending'
+            $global:__Rows = @($row)
+            . $script:RunScript -Request (New-Request)
+            $global:__Resp.Body | Should -Be '[]'
+        }
+
+        It 'still lists rows written before the State column existed' {
+            # Pre-reservation rows carry no State at all; absent must read as
+            # active, not as pending.
+            $global:__Rows = @(New-Row)
+            . $script:RunScript -Request (New-Request)
+            @($global:__Resp.Body | ConvertFrom-Json).Count | Should -Be 1
+        }
+
         It 'drops a row whose expiry cannot be parsed rather than reporting it active' {
             $row = New-Row
             $row.ExpiryUtc = 'not-a-date'

@@ -68,6 +68,7 @@ function script:New-Row {
         ExpiryUtc      = ([DateTime]::UtcNow.AddHours(2)).ToString('o')
         Justification  = 'incident 42'
         Port           = $null
+        State          = 'Active'
     }
 }
 
@@ -165,6 +166,20 @@ Describe 'Revoke-JITAccess' {
     # ── Ownership and RBAC ────────────────────────────────────────────────────
 
     Context 'ownership and authorization' {
+
+        It 'refuses to revoke a reservation that is still being granted' {
+            # State='Pending' means Request-JITAccess has claimed the slot and
+            # is mid-flight against ARM. Removing the row now would race that
+            # request and could delete the tracking row while the rule is
+            # still being created - the untracked-rule case reservations exist
+            # to prevent.
+            $global:__Row.State = 'Pending'
+            . $script:RunScript -Request (New-Request)
+            $global:__Resp.StatusCode | Should -Be ([System.Net.HttpStatusCode]::Conflict)
+            (Get-RespBody).status | Should -Be 'InProgress'
+            Should -Invoke -CommandName Remove-JITSqlFirewallRule -Exactly -Times 0 -Scope It
+            Should -Invoke -CommandName Remove-JITTableRow        -Exactly -Times 0 -Scope It
+        }
 
         It 'returns 404 when no rule matches the id' {
             Mock Get-JITTableRows { return @() }

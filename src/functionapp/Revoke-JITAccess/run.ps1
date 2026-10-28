@@ -1,4 +1,4 @@
-﻿# Revoke-JITAccess/run.ps1
+# Revoke-JITAccess/run.ps1
 #
 # HTTP DELETE /api/Revoke-JITAccess/{ruleId}
 #
@@ -94,6 +94,19 @@ catch {
 if (-not $row) {
     Write-JsonResponse -Status NotFound -Body @{
         error = "Rule '$ruleId' not found. It may have already expired or been revoked."
+    }
+    return
+}
+
+# A reservation, not a grant: Request-JITAccess has claimed this slot and is
+# mid-flight against ARM. Removing it now would race that request - we could
+# delete the tracking row while the rule is still being created, which is
+# exactly the untracked-rule case the reservation exists to prevent. The row
+# carries a short expiry, so refusing here cannot strand anything.
+if ($row.State -eq 'Pending') {
+    Write-JsonResponse -Status Conflict -Body @{
+        error  = "Rule '$ruleId' is still being granted. Retry in a moment."
+        status = 'InProgress'
     }
     return
 }
