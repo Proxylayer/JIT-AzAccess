@@ -49,6 +49,52 @@
 # FULL-BODY-PUT string-array types (no PATCH for cluster properties).
 . "$PSScriptRoot\Targets\Aks.ps1"
 
+# ---------------------------------------------------------------------------
+# Canonical list of supported target types.
+#
+# This used to be hand-copied into two validation arrays (Request-JITAccess and
+# Remove-ExpiredRules) that had to stay in step with three dispatch switches.
+# The dangerous direction of drift is a type accepted by the request validator
+# but missing from the timer's switch: the grant succeeds, and on expiry the
+# timer's unknown-type branch deletes the tracking row WITHOUT touching Azure,
+# leaving the firewall open permanently with nothing recording it.
+#
+# The validation lists now come from here. The dispatch switches stay explicit
+# and separate on purpose - the type token comes off a stored row, so it must
+# never be used to build a command name dynamically. JITTargets.Parity.Tests
+# asserts this list, the exported handlers and the dispatcher agree.
+# ---------------------------------------------------------------------------
+$script:JITSupportedTargetTypes = @(
+    'nsg'
+    'sqlServer'
+    'postgresqlFlexibleServer'
+    'storageAccount'
+    'keyVault'
+    'mysqlFlexibleServer'
+    'redis'
+    'synapse'
+    'cosmosDb'
+    'containerRegistry'
+    'aiSearch'
+    'cognitiveServices'
+    'kusto'
+    'iotHub'
+    'signalR'
+    'eventHub'
+    'serviceBus'
+    'appService'
+    'aks'
+)
+
+function Get-JITSupportedTargetTypes {
+    <#
+    .SYNOPSIS
+        The target-type tokens this module can grant and revoke. Returns a copy
+        so a caller cannot mutate the module's list.
+    #>
+    return @($script:JITSupportedTargetTypes)
+}
+
 function Invoke-JITTargetRemove {
     <#
     .SYNOPSIS
@@ -96,6 +142,7 @@ function Invoke-JITTargetRemove {
 }
 
 Export-ModuleMember -Function @(
+    'Get-JITSupportedTargetTypes'
     'Invoke-JITTargetRemove'
     'Add-JITNsgRule';           'Remove-JITNsgRule'
     'Add-JITSqlFirewallRule';   'Remove-JITSqlFirewallRule'

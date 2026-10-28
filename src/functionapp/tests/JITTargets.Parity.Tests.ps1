@@ -1,0 +1,121 @@
+# Parity guards for the supported target-type set.
+#
+# The failure these exist to prevent: a type accepted by Request-JITAccess but
+# missing from the Remove-ExpiredRules dispatch switch. The grant succeeds, and
+# at expiry the timer's unknown-type branch deletes the tracking row WITHOUT
+# touching Azure - the firewall stays open forever and nothing records it.
+#
+# These are AST/metadata assertions, so they need no Azure and no mocks.
+#
+# Pester 3.4.0 compatible (no BeforeAll at top level, no Should -Verb syntax).
+
+Import-Module "$PSScriptRoot/../Modules/HttpHelpers/HttpHelpers.psm1" -Force -DisableNameChecking
+Import-Module "$PSScriptRoot/../Modules/JITHelpers/JITHelpers.psm1"   -Force
+Import-Module "$PSScriptRoot/../Modules/JITTargets/JITTargets.psm1"   -Force
+
+$script:Types   = @(Get-JITSupportedTargetTypes)
+$script:Exports = (Get-Module JITTargets).ExportedFunctions.Keys
+
+# Pulls the literal switch labels out of a run.ps1's target-type switch, so the
+# test reads the real dispatch table rather than a copy of it.
+function script:Get-SwitchTokens {
+    param([string]$RelPath, [string]$MustContain)
+
+    $full = Join-Path $PSScriptRoot $RelPath
+    $ast  = [System.Management.Automation.Language.Parser]::ParseFile($full, [ref]$null, [ref]$null)
+
+    $switches = $ast.FindAll({
+        param($n) $n -is [System.Management.Automation.Language.SwitchStatementAst]
+    }, $true)
+
+    foreach ($sw in $switches) {
+        $tokens = @()
+        foreach ($clause in $sw.Clauses) {
+            $cond = $clause.Item1
+            if ($cond -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                $tokens += $cond.Value
+            }
+        }
+        if ($tokens -contains $MustContain) { return $tokens }
+    }
+    return @()
+}
+
+Describe 'Supported target-type parity' {
+
+    It 'maps every supported type to an exported Add handler' {
+        # Reads the real Request-JITAccess dispatch switch and checks the
+        # command each arm names is actually exported by JITTargets. NSG is
+        # granted before the switch (it needs the blob lock), so it is checked
+        # separately below.
+        $full = Join-Path $PSScriptRoot '../Request-JITAccess/run.ps1'
+        $text = Get-Content $full -Raw
+        $bad  = @()
+        foreach ($t in @($script:Types | Where-Object { $_ -ne 'nsg' })) {
+            if ($text -match "(?m)^\s*'$([regex]::Escape($t))'\s+\{\s*(Add-JIT\w+)\s") {
+                $fn = $matches[1]
+                if ($script:Exports -notcontains $fn) { $bad += "$t -> $fn (not exported)" }
+            }
+            else { $bad += "$t -> no Add dispatch arm" }
+        }
+        if ($script:Exports -notcontains 'Add-JITNsgRule') { $bad += 'nsg -> Add-JITNsgRule (not exported)' }
+        ($bad -join '; ') | Should Be ''
+    }
+
+    It 'dispatches every supported type in Request-JITAccess' {
+        $tokens  = Get-SwitchTokens -RelPath '../Request-JITAccess/run.ps1' -MustContain 'sqlServer'
+        $tokens.Count | Should BeGreaterThan 0
+        # NSG is handled before the switch (it needs the blob lock), so it is
+        # legitimately absent from the dispatch switch itself.
+        $expected = @($script:Types | Where-Object { $_ -ne 'nsg' })
+        $missing  = @($expected | Where-Object { $tokens -notcontains $_ })
+        ($missing -join ',') | Should Be ''
+    }
+
+    It 'dispatches every supported type in Remove-ExpiredRules' {
+        $tokens  = Get-SwitchTokens -RelPath '../Remove-ExpiredRules/run.ps1' -MustContain 'nsg'
+        $tokens.Count | Should BeGreaterThan 0
+        $missing = @($script:Types | Where-Object { $tokens -notcontains $_ })
+        ($missing -join ',') | Should Be ''
+    }
+
+    It 'dispatches every supported type in Revoke-JITAccess' {
+        $tokens  = Get-SwitchTokens -RelPath '../Revoke-JITAccess/run.ps1' -MustContain 'nsg'
+        $tokens.Count | Should BeGreaterThan 0
+        $missing = @($script:Types | Where-Object { $tokens -notcontains $_ })
+        ($missing -join ',') | Should Be ''
+    }
+
+    It 'dispatches every supported type in the shared Invoke-JITTargetRemove' {
+        $full   = Join-Path $PSScriptRoot '../Modules/JITTargets/JITTargets.psm1'
+        $ast    = [System.Management.Automation.Language.Parser]::ParseFile($full, [ref]$null, [ref]$null)
+        $sw     = @($ast.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.SwitchStatementAst]
+        }, $true))[0]
+        $tokens = @()
+        foreach ($clause in $sw.Clauses) {
+            $cond = $clause.Item1
+            if ($cond -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                $tokens += $cond.Value
+            }
+        }
+        $missing = @($script:Types | Where-Object { $tokens -notcontains $_ })
+        ($missing -join ',') | Should Be ''
+    }
+
+    It 'exports a Remove handler reachable for every supported type' {
+        # Every type must resolve through the shared dispatcher to a command
+        # that actually exists in the module.
+        $full = Join-Path $PSScriptRoot '../Modules/JITTargets/JITTargets.psm1'
+        $text = Get-Content $full -Raw
+        $bad  = @()
+        foreach ($t in $script:Types) {
+            if ($text -match "(?m)^\s*'$([regex]::Escape($t))'\s*\{\s*return\s+(Remove-JIT\w+)\s") {
+                $fn = $matches[1]
+                if ($script:Exports -notcontains $fn) { $bad += "$t -> $fn (not exported)" }
+            }
+            else { $bad += "$t -> no dispatcher arm" }
+        }
+        ($bad -join '; ') | Should Be ''
+    }
+}

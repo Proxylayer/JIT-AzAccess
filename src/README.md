@@ -207,6 +207,13 @@ Supported `targetType` values:
 
 `port` is NSG-only (omit for any-port; supports ranges like `8080-8090`).
 
+> **An NSG grant currently opens all ports and protocols.** `port` is recorded
+> on the audit row but is **not** applied to the security rule — the rule is
+> written with `protocol: *` and `destinationPortRange: *`, so the caller's IP
+> gets the NSG's whole inbound surface regardless of what `port` says. Treat an
+> NSG grant as a per-IP allowlist, not a per-port one. Port scoping is a
+> tracked follow-up.
+
 > **PostgreSQL / MySQL / Synapse** firewall-rule create and delete are **asynchronous**
 > (long-running) operations — JIT polls the operation to completion before confirming the
 > grant, and the expiry timer preserves the record for retry if a delete has not yet
