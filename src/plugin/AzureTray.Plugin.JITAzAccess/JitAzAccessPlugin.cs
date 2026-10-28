@@ -69,19 +69,38 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
     ///   ARM   — used by JitClient (talks to the JIT function app with an ARM token).
     ///   Graph — used by JitUrlDiscovery (reads app registration tags to self-discover the JIT URL).
     /// </summary>
+    /// <remarks>
+    /// ScopeName is the WIRE NAME and ScopeId is the GUID of the matching
+    /// oauth2PermissionScope on the resource service principal. These two were
+    /// filled in backwards: the wire name went into the GUID slot and a prose
+    /// label into the wire-name slot. Neither ScopeId parsed as a GUID, so the
+    /// host's pre-consent and "Fix Permissions" flow could not resolve either
+    /// scope — producing exactly the silent 401-on-first-use that declaring
+    /// them is meant to prevent.
+    ///
+    /// Both GUIDs below were read from a live tenant rather than copied:
+    ///   az ad sp show --id 797f4846-ba00-4fd7-ba43-dac1f8f63013 \
+    ///     --query "oauth2PermissionScopes[?value=='user_impersonation'].id"
+    ///   az ad sp show --id 00000003-0000-0000-c000-000000000000 \
+    ///     --query "oauth2PermissionScopes[?value=='Application.Read.All'].id"
+    /// They are the same in every tenant, which is why they can be baked in.
+    /// PermissionScopeIdsAreGuids in the test project guards the shape.
+    /// </remarks>
     public IReadOnlyList<PluginPermissionRequirement> RequiredPermissions =>
         new[]
         {
             new PluginPermissionRequirement(
                 Api:         PermissionApi.AzureResourceManager,
-                ScopeId:     "user_impersonation",
-                ScopeName:   "Azure Resource Manager user_impersonation",
+                ScopeName:   "user_impersonation",
+                ScopeId:     "41094075-9dad-400e-a0bd-54e686782033",
                 DisplayName: "Call the JIT function app + verify rules via ARM"),
 
+            // Admin-consent scope: the host surfaces that, and an admin has to
+            // approve it once per tenant.
             new PluginPermissionRequirement(
                 Api:         PermissionApi.MicrosoftGraph,
-                ScopeId:     "Application.Read.All",
-                ScopeName:   "Microsoft Graph Application.Read.All",
+                ScopeName:   "Application.Read.All",
+                ScopeId:     "c79f8feb-a9db-4090-85f9-90d820caa0eb",
                 DisplayName: "Read app registration tags (auto-discover JIT URL)"),
         };
 
@@ -134,9 +153,21 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
     // that any tenant user may be able to write.
     private const string BackendHostsOptionKey = "backendHostSuffixes";
 
-    // Asset-type selector keys. The host's generic option grid only renders
-    // Boolean/Text/Number (no Select/ComboBox), so the type picker is a set of
-    // Boolean checkboxes — one per catalog type plus an "All" master.
+    // Asset-type selector keys: one Boolean checkbox per catalog type plus an
+    // "All" master.
+    //
+    // This is NOT because the host can only render Boolean/Text/Number any
+    // more -- Select and Secret shipped in contracts 1.3.0 and the host has
+    // rendered them since v0.7.0. It stays a checkbox grid because Select is
+    // single-choice and there is no multi-select kind, so 19 types means 19
+    // controls either way. See docs/CONTRACTS-PROPOSALS.md proposal D.
+    //
+    // PluginOption.GroupWithKey looks like it would tidy this up by tying each
+    // checkbox to the master, and it does not: the contract specifies that the
+    // host disables a grouped option's editor when the PARTNER's value is
+    // false. Pointing these at "include.all" would therefore grey out the
+    // per-type checkboxes exactly when "All" is OFF -- the one time the user
+    // needs them. Documented as proposal G rather than shipped backwards.
     private const string IncludeAllOptionKey = "include.all";
     private const string IncludePrefix       = "include.";
 
@@ -146,6 +177,22 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
     // a stored value is blank or malformed).
     private const int    DefaultDurationHoursValue = 4;
     private const string DefaultAllowedDurations   = "1,2,4,8";
+
+    // Presets for the "Offered durations" combo box. The option used to be
+    // free text, where a typo fell back to 1,2,4,8 silently -- the user saw
+    // durations they had not chosen and nothing said why. ParseDurations
+    // stays as the fallback anyway, for values persisted before this changed
+    // and for a host that ignores AllowedValues.
+    private static readonly string[] AllowedDurationPresets =
+    {
+        "1,2,4",
+        "1,2,4,8",
+        "1,4,8",
+        "2,4,8",
+        "4,8",
+        "1,2,4,8,12",
+        "1,4,8,24",
+    };
 
     // Built once from the canonical catalog: the two duration options, the "All
     // asset types" master, then one "Include <label>" checkbox per asset type.
@@ -164,11 +211,12 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                 Description:  "Pre-selected duration in the grant prompt. A resource that declares its own durations still overrides this.",
                 DefaultValue: DefaultDurationHoursValue),
             new PluginOption(
-                Key:          AllowedDurationsOptionKey,
-                Label:        "Offered durations (hours)",
-                Kind:         PluginOptionKind.Text,
-                Description:  "Comma-separated durations offered in the grant prompt (e.g. 1,2,4,8). Used when a resource doesn't specify its own.",
-                DefaultValue: DefaultAllowedDurations),
+                Key:           AllowedDurationsOptionKey,
+                Label:         "Offered durations (hours)",
+                Kind:          PluginOptionKind.Select,
+                Description:   "Durations offered in the grant prompt. Used when a resource doesn't specify its own.",
+                DefaultValue:  DefaultAllowedDurations,
+                AllowedValues: AllowedDurationPresets),
             new PluginOption(
                 Key:          BackendHostsOptionKey,
                 Label:        "Allowed JIT backend hosts",
@@ -479,7 +527,14 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         _resources  = new ResourceDiscovery(context);
         _favorites  = new FavoritesStore(context.DataDir, context.Logger);
 
-        context.Logger.LogInformation("JIT Azure Access plugin initialised.");
+        // HostVersion is null on hosts predating the member. Logged rather
+        // than branched on: the one capability this plugin would gate,
+        // RefreshTokenAsync, already self-reports by returning false on a host
+        // that does not implement it, and asking the feature is more reliable
+        // than comparing version strings.
+        context.Logger.LogInformation(
+            "JIT Azure Access plugin {PluginVersion} initialised on host {HostVersion} (contract API v{ApiVersion}).",
+            AssemblyVersion, context.HostVersion ?? "(pre-0.3.0)", PluginApiVersion.Current);
 
         context.TenantReady   += OnTenantReady;
         context.TenantRemoved += OnTenantRemoved;
@@ -821,44 +876,81 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
 
     /// <summary>
     /// Called when a poll returns 401/403 for a tenant. Sets the auth-blocked
-    /// state and pushes a one-shot toast. Subsequent failures don't repeat the
-    /// toast until <see cref="ClearAuthBlocked"/> resets the state.
+    /// state and raises a one-shot prompt. Subsequent failures don't repeat it
+    /// until <see cref="ClearAuthBlocked"/> resets the state.
     /// </summary>
     private void NotifyAuthBlocked(TenantState state, JitHttpException ex, string url)
     {
         var context = _context;
         if (context is null) return;
 
-        // Suppress repeat toasts when the status hasn't changed.
+        // Suppress repeat prompts when the status hasn't changed.
         lock (state.Lock)
         {
             if (state.AuthBlocked && state.AuthBlockedStatus == ex.StatusCode)
             {
                 context.Logger.LogDebug(
-                    "JIT: still auth-blocked ({Status}) on {Url} — suppressing duplicate toast.", ex.StatusCode, url);
+                    "JIT: still auth-blocked ({Status}) on {Url} — suppressing duplicate prompt.", ex.StatusCode, url);
                 return;
             }
             state.AuthBlocked       = true;
             state.AuthBlockedStatus = ex.StatusCode;
         }
 
-        var (title, body) = ex.StatusCode switch
-        {
-            401 => ("JIT Access — sign-in required",
-                    "Your token was rejected by the JIT function app. Sign in to the tenant in AzureTray and try again."),
-            403 => ($"JIT Access — '{JitRequesterRoleNameDefault}' role required",
-                    $"You don't hold the '{JitRequesterRoleNameDefault}' RBAC role on the JIT function app. " +
-                    "Ask an admin to assign it to you on the function app site (or any parent scope)."),
-            _   => ("JIT Access — request rejected",
-                    ex.ServerError ?? ex.Message),
-        };
-
         context.Logger.LogWarning(
             "JIT: {Operation} returned {Status} from {Url}: {Server}",
             ex.Operation, ex.StatusCode, url, ex.ServerError ?? "(no body)");
 
-        FireAndForget(context.Notifier.ShowAsync(
-            new InformationRequest(Title: title, Message: body)
+        // Not awaited: an ActionRequest never auto-dismisses, so awaiting it
+        // here would stall the poll loop for as long as the toast sits on
+        // screen.
+        FireAndForget(PromptAuthBlockedAsync(state, ex, url, context), "auth-blocked prompt");
+
+        MenuChanged?.Invoke();
+    }
+
+    /// <summary>
+    /// Offers the user a token refresh for a 401/403, and performs it.
+    /// </summary>
+    /// <remarks>
+    /// This used to be a passive InformationRequest telling the user to go and
+    /// sign in again. Both statuses are usually fixable without that:
+    ///
+    ///   401 — the cached access token is stale or was rejected;
+    ///   403 — far more often a role assignment that exists server-side but is
+    ///         not in the token yet. Group and role claims are baked in at
+    ///         issue time, so a JIT-Requester assignment made (or a PIM
+    ///         activation approved) five minutes ago is invisible until the
+    ///         token rolls over, which can be an hour.
+    ///
+    /// IPluginContext.RefreshTokenAsync re-acquires the tenant's tokens
+    /// bypassing the cache, which is exactly that case. It never triggers an
+    /// interactive sign-in, and it returns false rather than throwing when the
+    /// host is too old to implement it, when the tenant is not enabled, or
+    /// when no genuinely new token could be had — so asking the feature is a
+    /// better gate than comparing HostVersion strings.
+    ///
+    /// Closes TODO-0009, which recorded that refresh was "IMPOSSIBLE via
+    /// Contracts 1.3.0". The host added it for precisely this.
+    /// </remarks>
+    private async Task PromptAuthBlockedAsync(
+        TenantState state, JitHttpException ex, string url, IPluginContext context)
+    {
+        var (title, body) = ex.StatusCode switch
+        {
+            401 => ("JIT Access — sign-in needs refreshing",
+                    "Your token was rejected by the JIT function app. Refreshing it usually fixes this; " +
+                    "if it doesn't, sign in to the tenant again in AzureTray."),
+            403 => ($"JIT Access — '{JitRequesterRoleNameDefault}' role not in your token",
+                    $"The JIT function app says you don't hold the '{JitRequesterRoleNameDefault}' RBAC role. " +
+                    "If it was assigned recently it may not be in your current token yet — refreshing picks it up. " +
+                    "If that doesn't help, ask an admin to assign it on the function app site or any parent scope."),
+            _   => ("JIT Access — request rejected",
+                    ex.ServerError ?? ex.Message),
+        };
+
+        var result = await context.Notifier.ShowAsync(
+            new ActionRequest(Title: title, Message: body, ActionLabel: "Refresh sign-in")
             {
                 Severity = NotificationSeverity.Warning,
                 Details  = new[]
@@ -869,9 +961,42 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                     new NotificationDetail("Server",   ex.ServerError ?? ex.Message),
                 },
             },
-            CancellationToken.None), "NotifyAuthBlocked notification");
+            CancellationToken.None).ConfigureAwait(false);
 
-        MenuChanged?.Invoke();
+        if (result is not ActionResult { ActionInvoked: true }) return;
+
+        var tenantId = state.Tenant.TenantId;
+        var refreshed = await context.RefreshTokenAsync(tenantId, CancellationToken.None)
+            .ConfigureAwait(false);
+
+        if (!refreshed)
+        {
+            // Documented as "carry on, the change will surface when the token
+            // naturally rolls over" — not an error, so this is not a red toast.
+            context.Logger.LogInformation(
+                "JIT: token refresh for tenant {TenantId} produced no new token; the claim change will " +
+                "surface when the token rolls over.", tenantId);
+            FireAndForget(context.Notifier.ShowAsync(
+                new InformationRequest(
+                    Title:   "JIT Access — nothing to refresh",
+                    Message: "Your token is already current. If access was granted very recently it can take " +
+                             "a little longer to appear; otherwise sign in to the tenant again in AzureTray.")
+                { Severity = NotificationSeverity.Info },
+                CancellationToken.None), "refresh-noop notification");
+            return;
+        }
+
+        context.Logger.LogInformation(
+            "JIT: token refreshed for tenant {TenantId} — re-polling.", tenantId);
+
+        // Force the next poll to actually hit the wire rather than sit behind
+        // the TTLs, so the user sees the result of the thing they just clicked.
+        lock (state.Lock)
+        {
+            state.RulesAt   = DateTime.MinValue;
+            state.TargetsAt = DateTime.MinValue;
+        }
+        await PollTenantAsync(state).ConfigureAwait(false);
     }
 
     /// <summary>Clears a tenant's auth-blocked state after a successful poll.</summary>
