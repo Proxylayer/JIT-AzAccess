@@ -90,8 +90,15 @@ Describe 'Request-JITAccess endpoint branching' {
         }
         Mock Add-JITTableRow    { }
         Mock Update-JITTableRow { }
+        Mock Remove-JITTableRow { }
         Mock Add-JITAuditRow    { }
         Mock Write-JITAuditEvent { }
+
+        # The abuse-prevention check now runs inside a caller-scoped blob
+        # lock. Run the scriptblock for real and return its value, so the
+        # limit/cooldown/reservation logic inside it is what these tests
+        # exercise - only the lease itself is faked away.
+        Mock Invoke-WithBlobLock { & $Action }
 
         # Default target handler outcome: a normal Created grant. Tests override.
         Mock Add-JITSqlFirewallRule { return @{ RuleIdentifier = 'jit-alice-abcd1234'; Status = 'Created' } }
@@ -174,8 +181,11 @@ Describe 'Request-JITAccess endpoint branching' {
         Get-RespStatus | Should -Be 'Extended'
         Should -Invoke -CommandName Update-JITTableRow -Times 1 -Scope It
         Should -Invoke -CommandName Add-JITAuditRow -Times 1 -Scope It -ParameterFilter { $Action -eq 'Extend' }
-        # An extend must NOT create a new JITRules row.
-        Should -Invoke -CommandName Add-JITTableRow -Exactly -Times 0 -Scope It
+        # An extend must leave exactly ONE tracked rule. The reservation is
+        # written before the grant, so the check is that it is released again
+        # rather than that nothing was ever inserted.
+        Should -Invoke -CommandName Add-JITTableRow    -Exactly -Times 1 -Scope It
+        Should -Invoke -CommandName Remove-JITTableRow -Exactly -Times 1 -Scope It
     }
 
     # ── AlreadyPresent -> AlreadyExternal (entry not managed by JIT) ────────────
@@ -186,8 +196,11 @@ Describe 'Request-JITAccess endpoint branching' {
         . $script:RunScript -Request $script:Req
         Get-RespStatus | Should -Be 'AlreadyWhitelisted'
         Should -Invoke -CommandName Add-JITAuditRow -Times 1 -Scope It -ParameterFilter { $Action -eq 'AlreadyExternal' }
+        # JIT did not create the whitelist entry, so it must not end up
+        # tracking or scheduling a removal for it: the reservation is released
+        # and never promoted.
         Should -Invoke -CommandName Update-JITTableRow -Exactly -Times 0 -Scope It
-        Should -Invoke -CommandName Add-JITTableRow    -Exactly -Times 0 -Scope It
+        Should -Invoke -CommandName Remove-JITTableRow -Exactly -Times 1 -Scope It
     }
 
     # ── SkippedOpen (resource open/unrestricted) ───────────────────────────────
@@ -197,7 +210,9 @@ Describe 'Request-JITAccess endpoint branching' {
         . $script:RunScript -Request $script:Req
         Get-RespStatus | Should -Be 'SkippedOpen'
         Should -Invoke -CommandName Add-JITAuditRow -Times 1 -Scope It -ParameterFilter { $Action -eq 'SkippedOpen' }
-        Should -Invoke -CommandName Add-JITTableRow    -Exactly -Times 0 -Scope It
+        # Nothing to revoke, so the reservation must be released and never
+        # promoted to Active.
+        Should -Invoke -CommandName Remove-JITTableRow -Exactly -Times 1 -Scope It
         Should -Invoke -CommandName Update-JITTableRow -Exactly -Times 0 -Scope It
     }
 
@@ -293,14 +308,17 @@ Describe 'Request-JITAccess endpoint branching' {
     # The worst failure this system can have: the firewall hole is open on the
     # resource and nothing records it, so the expiry timer will never revoke
     # it. Before the fix this logged a warning and returned 200 Created.
-    Context 'when the JITRules row cannot be written after a successful grant' {
+    Context 'when the reservation cannot be finalised after a successful grant' {
 
         BeforeEach {
             # The Functions worker leaves $ErrorActionPreference at Continue, so
             # run.ps1's Write-Error paths below are non-terminating there.
             # test.ps1 sets Stop for its own logic; match the worker.
             $ErrorActionPreference = 'Continue'
-            Mock Add-JITTableRow { throw 'table storage unavailable' }
+            # The row is now INSERTED before the grant (the reservation) and
+            # UPDATED after it (the finalise), so the failure that strands a
+            # live rule is the update.
+            Mock Update-JITTableRow { throw 'table storage unavailable' }
             Mock Invoke-JITTargetRemove { return @{ Status = 'Removed'; Details = @{} } }
         }
 
@@ -350,6 +368,119 @@ Describe 'Request-JITAccess endpoint branching' {
             Should -Invoke -CommandName Write-JITAuditEvent -Exactly -Times 0 -Scope It -ParameterFilter {
                 $EventType -eq 'JITGrantRolledBack'
             }
+        }
+    }
+
+    # ── Serialised abuse limits: the reservation (2.5) ────────────────────────
+    #
+    # The race: the limits used to be read here and the row written after an
+    # ARM call that can take minutes, so two concurrent requests from one
+    # caller both passed the check and both inserted. The fix makes "check"
+    # and "claim a slot" one atomic step under a caller-scoped lock, with the
+    # ARM call deliberately OUTSIDE it (a 60s lease with no renewal cannot
+    # safely span an LRO).
+    Context 'reservation' {
+
+        BeforeEach {
+            $global:__Order = @()
+            Mock Add-JITTableRow        { $global:__Order += 'reserve' }
+            Mock Update-JITTableRow     { $global:__Order += 'finalise' }
+            Mock Remove-JITTableRow     { $global:__Order += 'release' }
+            Mock Add-JITSqlFirewallRule {
+                $global:__Order += 'grant'
+                return @{ RuleIdentifier = 'jit-alice-abcd1234'; Status = 'Created' }
+            }
+        }
+
+        AfterEach {
+            Remove-Variable -Name __Order -Scope Global -ErrorAction SilentlyContinue
+        }
+
+        It 'claims the slot BEFORE calling ARM, and finalises it after' {
+            # This ordering IS the fix. A reservation written after the grant
+            # would leave the same window open that the bug lived in.
+            . $script:RunScript -Request $script:Req
+            ($global:__Order -join ',') | Should -Be 'reserve,grant,finalise'
+        }
+
+        It 'evaluates the limits inside a lock keyed on the caller' {
+            . $script:RunScript -Request $script:Req
+            Should -Invoke -CommandName Invoke-WithBlobLock -Exactly -Times 1 -Scope It -ParameterFilter {
+                $LockName -eq 'caller-oid-1'
+            }
+        }
+
+        It 'writes the reservation as Pending with a short expiry, not the requested one' {
+            . $script:RunScript -Request $script:Req
+            Should -Invoke -CommandName Add-JITTableRow -Exactly -Times 1 -Scope It -ParameterFilter {
+                $Properties.State -eq 'Pending' -and
+                $Properties.CallerIp -eq '10.1.2.3' -and
+                # 4h was requested; the reservation must expire far sooner so
+                # an abandoned one clears itself.
+                ([DateTime]::Parse($Properties.ExpiryUtc)).ToUniversalTime() -lt [DateTime]::UtcNow.AddHours(1)
+            }
+        }
+
+        It 'promotes the reservation to Active with the real expiry and the handler identifier' {
+            . $script:RunScript -Request $script:Req
+            Should -Invoke -CommandName Update-JITTableRow -Exactly -Times 1 -Scope It -ParameterFilter {
+                $Properties.State -eq 'Active' -and
+                $Properties.RuleIdentifier -eq 'jit-alice-abcd1234' -and
+                ([DateTime]::Parse($Properties.ExpiryUtc)).ToUniversalTime() -gt [DateTime]::UtcNow.AddHours(3)
+            }
+        }
+
+        It 'releases the slot when the grant fails' {
+            # Otherwise a failed request would cost the caller one of their
+            # five slots until the reservation expired.
+            $ErrorActionPreference = 'Continue'
+            Mock Add-JITSqlFirewallRule { $global:__Order += 'grant'; throw 'ARM rejected the write' }
+            . $script:RunScript -Request $script:Req 2>$null
+            ($global:__Order -join ',') | Should -Be 'reserve,grant,release'
+            $global:__Resp.StatusCode | Should -Be ([System.Net.HttpStatusCode]::InternalServerError)
+        }
+
+        It 'counts a reservation toward the per-caller limit' {
+            # The whole point: an in-flight request from the same caller
+            # occupies a slot even though its rule does not exist yet.
+            $global:__ActiveRow = @(1..5 | ForEach-Object {
+                [PSCustomObject]@{
+                    RowKey       = "jit-alice-pending$_"
+                    ResourceName = "other$_"
+                    SubscriptionId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+                    CallerIp     = '10.1.2.3'
+                    State        = 'Pending'
+                    ExpiryUtc    = ([DateTime]::UtcNow.AddMinutes(15)).ToString('o')
+                }
+            })
+            . $script:RunScript -Request $script:Req
+            $global:__Resp.StatusCode | Should -Be ([System.Net.HttpStatusCode]::TooManyRequests)
+            # Denied means no slot taken and no ARM call made.
+            ($global:__Order -join ',') | Should -Be ''
+        }
+
+        It 'refuses a duplicate while the first request for the resource is still in flight' {
+            $global:__ActiveRow = @([PSCustomObject]@{
+                RowKey         = 'jit-alice-inflight'
+                ResourceName   = 'res1'
+                SubscriptionId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+                CallerIp       = '10.1.2.3'
+                State          = 'Pending'
+                ExpiryUtc      = ([DateTime]::UtcNow.AddMinutes(15)).ToString('o')
+            })
+            . $script:RunScript -Request $script:Req
+            $global:__Resp.StatusCode | Should -Be ([System.Net.HttpStatusCode]::Conflict)
+            # Not reported as "you already have access" - the rule may not exist.
+            Get-RespStatus | Should -Not -Be 'AlreadyActive'
+            ($global:__Order -join ',') | Should -Be ''
+        }
+
+        It 'denies without reserving when the table cannot be read (fails closed)' {
+            $ErrorActionPreference = 'Continue'
+            Mock Get-JITTableRows { throw 'storage unavailable' }
+            . $script:RunScript -Request $script:Req 2>$null
+            $global:__Resp.StatusCode | Should -Be ([System.Net.HttpStatusCode]::ServiceUnavailable)
+            ($global:__Order -join ',') | Should -Be ''
         }
     }
 }

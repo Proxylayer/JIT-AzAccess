@@ -1,4 +1,4 @@
-﻿# JITHelpers.psm1 — shared helpers for the JIT NSG function app.
+# JITHelpers.psm1 — shared helpers for the JIT NSG function app.
 #
 # This module depends on HttpHelpers.psm1 instead of Az.* modules so the
 # function app stays slim. All Azure ops go through Invoke-RestMethod via
@@ -809,6 +809,14 @@ function Invoke-WithBlobLock {
             }
             Start-Sleep -Milliseconds $RetryDelayMs
         }
+    }
+
+    # Belt and braces: with RetryCount <= 0 the loop above never runs, which
+    # would otherwise mean executing the action with NO lock held and then
+    # trying to release a null lease. A lock helper that silently does not
+    # lock is worse than one that fails.
+    if (-not $leaseId) {
+        throw "Could not acquire lock '$LockName': no lease was obtained."
     }
 
     $actionResult = $null

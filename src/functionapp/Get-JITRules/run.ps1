@@ -1,4 +1,4 @@
-﻿# Get-JITRules/run.ps1
+# Get-JITRules/run.ps1
 #
 # HTTP GET — Returns active (non-expired) JIT rules from Table Storage that the
 # caller personally requested.
@@ -75,8 +75,15 @@ try {
     # so an OData range filter would depend on every row having been written in
     # the same lexicographically-sortable format. Dropping a row here means
     # hiding a live grant from its owner, so this one is not worth optimising.
+    # State='Pending' is a RESERVATION written by Request-JITAccess before it
+    # calls ARM (see its region 3b). The rule may not exist on the resource
+    # yet, and may never, so reporting one as an active grant would tell the
+    # caller they have access they do not have. Rows written before
+    # reservations existed carry no State at all, which is correctly not
+    # Pending.
     $active = $allRows | Where-Object {
-        $e = ConvertTo-JITUtc $_.ExpiryUtc; $e -and $e -gt $now
+        $_.State -ne 'Pending' -and
+        ($e = ConvertTo-JITUtc $_.ExpiryUtc) -and $e -gt $now
     }
 
     $active = @($active)
