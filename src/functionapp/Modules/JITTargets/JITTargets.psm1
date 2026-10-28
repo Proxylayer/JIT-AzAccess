@@ -49,7 +49,54 @@
 # FULL-BODY-PUT string-array types (no PATCH for cluster properties).
 . "$PSScriptRoot\Targets\Aks.ps1"
 
+function Invoke-JITTargetRemove {
+    <#
+    .SYNOPSIS
+        Dispatches a stored JITRules row to its Remove-JIT*Rule handler.
+
+    .DESCRIPTION
+        One explicit switch over the supported target types. Explicit on
+        purpose: the type token comes off a stored row, so it must never be
+        used to build a command name dynamically.
+
+        Added for the grant-rollback path in Request-JITAccess, which has to
+        undo a rule it just created when the tracking row cannot be written.
+        The three existing dispatch switches (Request / Revoke /
+        Remove-ExpiredRules) are untouched for now and are consolidated onto
+        this one separately.
+
+    .OUTPUTS
+        The handler's @{ Status; Details } hashtable, or $null for an
+        unrecognised target type (caller decides what that means).
+    #>
+    param([Parameter(Mandatory)]$Row)
+
+    switch ($Row.TargetType) {
+        'nsg'                      { return Remove-JITNsgRule                  -Row $Row }
+        'sqlServer'                { return Remove-JITSqlFirewallRule          -Row $Row }
+        'postgresqlFlexibleServer' { return Remove-JITPostgresFirewallRule     -Row $Row }
+        'storageAccount'           { return Remove-JITStorageNetworkRule       -Row $Row }
+        'keyVault'                 { return Remove-JITKeyVaultNetworkRule      -Row $Row }
+        'mysqlFlexibleServer'      { return Remove-JITMysqlFlexibleServerRule  -Row $Row }
+        'redis'                    { return Remove-JITRedisRule                -Row $Row }
+        'synapse'                  { return Remove-JITSynapseRule              -Row $Row }
+        'cosmosDb'                 { return Remove-JITCosmosDbRule             -Row $Row }
+        'containerRegistry'        { return Remove-JITContainerRegistryRule    -Row $Row }
+        'aiSearch'                 { return Remove-JITAiSearchRule             -Row $Row }
+        'cognitiveServices'        { return Remove-JITCognitiveServicesRule    -Row $Row }
+        'kusto'                    { return Remove-JITKustoRule                -Row $Row }
+        'iotHub'                   { return Remove-JITIotHubRule               -Row $Row }
+        'signalR'                  { return Remove-JITSignalRRule              -Row $Row }
+        'eventHub'                 { return Remove-JITEventHubRule             -Row $Row }
+        'serviceBus'               { return Remove-JITServiceBusRule           -Row $Row }
+        'appService'               { return Remove-JITAppServiceRule           -Row $Row }
+        'aks'                      { return Remove-JITAksRule                  -Row $Row }
+        default                    { return $null }
+    }
+}
+
 Export-ModuleMember -Function @(
+    'Invoke-JITTargetRemove'
     'Add-JITNsgRule';           'Remove-JITNsgRule'
     'Add-JITSqlFirewallRule';   'Remove-JITSqlFirewallRule'
     'Add-JITPostgresFirewallRule'; 'Remove-JITPostgresFirewallRule'

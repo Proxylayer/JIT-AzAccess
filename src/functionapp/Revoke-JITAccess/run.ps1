@@ -19,6 +19,10 @@ Import-Module "$PSScriptRoot/../Modules/JITTargets/JITTargets.psm1"   -Force
 $tenantId  = Get-JitTenantId
 $tableName = if ($env:JIT_TABLE_NAME) { $env:JIT_TABLE_NAME } else { 'JITRules' }
 
+# Correlation id for this request. Internal failure detail is logged against
+# it and only the id goes back to the caller.
+$correlationId = [guid]::NewGuid().ToString('N').Substring(0, 12)
+
 function Write-JsonResponse {
     param([HttpStatusCode]$Status, [hashtable]$Body)
     Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
@@ -79,7 +83,11 @@ try {
                Select-Object -First 1
 }
 catch {
-    Write-JsonResponse -Status InternalServerError -Body @{ error = "Failed to query table: $_" }
+    Write-Error "Revoke-JITAccess: rules table query failed [correlationId=$correlationId]: $_"
+    Write-JsonResponse -Status InternalServerError -Body @{
+        error         = 'Failed to query the rules table.'
+        correlationId = $correlationId
+    }
     return
 }
 
@@ -139,10 +147,12 @@ try {
     }
 }
 catch {
-    Write-Error "Revoke-JITAccess: failed to remove rule '$ruleId' from resource — $_"
+    # Log the detail; return only the correlation id. Exception text can carry
+    # ARM URLs, resource ids and raw resource-provider error bodies.
+    Write-Error "Revoke-JITAccess: failed to remove rule '$ruleId' from resource [correlationId=$correlationId]: $_"
     Write-JsonResponse -Status InternalServerError -Body @{
-        error  = 'Failed to remove the rule from the target resource. The table record has NOT been deleted.'
-        detail = $_.ToString()
+        error         = 'Failed to remove the rule from the target resource. The table record has NOT been deleted.'
+        correlationId = $correlationId
     }
     return
 }

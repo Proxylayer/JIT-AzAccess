@@ -127,6 +127,12 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
     private const string DefaultDurationOptionKey  = "defaultDurationHours";
     private const string AllowedDurationsOptionKey = "allowedDurations";
 
+    // Egress allowlist for the self-discovered backend. See
+    // JitUrlDiscovery.IsAllowedBackendUrl — this is a security control, not a
+    // convenience, because the backend URL comes off an app-registration tag
+    // that any tenant user may be able to write.
+    private const string BackendHostsOptionKey = "backendHostSuffixes";
+
     // Asset-type selector keys. The host's generic option grid only renders
     // Boolean/Text/Number (no Select/ComboBox), so the type picker is a set of
     // Boolean checkboxes — one per catalog type plus an "All" master.
@@ -163,6 +169,12 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                 Description:  "Comma-separated durations offered in the grant prompt (e.g. 1,2,4,8). Used when a resource doesn't specify its own.",
                 DefaultValue: DefaultAllowedDurations),
             new PluginOption(
+                Key:          BackendHostsOptionKey,
+                Label:        "Allowed JIT backend hosts",
+                Kind:         PluginOptionKind.Text,
+                Description:  "Hosts the plugin may send your Azure token to. Comma-separated; an entry starting with '.' matches any host under that suffix. Only change this for a sovereign cloud or a custom domain.",
+                DefaultValue: JitUrlDiscovery.DefaultAllowedHostSuffixes),
+            new PluginOption(
                 Key:          IncludeAllOptionKey,
                 Label:        "All asset types",
                 Kind:         PluginOptionKind.Boolean,
@@ -191,6 +203,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         {
             [DefaultDurationOptionKey]  = DefaultDurationHoursValue,
             [AllowedDurationsOptionKey] = DefaultAllowedDurations,
+            [BackendHostsOptionKey]     = JitUrlDiscovery.DefaultAllowedHostSuffixes,
             [IncludeAllOptionKey]       = true,
         };
         foreach (var t in AssetTypeCatalog.All)
@@ -281,6 +294,11 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
     // Durations offered when a target doesn't declare its own.
     private int[] OfferedDurations =>
         ParseDurations(_optionValues.GetValueOrDefault(AllowedDurationsOptionKey) as string);
+
+    // Hosts a discovered JIT backend may live on. A blank or malformed value
+    // falls back to the built-in default rather than disabling the check.
+    private IReadOnlyList<string> AllowedBackendHosts =>
+        JitUrlDiscovery.ParseHostSuffixes(_optionValues.GetValueOrDefault(BackendHostsOptionKey) as string);
 
     private static bool TryToInt(object? value, out int result)
     {
@@ -441,7 +459,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         _client     = new JitClient(context);
         _verifier   = new ArmVerifier(context);
         _localStore = new ActiveRulesStore(context.DataDir, context.Logger);
-        _discovery  = new JitUrlDiscovery(context);
+        _discovery  = new JitUrlDiscovery(context, () => AllowedBackendHosts);
         _resources  = new ResourceDiscovery(context);
         _favorites  = new FavoritesStore(context.DataDir, context.Logger);
 
