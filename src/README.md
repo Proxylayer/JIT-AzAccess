@@ -50,7 +50,7 @@ plugin-side configuration needed.
 | Azure CLI (`az`) | `az login` before deploying |
 | Azure subscription | You need **Owner** or **User Access Administrator** to deploy the ARM template and create custom RBAC roles |
 | Entra ID role | Caller must be **Application Administrator** (or Global Admin) to grant Graph app role assignments to the function app MI |
-| AzureTray app registration | Must already exist in the tenant — its `notes` field is where the function app writes `jitBaseUrl` |
+| AzureTray app registration | Must already exist in the tenant — its `tags` array is where the function app writes one `jit-baseurl:<subscriptionId>=<url>` entry per deployment |
 
 ---
 
@@ -110,7 +110,7 @@ jit-azaccess/
   functionapp/                        # PowerShell Azure Functions code
     host.json
     requirements.psd1
-    profile.ps1                       # Writes jitBaseUrl to AzureTray app reg on cold start
+    profile.ps1                       # Writes the jit-baseurl:<sub>=<url> TAG to the AzureTray app reg on cold start
     Request-JITAccess/
       function.json                   # HTTP POST
       run.ps1
@@ -136,14 +136,16 @@ jit-azaccess/
 | Parameter | Default | Description |
 |---|---|---|
 | `location` | _(required)_ | Azure region for all resources |
-| `appName` | `jitazaccess` | Short lowercase alphanumeric name (3-15 chars) used to derive resource names |
+| `appName` | `pgjitazaccess` | Short lowercase alphanumeric name (3-15 chars) used to derive resource names. Matches the `-AppName` default in both Deploy.ps1 and Test-JITAccess.ps1 |
 | `resourceGroupName` | `rg-jit-azaccess` | Resource group to create |
-| `azureTrayAppRegistrationName` | `AzureTray` | Display name of the host app reg the function app writes `jitBaseUrl` to |
+| `azureTrayAppRegistrationName` | `AzureTray` | Display name of the host app reg the function app writes its `jit-baseurl:` tag to |
 | `allowedDurationsHours` | `1,4,8` | Comma-separated list of valid JIT durations in hours |
 | `nsgPriorityMin` | `1000` | Lowest NSG rule priority the JIT app may assign |
 | `nsgPriorityMax` | `3900` | Highest NSG rule priority the JIT app may assign |
 | `maxRulesPerCaller` | `5` | Max simultaneously active rules per caller identity |
 | `maxRulesPerResource` | `20` | Max simultaneously active rules per target resource |
+| `logAnalyticsWorkspaceId` | _(required)_ | Resource ID of an existing Log Analytics workspace. The app runs from a package, so filesystem log streaming is off and App Insights is the only place its logs land — and the alert rules query it |
+| `alertEmailAddress` | _(required)_ | Receives the orphaned-grant, stuck-revocation and timer-silent alerts. Required because an alert nobody receives leaves a permanently-open firewall hole looking exactly like a healthy system |
 
 Resource names are derived from `appName`:
 

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Reflection;
 using System.Threading;
@@ -321,11 +322,13 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
         }
     }
 
+    private static readonly char[] DurationSeparators = { ',', ';', ' ', '\t' };
+
     private static int[] ParseDurations(string? csv)
     {
         if (string.IsNullOrWhiteSpace(csv)) return new[] { 1, 2, 4, 8 };
         var parsed = csv
-            .Split(new[] { ',', ';', ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Split(DurationSeparators, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(s => int.TryParse(s, out var n) ? n : 0)
             .Where(n => n > 0)
             .Distinct()
@@ -861,7 +864,7 @@ public sealed class JitAzAccessPlugin : ITrayPlugin, IMenuChangeNotifier, IBadge
                 Details  = new[]
                 {
                     new NotificationDetail("Tenant",   state.Tenant.DisplayName),
-                    new NotificationDetail("Status",   ex.StatusCode.ToString()),
+                    new NotificationDetail("Status",   ex.StatusCode.ToString(CultureInfo.InvariantCulture)),
                     new NotificationDetail("Endpoint", url),
                     new NotificationDetail("Server",   ex.ServerError ?? ex.Message),
                 },

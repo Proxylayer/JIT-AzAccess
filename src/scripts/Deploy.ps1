@@ -146,8 +146,8 @@ $lookup = if ($lookupJson) { ($lookupJson | ConvertFrom-Json).value } else { @()
 
 $azureTrayAppObjId = ''
 if (@($lookup).Count -eq 0) {
-    Write-Warning "App registration '$AzureTrayAppRegistrationName' not found. " +
-                  "URL self-register will be disabled until you re-run Deploy.ps1 once it exists."
+    Write-Warning ("App registration '$AzureTrayAppRegistrationName' not found. " +
+                   "URL self-register will be disabled until you re-run Deploy.ps1 once it exists.")
 }
 else {
     $azureTrayAppObjId = $lookup[0].id
@@ -317,7 +317,18 @@ $zipPath = Join-Path $env:TEMP "jit-azaccess-functionapp.zip"
 if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 
 Write-Host "Packaging $funcAppDir ..."
-Compress-Archive -Path "$funcAppDir\*" -DestinationPath $zipPath -Force
+# tests/ is ~3,000 lines of Pester that the worker would happily load into the
+# production app. Stage the content first and drop it.
+$stageDir = Join-Path $env:TEMP "jit-azaccess-stage"
+if (Test-Path $stageDir) { Remove-Item $stageDir -Recurse -Force }
+Copy-Item -Path $funcAppDir -Destination $stageDir -Recurse -Force
+$stagedTests = Join-Path $stageDir 'tests'
+if (Test-Path $stagedTests) {
+    Remove-Item $stagedTests -Recurse -Force
+    Write-Host "  Excluded tests/ from the deployment package."
+}
+Compress-Archive -Path "$stageDir\*" -DestinationPath $zipPath -Force
+Remove-Item $stageDir -Recurse -Force
 Write-Host "  Package: $zipPath ($([Math]::Round((Get-Item $zipPath).Length / 1KB)) KB)"
 
 Write-Host "Uploading package to $storageName/$packageContainer/$packageBlob ..."
@@ -350,15 +361,33 @@ Write-Host "  Package uploaded." -ForegroundColor Green
 # HTTP listeners are re-registered against the new content.
 Write-Host "Restarting $functionAppName to pick up the new package ..."
 az functionapp restart --name $functionAppName --resource-group $rgName --subscription $SubscriptionId --output none
-if ($LASTEXITCODE -ne 0) { Write-Warning "  Restart failed; the app may still be running the previous package." }
+if ($LASTEXITCODE -ne 0) {
+    # Fatal, not a warning. Without the restart the host keeps serving the
+    # PREVIOUS package while the script goes on to print "Deployment
+    # complete" - so a deploy that shipped nothing looks like one that worked.
+    Write-Error "Restart of '$functionAppName' failed. The app is still running the previous package; the deployment did NOT take effect."
+    exit 1
+}
 
 Write-Host "Syncing function triggers ..."
 az rest --method post `
     --url "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$rgName/providers/Microsoft.Web/sites/$functionAppName/syncfunctiontriggers?api-version=2022-03-01" `
     --output none
 if ($LASTEXITCODE -ne 0) {
-    Write-Warning "  Trigger sync failed. Timer triggers may not fire until you re-run it:"
-    Write-Warning "    az rest --method post --url https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$rgName/providers/Microsoft.Web/sites/$functionAppName/syncfunctiontriggers?api-version=2022-03-01"
+    # Fatal. This script's own note above says a missed trigger sync is how
+    # the timer stops firing while HTTP keeps working - and that is the
+    # eight-day outage recorded at the top of HttpHelpers.psm1. When the timer
+    # is not firing, nothing revokes anything and every grant is permanent.
+    # That must never be reported as a successful deployment.
+    Write-Error @"
+Trigger sync failed for '$functionAppName'. The expiry timer may not be registered,
+which means expired JIT rules will NOT be revoked. Re-run:
+
+  az rest --method post --url https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$rgName/providers/Microsoft.Web/sites/$functionAppName/syncfunctiontriggers?api-version=2022-03-01
+
+and confirm the timer runs before treating this deployment as complete.
+"@
+    exit 1
 }
 
 Write-Host "Code deployment succeeded." -ForegroundColor Green
@@ -426,8 +455,8 @@ else {
     # Make the function app MI an owner of the AzureTray app registration.
     # We resolved $azureTrayAppObjId in Step 0 — reuse it.
     if (-not $azureTrayAppObjId) {
-        Write-Warning "  AzureTray app registration '$AzureTrayAppRegistrationName' not found. " +
-                      "Cold-start URL self-register will fail until it exists and the MI is an owner."
+        Write-Warning ("  AzureTray app registration '$AzureTrayAppRegistrationName' not found. " +
+                       "Cold-start URL self-register will fail until it exists and the MI is an owner.")
     }
     else {
         $ownersJson = az rest --method GET `

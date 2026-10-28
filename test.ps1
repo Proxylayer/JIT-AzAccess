@@ -35,7 +35,11 @@
 [CmdletBinding()]
 param(
     [switch] $Detailed,
-    [string] $Target
+    [string] $Target,
+
+    # Skip the C# (xUnit) project. Useful on a machine without the .NET SDK,
+    # or when iterating on the PowerShell suite alone.
+    [switch] $SkipDotNet
 )
 
 $ErrorActionPreference = 'Stop'
@@ -142,6 +146,25 @@ foreach ($s in $standaloneFiles) {
     }
 }
 
+# ── Run the C# test project ──────────────────────────────────────────────────
+# Reported separately: xUnit owns its own counts, and folding them into the
+# Pester totals would make a failure ambiguous about which suite broke.
+$dotnetFailed = $false
+if (-not $SkipDotNet -and -not $Target) {
+    $testProj = Join-Path $PSScriptRoot 'src/plugin/AzureTray.Plugin.JITAzAccess.Tests/AzureTray.Plugin.JITAzAccess.Tests.csproj'
+    if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+        Write-Host ''
+        Write-Host 'dotnet SDK not found - skipping the C# test project.' -ForegroundColor Yellow
+    }
+    elseif (Test-Path $testProj) {
+        Write-Host ''
+        Write-Host 'Running C# tests...' -ForegroundColor Cyan
+        $verbosity = if ($Detailed) { 'normal' } else { 'quiet' }
+        & dotnet test $testProj --nologo -v $verbosity
+        if ($LASTEXITCODE -ne 0) { $dotnetFailed = $true }
+    }
+}
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 Write-Host ''
 Write-Host '================ Test Summary ================'
@@ -149,6 +172,9 @@ Write-Host ("Total:   {0}" -f $total)
 Write-Host ("Passed:  {0}" -f $passed)
 Write-Host ("Failed:  {0}" -f $failed)
 Write-Host ("Skipped: {0}" -f $skipped)
+if ($dotnetFailed) {
+    Write-Host 'C#:      FAILED (see dotnet test output above)' -ForegroundColor Red
+}
 if ($failedNames.Count -gt 0) {
     Write-Host ''
     Write-Host 'Failed tests:'
@@ -156,4 +182,4 @@ if ($failedNames.Count -gt 0) {
 }
 Write-Host '============================================='
 
-if ($failed -gt 0) { exit 1 } else { exit 0 }
+if ($failed -gt 0 -or $dotnetFailed) { exit 1 } else { exit 0 }

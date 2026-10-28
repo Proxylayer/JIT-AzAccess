@@ -23,3 +23,11 @@ local.settings.json
 
 # Deployment parameters with real values
 azuredeploy.parameters.json
+
+# Point-in-time `az role definition list` exports kept for reference only.
+# Nothing reads them: the authoritative role definitions live in
+# Grant-JITPermissions.ps1. They carry real subscription GUIDs in their
+# AssignableScopes, so they are ignored rather than tracked - otherwise they
+# are one `git add .` away from being published.
+src/JIT-AzAccess.json
+src/JIT-AzAccess-Manager.json

@@ -1,0 +1,20 @@
+# Test-project overrides. Inherits everything else from the repo-root
+# .editorconfig; these relax rules that only make sense for production code.
+
+[*.cs]
+
+# CA1707 (no underscores in identifiers): test names are sentences.
+dotnet_diagnostic.CA1707.severity = none
+
+# CA2007 (ConfigureAwait on every await): xUnit runs tests without a
+# synchronization context, so there is nothing to deadlock against.
+dotnet_diagnostic.CA2007.severity = none
+
+# CA1869 (cache JsonSerializerOptions): a test that deserializes one object
+# once is not the allocation path this rule exists for, and a shared static
+# would couple the cases together.
+dotnet_diagnostic.CA1869.severity = none
+
+# CA1861 (constant array arguments): the arrays here are expected values in
+# assertions, built once per test by design.
+dotnet_diagnostic.CA1861.severity = none
