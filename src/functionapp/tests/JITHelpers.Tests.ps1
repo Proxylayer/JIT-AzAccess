@@ -66,16 +66,28 @@ $script:VP = @{
 # Populate the JITHelpers module's JWKS cache with our test key so
 # Invoke-JwtValidation never hits the network during tests.
 function script:Set-TestJwksCache {
-    param([object[]]$Keys = @($script:Jwk))
-    # Use $global: to bridge the test script scope -> module scope boundary
-    $global:__JITTestKeys = $Keys
+    param(
+        [object[]]$Keys     = @($script:Jwk),
+        [string]  $TenantId = 'test-tenant'
+    )
+    # The module's JWKS cache is keyed by tenant id:
+    #   @{ <tenantId> = @{ Keys = [...]; FetchedAt = [DateTime] } }
+    # Use $global: to bridge the test script scope -> module scope boundary.
+    $global:__JITTestKeys   = $Keys
+    $global:__JITTestTenant = $TenantId
     InModuleScope JITHelpers {
         $script:JwksCache = @{
-            Keys      = $global:__JITTestKeys
-            FetchedAt = [DateTime]::UtcNow
+            $global:__JITTestTenant = @{
+                Keys      = $global:__JITTestKeys
+                FetchedAt = [DateTime]::UtcNow
+            }
         }
+        # Clear the kid-miss force-refresh throttle so a rotation test is never
+        # blocked by a forced refresh an earlier test already spent.
+        $script:JwksForcedRefreshAt = @{}
     }
-    Remove-Variable -Name __JITTestKeys -Scope Global -ErrorAction SilentlyContinue
+    Remove-Variable -Name __JITTestKeys   -Scope Global -ErrorAction SilentlyContinue
+    Remove-Variable -Name __JITTestTenant -Scope Global -ErrorAction SilentlyContinue
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

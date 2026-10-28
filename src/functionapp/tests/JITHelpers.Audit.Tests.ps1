@@ -463,10 +463,14 @@ Describe 'ConvertTo-JITAuditDetails' {
 # these stay meaningful independently of the function-host harnesses.
 Describe 'Add-JITAuditRow Details wiring at the call sites' {
 
-    It 'forwards Details on all four Request-JITAccess audit rows' {
+    # Six call sites: the four normal outcomes, plus the two on the
+    # compensating-remove path taken when the JITRules row cannot be written
+    # (GrantRolledBack = the rule was undone, OrphanedGrant = it could not be
+    # and a human must remove it). All six carry Details.
+    It 'forwards Details on all six Request-JITAccess audit rows' {
         $calls = Get-AuditRowCallSites '../Request-JITAccess/run.ps1'
-        $calls.Count | Should Be 4
-        (($calls.Action | Sort-Object) -join ',') | Should Be 'AlreadyExternal,Extend,Grant,SkippedOpen'
+        $calls.Count | Should Be 6
+        (($calls.Action | Sort-Object) -join ',') | Should Be 'AlreadyExternal,Extend,Grant,GrantRolledBack,OrphanedGrant,SkippedOpen'
         @($calls | Where-Object { -not $_.HasDetails }).Count | Should Be 0
     }
 
