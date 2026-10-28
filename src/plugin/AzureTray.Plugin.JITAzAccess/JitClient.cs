@@ -58,7 +58,7 @@ internal sealed class JitClient
             "JIT: POST {Url} (targetType={TargetType}, resource={ResourceName}, hours={DurationHours}).",
             url, request.TargetType, request.ResourceName, request.DurationHours);
 
-        var response = await _context.GetHttpClient(tenantId)
+        using var response = await _context.GetHttpClient(tenantId)
             .SendAsync(PluginHttpClientNames.Arm, _context.ArmScope, httpRequest, ct)
             .ConfigureAwait(false);
 
@@ -94,7 +94,7 @@ internal sealed class JitClient
 
         _context.Logger.LogDebug("JIT: GET {Url}", url);
 
-        var response = await _context.GetHttpClient(tenantId)
+        using var response = await _context.GetHttpClient(tenantId)
             .SendAsync(PluginHttpClientNames.Arm, _context.ArmScope, httpRequest, ct)
             .ConfigureAwait(false);
 
@@ -140,7 +140,7 @@ internal sealed class JitClient
 
         _context.Logger.LogDebug("JIT: DELETE {Url}", url);
 
-        var response = await _context.GetHttpClient(tenantId)
+        using var response = await _context.GetHttpClient(tenantId)
             .SendAsync(PluginHttpClientNames.Arm, _context.ArmScope, httpRequest, ct)
             .ConfigureAwait(false);
 

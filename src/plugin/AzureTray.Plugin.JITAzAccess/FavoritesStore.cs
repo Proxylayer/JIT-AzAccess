@@ -10,7 +10,8 @@ namespace AzureTray.Plugin.JITAzAccess;
 /// <summary>
 /// Thread-safe per-user store of favorite resource IDs. Persisted to
 /// DataDir/favorites.json so the user's choices survive plugin restarts.
-/// Mirrors the pattern used by <see cref="ActiveRulesStore"/>.
+/// Written through <see cref="AtomicFile"/> so an interrupted save cannot
+/// truncate the file and silently reset the user's favorites.
 /// </summary>
 internal sealed class FavoritesStore
 {
@@ -33,11 +34,6 @@ internal sealed class FavoritesStore
     {
         if (string.IsNullOrEmpty(id)) return false;
         lock (_lock) return _ids.Contains(id);
-    }
-
-    public IReadOnlyCollection<string> Snapshot()
-    {
-        lock (_lock) return _ids.ToArray();
     }
 
     /// <summary>Toggles favorite state. Returns the new state.</summary>
@@ -79,7 +75,7 @@ internal sealed class FavoritesStore
         try
         {
             var json = JsonSerializer.Serialize(_ids.ToArray(), JsonOptions);
-            File.WriteAllText(_filePath, json);
+            AtomicFile.WriteAllText(_filePath, json);
         }
         catch (Exception ex)
         {

@@ -194,15 +194,19 @@ internal sealed class JitUrlDiscovery
                 return JitUrlDiscoveryResult.Empty;
             }
 
-            if (!response.IsSuccessStatusCode)
+            string body;
+            using (response)
             {
-                _context.Logger.LogWarning(
-                    "JIT: Graph applications query returned {Status} for tenant {TenantId}.",
-                    (int)response.StatusCode, tenantId);
-                return JitUrlDiscoveryResult.Empty;
-            }
+                if (!response.IsSuccessStatusCode)
+                {
+                    _context.Logger.LogWarning(
+                        "JIT: Graph applications query returned {Status} for tenant {TenantId}.",
+                        (int)response.StatusCode, tenantId);
+                    return JitUrlDiscoveryResult.Empty;
+                }
 
-            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            }
 
             try
             {

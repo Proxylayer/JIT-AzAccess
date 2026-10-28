@@ -27,6 +27,12 @@ internal sealed class ResourceDiscovery
     private const string ResourceGraphUrl =
         "https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01";
 
+    // Cap the skipToken walk so a tenant with a very large resource estate (or
+    // a server that keeps handing back a token) can't turn a background poll
+    // into an unbounded crawl. 20 pages x 1000 rows is far past any realistic
+    // JIT-eligible estate. Mirrors JitUrlDiscovery.MaxPages.
+    private const int MaxPages = 20;
+
     private readonly IPluginContext _context;
 
     // Last discovered-resource count per tenant, used to demote the discovery
@@ -82,8 +88,10 @@ Resources
         // Resource Graph pages by skipToken when results > $top (default 100,
         // max 1000). Loop until exhausted.
         string? skipToken = null;
+        var pages = 0;
         do
         {
+            pages++;
             var body = new
             {
                 query   = kql,
@@ -111,13 +119,17 @@ Resources
                 return all;
             }
 
-            var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-
-            if (!response.IsSuccessStatusCode)
+            string responseBody;
+            using (response)
             {
-                _context.Logger.LogWarning(
-                    "JIT: Resource Graph returned {Status}: {Body}", (int)response.StatusCode, responseBody);
-                return all;
+                responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    _context.Logger.LogWarning(
+                        "JIT: Resource Graph returned {Status}: {Body}", (int)response.StatusCode, responseBody);
+                    return all;
+                }
             }
 
             try
@@ -144,7 +156,12 @@ Resources
                 return all;
             }
         }
-        while (!string.IsNullOrEmpty(skipToken));
+        while (!string.IsNullOrEmpty(skipToken) && pages < MaxPages);
+
+        if (!string.IsNullOrEmpty(skipToken))
+            _context.Logger.LogWarning(
+                "JIT: Resource Graph paging stopped at the {MaxPages}-page cap for tenant {TenantId}; " +
+                "some resources are not listed.", MaxPages, tenantId);
 
         // The count is a heartbeat: at INF every cycle it was ~77% of all INF
         // lines. Only a CHANGED count is information; a stable count is Debug.
