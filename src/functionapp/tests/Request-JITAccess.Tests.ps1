@@ -24,9 +24,11 @@
 #       no JIT row (external/manual entry)      -> AlreadyExternal audit, no row/extend
 #   • Add handler Status = 'SkippedOpen'        -> SkippedOpen audit, no row/extend
 #
-# Pester 3.4.0 compatible (no BeforeAll at top level, no Should -Verb syntax).
+# Pester 5+ (setup in BeforeAll, `Should -Verb` syntax).
 #
 # Run:  Invoke-Pester ./src/functionapp/tests/Request-JITAccess.Tests.ps1
+
+BeforeAll {
 
 Import-Module "$PSScriptRoot/../Modules/HttpHelpers/HttpHelpers.psm1" -Force -DisableNameChecking
 Import-Module "$PSScriptRoot/../Modules/JITHelpers/JITHelpers.psm1"   -Force
@@ -51,6 +53,8 @@ $script:RunScript = "$PSScriptRoot/../Request-JITAccess/run.ps1"
 
 # Parse the JSON body run.ps1 wrote into the captured HttpResponseContext.
 function script:Get-RespStatus { ($global:__Resp.Body | ConvertFrom-Json).status }
+
+}   # end BeforeAll
 
 Describe 'Request-JITAccess endpoint branching' {
 
@@ -120,14 +124,14 @@ Describe 'Request-JITAccess endpoint branching' {
         Mock Test-JustificationRequired { return $true }
         $script:Req.Body.justification = $null
         . $script:RunScript -Request $script:Req
-        $global:__Resp.StatusCode | Should Be ([System.Net.HttpStatusCode]::BadRequest)
+        $global:__Resp.StatusCode | Should -Be ([System.Net.HttpStatusCode]::BadRequest)
     }
 
     It 'writes a JITDenied(JustificationRequired) audit when justification is missing' {
         Mock Test-JustificationRequired { return $true }
         $script:Req.Body.justification = $null
         . $script:RunScript -Request $script:Req
-        Assert-MockCalled Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter {
+        Should -Invoke -CommandName Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter {
             $EventType -eq 'JITDenied' -and $DenyReason -eq 'JustificationRequired'
         }
     }
@@ -136,25 +140,25 @@ Describe 'Request-JITAccess endpoint branching' {
         Mock Test-JustificationRequired { return $true }
         $script:Req.Body.justification = $null
         . $script:RunScript -Request $script:Req
-        Assert-MockCalled Add-JITSqlFirewallRule -Exactly -Times 0 -Scope It
+        Should -Invoke -CommandName Add-JITSqlFirewallRule -Exactly -Times 0 -Scope It
     }
 
     It 'proceeds to grant when justification is NOT required, even if omitted' {
         Mock Test-JustificationRequired { return $false }
         $script:Req.Body.justification = $null
         . $script:RunScript -Request $script:Req
-        $global:__Resp.StatusCode | Should Be ([System.Net.HttpStatusCode]::OK)
-        Get-RespStatus | Should Be 'Created'
+        $global:__Resp.StatusCode | Should -Be ([System.Net.HttpStatusCode]::OK)
+        Get-RespStatus | Should -Be 'Created'
     }
 
     # ── Created (normal grant) ─────────────────────────────────────────────────
 
     It "records a JITRules row and a Grant audit on Status='Created'" {
         . $script:RunScript -Request $script:Req
-        Get-RespStatus | Should Be 'Created'
-        Assert-MockCalled Add-JITTableRow -Times 1 -Scope It
-        Assert-MockCalled Add-JITAuditRow -Times 1 -Scope It -ParameterFilter { $Action -eq 'Grant' }
-        Assert-MockCalled Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter { $EventType -eq 'JITGranted' }
+        Get-RespStatus | Should -Be 'Created'
+        Should -Invoke -CommandName Add-JITTableRow -Times 1 -Scope It
+        Should -Invoke -CommandName Add-JITAuditRow -Times 1 -Scope It -ParameterFilter { $Action -eq 'Grant' }
+        Should -Invoke -CommandName Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter { $EventType -eq 'JITGranted' }
     }
 
     # ── AlreadyPresent -> Extend (the whitelist entry is a JIT-managed row) ─────
@@ -167,11 +171,11 @@ Describe 'Request-JITAccess endpoint branching' {
             RuleIdentifier = 'jit-alice-existing1'
         }
         . $script:RunScript -Request $script:Req
-        Get-RespStatus | Should Be 'Extended'
-        Assert-MockCalled Update-JITTableRow -Times 1 -Scope It
-        Assert-MockCalled Add-JITAuditRow -Times 1 -Scope It -ParameterFilter { $Action -eq 'Extend' }
+        Get-RespStatus | Should -Be 'Extended'
+        Should -Invoke -CommandName Update-JITTableRow -Times 1 -Scope It
+        Should -Invoke -CommandName Add-JITAuditRow -Times 1 -Scope It -ParameterFilter { $Action -eq 'Extend' }
         # An extend must NOT create a new JITRules row.
-        Assert-MockCalled Add-JITTableRow -Exactly -Times 0 -Scope It
+        Should -Invoke -CommandName Add-JITTableRow -Exactly -Times 0 -Scope It
     }
 
     # ── AlreadyPresent -> AlreadyExternal (entry not managed by JIT) ────────────
@@ -180,10 +184,10 @@ Describe 'Request-JITAccess endpoint branching' {
         Mock Add-JITSqlFirewallRule { return @{ RuleIdentifier = 'jit-alice-abcd1234'; Status = 'AlreadyPresent' } }
         $global:__ExistingRow = $null   # region-5 CallerIp lookup returns nothing
         . $script:RunScript -Request $script:Req
-        Get-RespStatus | Should Be 'AlreadyWhitelisted'
-        Assert-MockCalled Add-JITAuditRow -Times 1 -Scope It -ParameterFilter { $Action -eq 'AlreadyExternal' }
-        Assert-MockCalled Update-JITTableRow -Exactly -Times 0 -Scope It
-        Assert-MockCalled Add-JITTableRow    -Exactly -Times 0 -Scope It
+        Get-RespStatus | Should -Be 'AlreadyWhitelisted'
+        Should -Invoke -CommandName Add-JITAuditRow -Times 1 -Scope It -ParameterFilter { $Action -eq 'AlreadyExternal' }
+        Should -Invoke -CommandName Update-JITTableRow -Exactly -Times 0 -Scope It
+        Should -Invoke -CommandName Add-JITTableRow    -Exactly -Times 0 -Scope It
     }
 
     # ── SkippedOpen (resource open/unrestricted) ───────────────────────────────
@@ -191,10 +195,10 @@ Describe 'Request-JITAccess endpoint branching' {
     It "records a SkippedOpen audit and no row on Status='SkippedOpen'" {
         Mock Add-JITSqlFirewallRule { return @{ RuleIdentifier = 'jit-alice-abcd1234'; Status = 'SkippedOpen' } }
         . $script:RunScript -Request $script:Req
-        Get-RespStatus | Should Be 'SkippedOpen'
-        Assert-MockCalled Add-JITAuditRow -Times 1 -Scope It -ParameterFilter { $Action -eq 'SkippedOpen' }
-        Assert-MockCalled Add-JITTableRow    -Exactly -Times 0 -Scope It
-        Assert-MockCalled Update-JITTableRow -Exactly -Times 0 -Scope It
+        Get-RespStatus | Should -Be 'SkippedOpen'
+        Should -Invoke -CommandName Add-JITAuditRow -Times 1 -Scope It -ParameterFilter { $Action -eq 'SkippedOpen' }
+        Should -Invoke -CommandName Add-JITTableRow    -Exactly -Times 0 -Scope It
+        Should -Invoke -CommandName Update-JITTableRow -Exactly -Times 0 -Scope It
     }
 
     # ── Idempotency / cooldown (2.8) ──────────────────────────────────────────
@@ -219,9 +223,9 @@ Describe 'Request-JITAccess endpoint branching' {
 
         . $script:RunScript -Request $script:Req
 
-        $global:__Resp.StatusCode | Should Be ([System.Net.HttpStatusCode]::OK)
-        Get-RespStatus            | Should Be 'AlreadyActive'
-        ($global:__Resp.Body | ConvertFrom-Json).ruleId | Should Be 'jit-alice-11112222'
+        $global:__Resp.StatusCode | Should -Be ([System.Net.HttpStatusCode]::OK)
+        Get-RespStatus            | Should -Be 'AlreadyActive'
+        ($global:__Resp.Body | ConvertFrom-Json).ruleId | Should -Be 'jit-alice-11112222'
     }
 
     It 'does not create a second rule or extend the expiry on the idempotent path' {
@@ -241,13 +245,13 @@ Describe 'Request-JITAccess endpoint branching' {
 
         . $script:RunScript -Request $script:Req
 
-        Assert-MockCalled Add-JITSqlFirewallRule -Times 0 -Scope It
-        Assert-MockCalled Add-JITTableRow        -Times 0 -Scope It
-        Assert-MockCalled Update-JITTableRow     -Times 0 -Scope It
+        Should -Invoke -CommandName Add-JITSqlFirewallRule -Times 0 -Scope It
+        Should -Invoke -CommandName Add-JITTableRow        -Times 0 -Scope It
+        Should -Invoke -CommandName Update-JITTableRow     -Times 0 -Scope It
         # ConvertFrom-Json rehydrates an ISO-8601 string as [DateTime], so compare
         # normalised values rather than raw text.
         $returned = ([DateTime](($global:__Resp.Body | ConvertFrom-Json).expiresUtc)).ToUniversalTime().ToString('o')
-        $returned | Should Be ([DateTime]$existingExpiry).ToUniversalTime().ToString('o')
+        $returned | Should -Be ([DateTime]$existingExpiry).ToUniversalTime().ToString('o')
     }
 
     It 'still returns 409 when the active rule belongs to a different caller IP' {
@@ -266,8 +270,8 @@ Describe 'Request-JITAccess endpoint branching' {
 
         . $script:RunScript -Request $script:Req
 
-        $global:__Resp.StatusCode | Should Be ([System.Net.HttpStatusCode]::Conflict)
-        Assert-MockCalled Add-JITSqlFirewallRule -Times 0 -Scope It
+        $global:__Resp.StatusCode | Should -Be ([System.Net.HttpStatusCode]::Conflict)
+        Should -Invoke -CommandName Add-JITSqlFirewallRule -Times 0 -Scope It
     }
 
     # ── Caller IP trust boundary (1.2) ────────────────────────────────────────
@@ -279,8 +283,73 @@ Describe 'Request-JITAccess endpoint branching' {
 
         . $script:RunScript -Request $script:Req
 
-        $global:__Resp.StatusCode | Should Be ([System.Net.HttpStatusCode]::BadRequest)
-        Assert-MockCalled Add-JITSqlFirewallRule -Times 0 -Scope It
-        Assert-MockCalled Add-JITTableRow        -Times 0 -Scope It
+        $global:__Resp.StatusCode | Should -Be ([System.Net.HttpStatusCode]::BadRequest)
+        Should -Invoke -CommandName Add-JITSqlFirewallRule -Times 0 -Scope It
+        Should -Invoke -CommandName Add-JITTableRow        -Times 0 -Scope It
+    }
+
+    # ── Compensating remove when the tracking row cannot be written ───────────
+    #
+    # The worst failure this system can have: the firewall hole is open on the
+    # resource and nothing records it, so the expiry timer will never revoke
+    # it. Before the fix this logged a warning and returned 200 Created.
+    Context 'when the JITRules row cannot be written after a successful grant' {
+
+        BeforeEach {
+            # The Functions worker leaves $ErrorActionPreference at Continue, so
+            # run.ps1's Write-Error paths below are non-terminating there.
+            # test.ps1 sets Stop for its own logic; match the worker.
+            $ErrorActionPreference = 'Continue'
+            Mock Add-JITTableRow { throw 'table storage unavailable' }
+            Mock Invoke-JITTargetRemove { return @{ Status = 'Removed'; Details = @{} } }
+        }
+
+        It 'removes the rule it just created rather than leaving it untracked' {
+            . $script:RunScript -Request $script:Req 2>$null 3>$null
+            Should -Invoke -CommandName Invoke-JITTargetRemove -Exactly -Times 1 -Scope It -ParameterFilter {
+                $Row.TargetType -eq 'sqlServer' -and $Row.ResourceName -eq 'res1'
+            }
+        }
+
+        It 'reports 500, never a success, when the grant could not be recorded' {
+            . $script:RunScript -Request $script:Req 2>$null 3>$null
+            $global:__Resp.StatusCode | Should -Be ([System.Net.HttpStatusCode]::InternalServerError)
+        }
+
+        It 'audits JITGrantRolledBack when the compensating remove succeeds' {
+            . $script:RunScript -Request $script:Req 2>$null 3>$null
+            Should -Invoke -CommandName Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter {
+                $EventType -eq 'JITGrantRolledBack'
+            }
+        }
+
+        It 'returns a correlation id and no exception detail to the caller' {
+            . $script:RunScript -Request $script:Req 2>$null 3>$null
+            $body = $global:__Resp.Body | ConvertFrom-Json
+            $body.correlationId | Should -Match '^[0-9a-f]{12}$'
+            ($body | ConvertTo-Json) | Should -Not -Match 'table storage unavailable'
+        }
+
+        It 'escalates to JITOrphanedGrant when the compensating remove also fails' {
+            Mock Invoke-JITTargetRemove { throw 'ARM delete failed too' }
+            . $script:RunScript -Request $script:Req 2>$null 3>$null
+            Should -Invoke -CommandName Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter {
+                $EventType -eq 'JITOrphanedGrant'
+            }
+            $global:__Resp.StatusCode | Should -Be ([System.Net.HttpStatusCode]::InternalServerError)
+        }
+
+        It 'escalates to JITOrphanedGrant when the rollback is refused rather than done' {
+            # AKS refuses to remove the last authorized range, so the rule stays
+            # live and untracked. That is an orphan, not a clean rollback.
+            Mock Invoke-JITTargetRemove { return @{ Status = 'Refused'; Details = @{} } }
+            . $script:RunScript -Request $script:Req 2>$null 3>$null
+            Should -Invoke -CommandName Write-JITAuditEvent -Times 1 -Scope It -ParameterFilter {
+                $EventType -eq 'JITOrphanedGrant'
+            }
+            Should -Invoke -CommandName Write-JITAuditEvent -Exactly -Times 0 -Scope It -ParameterFilter {
+                $EventType -eq 'JITGrantRolledBack'
+            }
+        }
     }
 }

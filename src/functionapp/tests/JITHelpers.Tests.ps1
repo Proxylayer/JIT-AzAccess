@@ -8,9 +8,13 @@
 # unit-tested here because mocking Get-AzAccessToken across module scopes is
 # brittle.
 #
-# Pester 3.4.0 compatible (no BeforeAll at top level, no Should -Verb syntax)
+# Pester 5+ (setup in BeforeAll, `Should -Verb` syntax). Everything below the
+# BeforeAll runs at RUN time: a Describe body runs at DISCOVERY time in Pester
+# 5, where none of this state would exist yet.
 #
 # Run:  Invoke-Pester ./src/functionapp/tests/JITHelpers.Tests.ps1
+
+BeforeAll {
 
 Import-Module "$PSScriptRoot/../Modules/JITHelpers/JITHelpers.psm1" -Force
 
@@ -90,6 +94,8 @@ function script:Set-TestJwksCache {
     Remove-Variable -Name __JITTestTenant -Scope Global -ErrorAction SilentlyContinue
 }
 
+}   # end BeforeAll
+
 # ─────────────────────────────────────────────────────────────────────────────
 Describe 'Invoke-JwtValidation' {
 
@@ -102,22 +108,22 @@ Describe 'Invoke-JwtValidation' {
     It 'returns the decoded payload for a fully valid RS256 token' {
         $token  = New-TestJwt -Claims (New-ValidClaims)
         $result = Invoke-JwtValidation -Token $token @script:VP
-        $result       | Should Not BeNullOrEmpty
-        $result.oid   | Should Be '00000000-0000-0000-0000-000000000001'
+        $result       | Should -Not -BeNullOrEmpty
+        $result.oid   | Should -Be '00000000-0000-0000-0000-000000000001'
     }
 
     It 'accepts the v2.0 issuer URL format' {
         $claims       = New-ValidClaims
         $claims['iss'] = 'https://login.microsoftonline.com/test-tenant/v2.0'
         $result = Invoke-JwtValidation -Token (New-TestJwt -Claims $claims) @script:VP
-        $result | Should Not BeNullOrEmpty
+        $result | Should -Not -BeNullOrEmpty
     }
 
     It 'accepts the trailing-slash variant of the ARM audience' {
         $claims        = New-ValidClaims
         $claims['aud'] = 'https://management.azure.com'
         $result = Invoke-JwtValidation -Token (New-TestJwt -Claims $claims) @script:VP
-        $result | Should Not BeNullOrEmpty
+        $result | Should -Not -BeNullOrEmpty
     }
 
     It 'accepts an explicit AllowedAudiences override' {
@@ -126,19 +132,19 @@ Describe 'Invoke-JwtValidation' {
         $result = Invoke-JwtValidation -Token (New-TestJwt -Claims $claims) `
             -TenantId 'test-tenant' `
             -AllowedAudiences @('https://custom.example.com/')
-        $result | Should Not BeNullOrEmpty
+        $result | Should -Not -BeNullOrEmpty
     }
 
     # ── Algorithm ─────────────────────────────────────────────────────────────
 
     It 'rejects a token whose alg header is not RS256' {
         $result = Invoke-JwtValidation -Token (New-TestJwt -Claims (New-ValidClaims) -Alg 'HS256') @script:VP
-        $result | Should BeNullOrEmpty
+        $result | Should -BeNullOrEmpty
     }
 
     It 'rejects a token with alg: none' {
         $result = Invoke-JwtValidation -Token (New-TestJwt -Claims (New-ValidClaims) -Alg 'none') @script:VP
-        $result | Should BeNullOrEmpty
+        $result | Should -BeNullOrEmpty
     }
 
     # ── Time claims ───────────────────────────────────────────────────────────
@@ -147,14 +153,14 @@ Describe 'Invoke-JwtValidation' {
         $claims        = New-ValidClaims
         $claims['exp'] = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - 1
         $result = Invoke-JwtValidation -Token (New-TestJwt -Claims $claims) @script:VP
-        $result | Should BeNullOrEmpty
+        $result | Should -BeNullOrEmpty
     }
 
     It 'rejects a token whose nbf is in the future' {
         $claims        = New-ValidClaims
         $claims['nbf'] = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 3600
         $result = Invoke-JwtValidation -Token (New-TestJwt -Claims $claims) @script:VP
-        $result | Should BeNullOrEmpty
+        $result | Should -BeNullOrEmpty
     }
 
     # ── Tenant / issuer ───────────────────────────────────────────────────────
@@ -162,14 +168,14 @@ Describe 'Invoke-JwtValidation' {
     It 'rejects a token issued for a different tenant' {
         $result = Invoke-JwtValidation -Token (New-TestJwt -Claims (New-ValidClaims)) `
             -TenantId 'other-tenant'
-        $result | Should BeNullOrEmpty
+        $result | Should -BeNullOrEmpty
     }
 
     It 'rejects a token with an untrusted issuer' {
         $claims        = New-ValidClaims
         $claims['iss'] = 'https://evil.example.com/'
         $result = Invoke-JwtValidation -Token (New-TestJwt -Claims $claims) @script:VP
-        $result | Should BeNullOrEmpty
+        $result | Should -BeNullOrEmpty
     }
 
     # ── Audience ──────────────────────────────────────────────────────────────
@@ -178,7 +184,7 @@ Describe 'Invoke-JwtValidation' {
         $claims        = New-ValidClaims
         $claims['aud'] = 'api://some-other-app'
         $result = Invoke-JwtValidation -Token (New-TestJwt -Claims $claims) @script:VP
-        $result | Should BeNullOrEmpty
+        $result | Should -BeNullOrEmpty
     }
 
     # ── Signature ─────────────────────────────────────────────────────────────
@@ -187,7 +193,7 @@ Describe 'Invoke-JwtValidation' {
         $parts    = (New-TestJwt -Claims (New-ValidClaims)).Split('.')
         $tampered = "$($parts[0]).$($parts[1]).dGFtcGVyZWQ"
         $result   = Invoke-JwtValidation -Token $tampered @script:VP
-        $result | Should BeNullOrEmpty
+        $result | Should -BeNullOrEmpty
     }
 
     It 'rejects a token signed by a different key' {
@@ -201,19 +207,19 @@ Describe 'Invoke-JwtValidation' {
             [Security.Cryptography.HashAlgorithmName]::SHA256,
             [Security.Cryptography.RSASignaturePadding]::Pkcs1))
         $result = Invoke-JwtValidation -Token "$h.$p.$sig" @script:VP
-        $result | Should BeNullOrEmpty
+        $result | Should -BeNullOrEmpty
     }
 
     # ── Malformed tokens ──────────────────────────────────────────────────────
 
     It 'rejects a token with wrong part count' {
         $result = Invoke-JwtValidation -Token 'not.valid.jwt.structure' @script:VP
-        $result | Should BeNullOrEmpty
+        $result | Should -BeNullOrEmpty
     }
 
     It 'rejects an empty string token (parameter binding rejects it)' {
         # [Parameter(Mandatory)][string] without [AllowEmptyString()] rejects ''
-        { Invoke-JwtValidation -Token '' @script:VP } | Should Throw
+        { Invoke-JwtValidation -Token '' @script:VP } | Should -Throw
     }
 
     # ── Key rotation retry ────────────────────────────────────────────────────
@@ -228,7 +234,7 @@ Describe 'Invoke-JwtValidation' {
 
         $result = Invoke-JwtValidation -Token (New-TestJwt -Claims (New-ValidClaims)) @script:VP
 
-        $result | Should Not BeNullOrEmpty
+        $result | Should -Not -BeNullOrEmpty
         Remove-Variable -Name __JITRetryJwk -Scope Global -ErrorAction SilentlyContinue
     }
 }
@@ -236,39 +242,41 @@ Describe 'Invoke-JwtValidation' {
 # ─────────────────────────────────────────────────────────────────────────────
 Describe 'Get-AvailableNsgPriority' {
 
-    function New-MockNsg {
-        param([int[]]$InboundPriorities = @())
-        $rules = $InboundPriorities | ForEach-Object {
-            [PSCustomObject]@{ Direction = 'Inbound'; Priority = $_ }
+    BeforeAll {
+        function New-MockNsg {
+            param([int[]]$InboundPriorities = @())
+            $rules = $InboundPriorities | ForEach-Object {
+                [PSCustomObject]@{ Direction = 'Inbound'; Priority = $_ }
+            }
+            return [PSCustomObject]@{ SecurityRules = $rules }
         }
-        return [PSCustomObject]@{ SecurityRules = $rules }
     }
 
     It 'returns the minimum priority when no rules exist' {
-        Get-AvailableNsgPriority -Nsg (New-MockNsg) -Min 1000 -Max 3900 | Should Be 1000
+        Get-AvailableNsgPriority -Nsg (New-MockNsg) -Min 1000 -Max 3900 | Should -Be 1000
     }
 
     It 'returns the next available slot when the minimum is occupied' {
-        Get-AvailableNsgPriority -Nsg (New-MockNsg 1000) -Min 1000 -Max 3900 | Should Be 1010
+        Get-AvailableNsgPriority -Nsg (New-MockNsg 1000) -Min 1000 -Max 3900 | Should -Be 1010
     }
 
     It 'skips a run of consecutive occupied priorities' {
-        Get-AvailableNsgPriority -Nsg (New-MockNsg 1000, 1010, 1020) -Min 1000 -Max 3900 | Should Be 1030
+        Get-AvailableNsgPriority -Nsg (New-MockNsg 1000, 1010, 1020) -Min 1000 -Max 3900 | Should -Be 1030
     }
 
     It 'ignores outbound rules when selecting priority' {
         $nsg = [PSCustomObject]@{
             SecurityRules = @([PSCustomObject]@{ Direction = 'Outbound'; Priority = 1000 })
         }
-        Get-AvailableNsgPriority -Nsg $nsg -Min 1000 -Max 3900 | Should Be 1000
+        Get-AvailableNsgPriority -Nsg $nsg -Min 1000 -Max 3900 | Should -Be 1000
     }
 
     It 'respects a custom Min/Max range' {
-        Get-AvailableNsgPriority -Nsg (New-MockNsg) -Min 2000 -Max 2100 | Should Be 2000
+        Get-AvailableNsgPriority -Nsg (New-MockNsg) -Min 2000 -Max 2100 | Should -Be 2000
     }
 
     It 'throws when every priority in the range is occupied' {
         $allUsed = 1000..1090 | Where-Object { ($_ - 1000) % 10 -eq 0 }
-        { Get-AvailableNsgPriority -Nsg (New-MockNsg $allUsed) -Min 1000 -Max 1090 } | Should Throw
+        { Get-AvailableNsgPriority -Nsg (New-MockNsg $allUsed) -Min 1000 -Max 1090 } | Should -Throw
     }
 }

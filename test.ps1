@@ -19,10 +19,18 @@
                                      Combine with -Detailed to diagnose one thing.
 
     Two kinds of tests live under tests/:
-      * Pester (v3.4.0) files   — contain Describe blocks; run via Invoke-Pester.
+      * Pester files            — contain Describe blocks; run via Invoke-Pester.
       * Standalone script tests — HttpHelpers.Tests.ps1 is a plain assertion
                                   script that exits non-zero on failure; run in a
                                   child process and judged by its exit code.
+
+    Pester version: the suite is written against Pester 5+ syntax
+    (`Should -Be`, `Should -Invoke`, setup in BeforeAll). Windows ships Pester
+    3.4.0 in C:\Program Files\WindowsPowerShell\Modules, and a bare
+    `Import-Module Pester` can bind commands from it even when a newer version
+    is also installed — which fails in confusing ways, because 3.4.0's Mock and
+    Describe then shadow the new ones. So this script resolves the newest
+    installed version at or above the floor and imports it by exact version.
 #>
 [CmdletBinding()]
 param(
@@ -32,13 +40,31 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Floor, not a pin: 5.5.0 is the oldest release with the configuration object
+# and `Should -Invoke` in the form this suite uses. CI pins an exact version.
+$MinimumPesterVersion = [version]'5.5.0'
+
 $testsDir = Join-Path $PSScriptRoot 'src/functionapp/tests'
 if (-not (Test-Path $testsDir)) {
     Write-Error "Tests directory not found: $testsDir"
     exit 2
 }
 
-Import-Module Pester -RequiredVersion 3.4.0 -Force
+$pester = Get-Module -ListAvailable Pester |
+    Where-Object { $_.Version -ge $MinimumPesterVersion } |
+    Sort-Object Version -Descending |
+    Select-Object -First 1
+
+if (-not $pester) {
+    Write-Host "Pester $MinimumPesterVersion or newer is required but not installed." -ForegroundColor Red
+    Write-Host "Install it with:" -ForegroundColor Yellow
+    Write-Host "  Install-Module Pester -MinimumVersion $MinimumPesterVersion -Scope CurrentUser -Force -SkipPublisherCheck" -ForegroundColor Yellow
+    exit 2
+}
+
+Remove-Module Pester -Force -ErrorAction SilentlyContinue
+Import-Module Pester -RequiredVersion $pester.Version -Force
+Write-Host "Using Pester $($pester.Version)" -ForegroundColor DarkGray
 
 # ── Discover and classify test files ─────────────────────────────────────────
 $allFiles = Get-ChildItem -Path $testsDir -Filter '*.Tests.ps1' -File
@@ -79,24 +105,22 @@ $failedNames = @()
 
 # ── Run Pester files ─────────────────────────────────────────────────────────
 if ($pesterFiles.Count -gt 0) {
-    $invokeArgs = @{
-        Script   = @($pesterFiles.FullName)
-        PassThru = $true
-    }
-    # Simple mode: suppress per-test chatter. Detailed: full output.
-    if (-not $Detailed) { $invokeArgs['Quiet'] = $true }
-    if ($testNameFilter) { $invokeArgs['TestName'] = $testNameFilter }
+    $config = New-PesterConfiguration
+    $config.Run.Path     = @($pesterFiles.FullName)
+    $config.Run.PassThru = $true
+    $config.Output.Verbosity = if ($Detailed) { 'Detailed' } else { 'None' }
+    if ($testNameFilter) { $config.Filter.FullName = $testNameFilter }
 
-    $result = Invoke-Pester @invokeArgs
+    $result = Invoke-Pester -Configuration $config
 
     $total   += $result.TotalCount
     $passed  += $result.PassedCount
     $failed  += $result.FailedCount
-    $skipped += ($result.SkippedCount + $result.PendingCount + $result.InconclusiveCount)
+    $skipped += ($result.SkippedCount + $result.NotRunCount)
 
-    $failedNames += $result.TestResult |
-        Where-Object { -not $_.Passed -and $_.Result -eq 'Failed' } |
-        ForEach-Object { "$($_.Describe) > $($_.Name)" }
+    # ExpandedPath is "Describe.Context.It" — enough to find the test without
+    # re-running in -Detailed.
+    $failedNames += $result.Failed | ForEach-Object { $_.ExpandedPath }
 }
 
 # ── Run standalone assertion scripts (own process; exit code = pass/fail) ─────
