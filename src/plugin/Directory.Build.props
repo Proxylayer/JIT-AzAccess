@@ -1,0 +1,24 @@
+<Project>
+
+  <!--
+    Shared compiler settings for everything under src/plugin.
+
+    The plugin is a security boundary (it holds the user's ARM token and
+    decides which host to send it to), so a nullability warning or an unused
+    result here is worth stopping the build for rather than scrolling past.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+</Project>

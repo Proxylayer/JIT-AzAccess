@@ -1,10 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
-    <Nullable>enable</Nullable>
-    <ImplicitUsings>disable</ImplicitUsings>
-
+    <!-- TargetFramework / Nullable / analyzers come from ../Directory.Build.props -->
     <IsPackable>true</IsPackable>
     <!--
       PackageId MUST equal the assembly name. The AzureTray host installs a
@@ -69,6 +66,12 @@
       publishing by pointing at the released NuGet version.
     -->
     <PackageReference Include="AzureTray.Plugin.Contracts" Version="1.5.0" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The plugin's types are internal; the test project needs to see them.
+         Nothing else does, so this is not a public API surface. -->
+    <InternalsVisibleTo Include="AzureTray.Plugin.JITAzAccess.Tests" />
   </ItemGroup>
 
   <Target Name="PackTransitiveAssets">

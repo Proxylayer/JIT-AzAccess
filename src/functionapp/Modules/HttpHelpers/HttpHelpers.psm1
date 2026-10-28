@@ -356,15 +356,24 @@ function Invoke-BlobRest {
 # Invoke-RestMethod / Invoke-WebRequest exception. PS 5 puts it on
 # .Exception.Response.StatusCode; PS 7+ on .Exception.StatusCode.
 function Get-StatusFromError {
+    # Both shapes are probed because neither property is guaranteed to exist on
+    # an arbitrary exception; a miss here is expected, not an error, so each
+    # probe is swallowed and only traced. Returning 0 means "no status could be
+    # read", and every caller treats that as "not a status I can act on" and
+    # rethrows rather than assuming success.
     param($ErrorRecord)
     try {
         if ($null -ne $ErrorRecord.Exception.StatusCode) { return [int]$ErrorRecord.Exception.StatusCode }
-    } catch { }
+    } catch {
+        Write-Verbose "Get-StatusFromError: no Exception.StatusCode - $_"
+    }
     try {
         if ($ErrorRecord.Exception.Response -and $null -ne $ErrorRecord.Exception.Response.StatusCode) {
             return [int]$ErrorRecord.Exception.Response.StatusCode
         }
-    } catch { }
+    } catch {
+        Write-Verbose "Get-StatusFromError: no Exception.Response.StatusCode - $_"
+    }
     return 0
 }
 

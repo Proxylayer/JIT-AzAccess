@@ -31,6 +31,14 @@
         },
         "maxRulesPerResource": {
             "value": "20"
+        },
+        "logAnalyticsWorkspaceId": {
+            "_comment": "Required. The app runs from a package, so filesystem log streaming is off and App Insights is the only place its logs land - and the alert rules query it.",
+            "value": "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.OperationalInsights/workspaces/<workspace>"
+        },
+        "alertEmailAddress": {
+            "_comment": "Required. Receives the orphaned-grant, stuck-revocation and timer-silent alerts. An alert nobody receives leaves an open firewall hole looking like a healthy system.",
+            "value": "jit-operators@example.com"
         }
     }
 }

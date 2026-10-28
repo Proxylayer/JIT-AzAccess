@@ -1,0 +1,68 @@
+# EditorConfig for JIT-AzAccess
+# https://editorconfig.org
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = crlf
+insert_final_newline = true
+indent_style = space
+trim_trailing_whitespace = true
+
+[*.{ps1,psm1,psd1}]
+indent_size = 4
+
+[*.{json,yml,yaml}]
+indent_size = 2
+
+[*.md]
+indent_size = 2
+trim_trailing_whitespace = false
+
+[*.cs]
+indent_size = 4
+
+# ── Language conventions ─────────────────────────────────────────────────────
+csharp_style_namespace_declarations = file_scoped:warning
+csharp_style_var_for_built_in_types = true:silent
+csharp_style_var_when_type_is_apparent = true:silent
+csharp_prefer_braces = when_multiline:silent
+csharp_style_prefer_switch_expression = true:suggestion
+csharp_style_expression_bodied_methods = when_on_single_line:silent
+
+dotnet_sort_system_directives_first = true
+dotnet_style_require_accessibility_modifiers = for_non_interface_members:warning
+dotnet_style_readonly_field = true:warning
+
+# ── Analyzer rules tuned for this codebase ───────────────────────────────────
+
+# CA1031 (do not catch general Exception): the plugin's poll loop, store loads
+# and fire-and-forget paths deliberately catch everything — a plugin that
+# throws into the host's timer takes the tray icon down with it.
+dotnet_diagnostic.CA1031.severity = none
+
+# CA1848 (use LoggerMessage delegates): a tray plugin logs a handful of lines
+# per poll; the source-generated delegates are not worth the noise here.
+dotnet_diagnostic.CA1848.severity = none
+
+# CA1303 (do not pass literals as localized parameters): this plugin is not
+# localized.
+dotnet_diagnostic.CA1303.severity = none
+
+# CA1873 (argument may be expensive if logging is disabled): fires on every
+# structured-logging call whose argument is a property access or a cast. The
+# plugin logs a handful of lines per 90-second poll, so guarding each one
+# behind IsEnabled would cost more readability than it buys. Suggestion, not
+# an error.
+dotnet_diagnostic.CA1873.severity = suggestion
+
+# CA1859 (prefer concrete return types): the members it flags are deliberately
+# interface-typed because they are the plugin's contract with the host
+# (IReadOnlyList/IReadOnlyDictionary), where handing back a mutable List is
+# the thing to avoid.
+dotnet_diagnostic.CA1859.severity = suggestion
+
+# Test-project relaxations live in
+# src/plugin/AzureTray.Plugin.JITAzAccess.Tests/.editorconfig, next to the
+# code they apply to, rather than as a path glob here.

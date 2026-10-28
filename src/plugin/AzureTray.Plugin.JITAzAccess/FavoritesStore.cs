@@ -20,7 +20,7 @@ internal sealed class FavoritesStore
     private readonly string  _filePath;
     private readonly object  _lock = new();
     private readonly ILogger? _logger;
-    private HashSet<string>  _ids;
+    private readonly HashSet<string> _ids;
 
     public FavoritesStore(string dataDir, ILogger? logger = null)
     {
@@ -42,9 +42,10 @@ internal sealed class FavoritesStore
         if (string.IsNullOrEmpty(id)) return false;
         lock (_lock)
         {
-            bool nowFavorite;
-            if (_ids.Contains(id)) { _ids.Remove(id); nowFavorite = false; }
-            else                   { _ids.Add(id);    nowFavorite = true;  }
+            // Remove reports whether the id was there, so this toggles and
+            // determines the new state in a single lookup.
+            var nowFavorite = !_ids.Remove(id);
+            if (nowFavorite) { _ids.Add(id); }
             Save();
             return nowFavorite;
         }
