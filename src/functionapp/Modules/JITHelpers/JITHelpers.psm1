@@ -616,8 +616,11 @@ function Write-JITAuditEvent {
         # reach the table. RolledBack = the rule was successfully undone.
         # OrphanedGrant = it could NOT be undone and a human must intervene, because
         # nothing else in the system now knows the rule exists.
+        # JITRemoveStuck: a row whose removal has failed repeatedly. Without it
+        # a permanently-open firewall hole looks identical to a healthy system,
+        # because the timer just retries forever and says nothing.
         [ValidateSet('JITGranted','JITDenied','JITExpired','JITRemoveFailed','JITRevoked',
-                     'JITGrantRolledBack','JITOrphanedGrant')]
+                     'JITGrantRolledBack','JITOrphanedGrant','JITRemoveStuck')]
         [string]$EventType,
 
         [string]$Caller,
@@ -862,6 +865,44 @@ function script:New-LeaseHeaders {
 #endregion
 
 #region ── Table Storage Helpers ──────────────────────────────────────────────
+
+function ConvertTo-JITUtc {
+    <#
+    .SYNOPSIS
+        Parses a stored ExpiryUtc string to a UTC [DateTime], or $null when it
+        cannot be parsed.
+
+    .DESCRIPTION
+        Expiry was being read three different ways. Remove-ExpiredRules used
+        [DateTimeOffset]::Parse(...).UtcDateTime (correct), while
+        Request-JITAccess and Get-JITRules used [DateTime]::Parse(...) compared
+        against [DateTime]::UtcNow. [DateTime]::Parse on an ISO-8601 string
+        carrying an offset yields a LOCAL-kind value, so on any host whose local
+        time is not UTC those two disagreed with the timer about what had
+        expired — the grant path could treat a live rule as expired (and skip
+        the cooldown) while the timer had not yet revoked it.
+
+        AssumeUniversal covers rows written without an offset suffix: the column
+        is ExpiryUtc, so an offset-less value means UTC, not local time.
+        AdjustToUniversal makes the returned value Kind=Utc either way, so it is
+        always safe to compare against [DateTime]::UtcNow.
+    #>
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+
+    $parsed = [DateTime]::MinValue
+    $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor `
+              [System.Globalization.DateTimeStyles]::AdjustToUniversal
+
+    if ([DateTime]::TryParse($Value,
+                             [System.Globalization.CultureInfo]::InvariantCulture,
+                             $styles,
+                             [ref]$parsed)) {
+        return $parsed
+    }
+    return $null
+}
 
 function Get-JITTableName {
     <#
@@ -1322,6 +1363,7 @@ Export-ModuleMember -Function @(
     'Test-JustificationRequired'
     'Get-AvailableNsgPriority'
     'Invoke-WithBlobLock'
+    'ConvertTo-JITUtc'
     'Get-JITTableName'
     'Get-JITTableRows'
     'Add-JITTableRow'

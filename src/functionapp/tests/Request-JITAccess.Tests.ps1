@@ -78,7 +78,10 @@ Describe 'Request-JITAccess endpoint branching' {
         # (CallerIp filter) returns whatever a test stages in $global:__ExistingRow.
         Mock Get-JITTableName { return 'JITRules' }
         Mock Get-JITTableRows {
-            if ($Filter -like '*CallerIp eq*') { return @($global:__ExistingRow) }
+            if ($Filter -like '*CallerIp eq*')     { return @($global:__ExistingRow) }
+            # Abuse-prevention / cooldown lookup. $global:__ActiveRow lets a
+            # test stage an already-active rule for this caller.
+            if ($Filter -like '*RequestedBy eq*')  { return @($global:__ActiveRow) }
             return @()
         }
         Mock Add-JITTableRow    { }
@@ -90,6 +93,7 @@ Describe 'Request-JITAccess endpoint branching' {
         Mock Add-JITSqlFirewallRule { return @{ RuleIdentifier = 'jit-alice-abcd1234'; Status = 'Created' } }
 
         $global:__ExistingRow = $null
+        $global:__ActiveRow   = $null
 
         $script:Req = [PSCustomObject]@{
             Headers = @{ Authorization = 'Bearer token' }
@@ -107,6 +111,7 @@ Describe 'Request-JITAccess endpoint branching' {
     AfterEach {
         Remove-Variable -Name __Resp        -Scope Global -ErrorAction SilentlyContinue
         Remove-Variable -Name __ExistingRow -Scope Global -ErrorAction SilentlyContinue
+        Remove-Variable -Name __ActiveRow   -Scope Global -ErrorAction SilentlyContinue
     }
 
     # ── Justification gate (item 2) ────────────────────────────────────────────
@@ -190,5 +195,92 @@ Describe 'Request-JITAccess endpoint branching' {
         Assert-MockCalled Add-JITAuditRow -Times 1 -Scope It -ParameterFilter { $Action -eq 'SkippedOpen' }
         Assert-MockCalled Add-JITTableRow    -Exactly -Times 0 -Scope It
         Assert-MockCalled Update-JITTableRow -Exactly -Times 0 -Scope It
+    }
+
+    # ── Idempotency / cooldown (2.8) ──────────────────────────────────────────
+    #
+    # The host retries the grant POST and the plugin cannot disable it, so the
+    # same request can arrive twice. The second arrival must not be reported as
+    # a failure for a grant that already succeeded.
+
+    It 'returns the existing rule as success when the same caller IP already has one' {
+        $global:__ActiveRow = [PSCustomObject]@{
+            RowKey         = 'jit-alice-11112222'
+            PartitionKey   = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+            ResourceName   = 'res1'
+            ResourceRg     = 'rg1'
+            SubscriptionId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+            TargetType     = 'sqlServer'
+            RuleIdentifier = 'jit-alice-11112222'
+            CallerIp       = '10.1.2.3'
+            RequestedBy    = 'alice@contoso.com'
+            ExpiryUtc      = ([DateTime]::UtcNow.AddHours(3)).ToString('o')
+        }
+
+        . $script:RunScript -Request $script:Req
+
+        $global:__Resp.StatusCode | Should Be ([System.Net.HttpStatusCode]::OK)
+        Get-RespStatus            | Should Be 'AlreadyActive'
+        ($global:__Resp.Body | ConvertFrom-Json).ruleId | Should Be 'jit-alice-11112222'
+    }
+
+    It 'does not create a second rule or extend the expiry on the idempotent path' {
+        $existingExpiry = ([DateTime]::UtcNow.AddHours(3)).ToString('o')
+        $global:__ActiveRow = [PSCustomObject]@{
+            RowKey         = 'jit-alice-11112222'
+            PartitionKey   = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+            ResourceName   = 'res1'
+            ResourceRg     = 'rg1'
+            SubscriptionId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+            TargetType     = 'sqlServer'
+            RuleIdentifier = 'jit-alice-11112222'
+            CallerIp       = '10.1.2.3'
+            RequestedBy    = 'alice@contoso.com'
+            ExpiryUtc      = $existingExpiry
+        }
+
+        . $script:RunScript -Request $script:Req
+
+        Assert-MockCalled Add-JITSqlFirewallRule -Times 0 -Scope It
+        Assert-MockCalled Add-JITTableRow        -Times 0 -Scope It
+        Assert-MockCalled Update-JITTableRow     -Times 0 -Scope It
+        # ConvertFrom-Json rehydrates an ISO-8601 string as [DateTime], so compare
+        # normalised values rather than raw text.
+        $returned = ([DateTime](($global:__Resp.Body | ConvertFrom-Json).expiresUtc)).ToUniversalTime().ToString('o')
+        $returned | Should Be ([DateTime]$existingExpiry).ToUniversalTime().ToString('o')
+    }
+
+    It 'still returns 409 when the active rule belongs to a different caller IP' {
+        $global:__ActiveRow = [PSCustomObject]@{
+            RowKey         = 'jit-alice-33334444'
+            PartitionKey   = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+            ResourceName   = 'res1'
+            ResourceRg     = 'rg1'
+            SubscriptionId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+            TargetType     = 'sqlServer'
+            RuleIdentifier = 'jit-alice-33334444'
+            CallerIp       = '198.51.100.9'
+            RequestedBy    = 'alice@contoso.com'
+            ExpiryUtc      = ([DateTime]::UtcNow.AddHours(3)).ToString('o')
+        }
+
+        . $script:RunScript -Request $script:Req
+
+        $global:__Resp.StatusCode | Should Be ([System.Net.HttpStatusCode]::Conflict)
+        Assert-MockCalled Add-JITSqlFirewallRule -Times 0 -Scope It
+    }
+
+    # ── Caller IP trust boundary (1.2) ────────────────────────────────────────
+
+    It 'rejects a request whose client supplied its own X-Forwarded-For chain' {
+        Mock Resolve-JITCallerIp {
+            return @{ IpAddress = '10.1.2.3'; ClaimedIp = '203.0.113.50'; Spoofed = $true; EntryCount = 2 }
+        }
+
+        . $script:RunScript -Request $script:Req
+
+        $global:__Resp.StatusCode | Should Be ([System.Net.HttpStatusCode]::BadRequest)
+        Assert-MockCalled Add-JITSqlFirewallRule -Times 0 -Scope It
+        Assert-MockCalled Add-JITTableRow        -Times 0 -Scope It
     }
 }

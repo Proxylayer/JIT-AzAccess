@@ -138,12 +138,9 @@ $durationHours  = [int]$body.durationHours
 $port           = $body.port          # NSG only — null means any port
 $justification  = $body.justification # Optional free-text reason; required when target.requiresJustification = true
 
-$supportedTypes = @(
-    'nsg', 'sqlServer', 'postgresqlFlexibleServer', 'storageAccount', 'keyVault',
-    'mysqlFlexibleServer', 'redis', 'synapse', 'cosmosDb', 'containerRegistry',
-    'aiSearch', 'cognitiveServices', 'kusto', 'iotHub', 'signalR',
-    'eventHub', 'serviceBus', 'appService', 'aks'
-)
+# Single source of truth (Modules/JITTargets). Keeping a second hand-written
+# copy here is how a type ends up accepted for grant but unknown at expiry.
+$supportedTypes = Get-JITSupportedTargetTypes
 
 if ($targetType -notin $supportedTypes) {
     Write-JsonResponse -Status BadRequest -Body @{
@@ -271,12 +268,11 @@ Write-Host "Caller IP: $callerIp"
 
 try {
     Get-JITTableName -TableName $tableName | Out-Null
-    $now             = [DateTime]::UtcNow.ToString('o')
 
     # Count active (non-expired) rules for this caller across all resources
     $callerActive = (Get-JITTableRows -TableName $tableName `
         -Filter "RequestedBy eq '$oDataRequestedBy'") |
-        Where-Object { try { [DateTime]::Parse($_.ExpiryUtc) -gt [DateTime]::UtcNow } catch { $false } }
+        Where-Object { $e = ConvertTo-JITUtc $_.ExpiryUtc; $e -and $e -gt [DateTime]::UtcNow }
 
     if ($callerActive.Count -ge $maxRulesPerCaller) {
         Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp $callerIp `
@@ -293,7 +289,7 @@ try {
     # Count active rules on the target resource
     $resourceActive = (Get-JITTableRows -TableName $tableName `
         -Filter "ResourceName eq '$resourceName' and ResourceRg eq '$resourceGroup'") |
-        Where-Object { try { [DateTime]::Parse($_.ExpiryUtc) -gt [DateTime]::UtcNow } catch { $false } }
+        Where-Object { $e = ConvertTo-JITUtc $_.ExpiryUtc; $e -and $e -gt [DateTime]::UtcNow }
 
     if ($resourceActive.Count -ge $maxRulesPerResource) {
         Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp $callerIp `
@@ -313,12 +309,46 @@ try {
     } | Select-Object -First 1)
 
     if ($cooldownRow) {
+        # IDEMPOTENCY. The AzureTray host wraps its HTTP clients in a resilience
+        # handler that RETRIES, and the plugin can neither see nor disable it
+        # (AzureTray Program.cs: 30s per attempt, 100s total). A slow
+        # LRO-backed grant therefore gets re-sent — and the second attempt
+        # lands here, finds the row the FIRST attempt just wrote, and used to
+        # answer 409. A grant that actually succeeded was reported to the user
+        # as a conflict. Double-clicking the menu item did the same thing.
+        #
+        # So: if the active rule is for the SAME caller IP, the caller already
+        # has exactly what they asked for. Return it as success rather than an
+        # error. Matching on IP rather than a time window also covers the
+        # genuine conflict — if their IP has CHANGED, the existing rule does
+        # not help them and the cooldown below is the right answer.
+        #
+        # Deliberately does NOT extend the expiry: a retried request must be
+        # indistinguishable from the original, not a way to roll the clock.
+        if ($cooldownRow.CallerIp -eq $callerIp) {
+            Write-Host "Request for '$resourceName' already satisfied by rule '$($cooldownRow.RowKey)' for $callerIp — returning it (idempotent)."
+            Write-JsonResponse -Status OK -Body @{
+                status         = 'AlreadyActive'
+                message        = 'An active JIT rule already covers this resource for your IP.'
+                ruleId         = $cooldownRow.RowKey
+                ruleIdentifier = $cooldownRow.RuleIdentifier
+                targetType     = $cooldownRow.TargetType
+                resourceName   = $resourceName
+                resourceGroup  = $resourceGroup
+                subscriptionId = $subscriptionId
+                callerIp       = $callerIp
+                expiresUtc     = $cooldownRow.ExpiryUtc
+                requestedBy    = $requestedBy
+            }
+            return
+        }
+
         Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp $callerIp `
             -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
             -SubscriptionId $subscriptionId -DenyReason 'CooldownActive' `
-            -Extra @{ existingRuleId = $cooldownRow.RowKey; expiresUtc = $cooldownRow.ExpiryUtc }
+            -Extra @{ existingRuleId = $cooldownRow.RowKey; expiresUtc = $cooldownRow.ExpiryUtc; existingCallerIp = $cooldownRow.CallerIp }
         Write-JsonResponse -Status Conflict -Body @{
-            error          = 'An active JIT rule already exists for this resource. Wait for it to expire or revoke it first.'
+            error          = 'An active JIT rule already exists for this resource, granted to a different IP address. Wait for it to expire or revoke it first.'
             existingRuleId = $cooldownRow.RowKey
             expiresUtc     = $cooldownRow.ExpiryUtc
         }

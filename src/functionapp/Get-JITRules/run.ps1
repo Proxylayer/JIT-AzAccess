@@ -76,7 +76,7 @@ try {
     # the same lexicographically-sortable format. Dropping a row here means
     # hiding a live grant from its owner, so this one is not worth optimising.
     $active = $allRows | Where-Object {
-        try { [DateTime]::Parse($_.ExpiryUtc) -gt $now } catch { $false }
+        $e = ConvertTo-JITUtc $_.ExpiryUtc; $e -and $e -gt $now
     }
 
     $active = @($active)

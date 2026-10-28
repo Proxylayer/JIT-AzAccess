@@ -45,9 +45,18 @@ function Add-JITNsgRule {
                     -Min $PriorityMin -Max $PriorityMax
 
     # PUT the individual security rule — Azure merges this into the NSG.
-    # This is an IP whitelist: open ANY source port to ANY destination port for
-    # the caller's IP (all protocols). The requested $Port is ignored for the
-    # rule itself and kept only for the audit record.
+    #
+    # NOT YET PORT-SCOPED. This opens ANY source port to ANY destination port
+    # on ALL protocols for the caller's IP. The caller's requested $Port is
+    # accepted, validated and recorded on the audit row, but it is NOT applied
+    # to the rule — so a request for 443 grants the caller's IP the NSG's
+    # entire inbound surface while the audit trail reads "443".
+    #
+    # Do not assume the port is enforced. Enforcing it (writing
+    # destinationPortRange from $Port, '*' only when no port was given) is a
+    # deliberate follow-up: it narrows access for anyone currently relying on
+    # the all-ports behaviour, so it needs a rollout decision rather than a
+    # quiet change. Documented in src/README.md and docs/TECHNICAL-REFERENCE.md.
     $ruleBody = @{
         properties = @{
             protocol                  = '*'

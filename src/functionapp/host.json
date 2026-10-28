@@ -6,5 +6,22 @@
     "extensionBundle": {
         "id": "Microsoft.Azure.Functions.ExtensionBundle",
         "version": "[4.*, 5.0.0)"
+    },
+
+    "//functionTimeout": "Consumption (Y1) defaults to 5 minutes and caps at 10. The expiry timer fires every 5 minutes and one removal can poll a long-running ARM operation for 180-300s, so the default allowed a run to be killed mid-row. Remove-ExpiredRules stops itself at ~80% of this (JIT_CLEANUP_BUDGET_SECONDS) and logs what it deferred.",
+    "functionTimeout": "00:09:00",
+
+    "logging": {
+        "applicationInsights": {
+            "//samplingSettings": "Exception telemetry is excluded from sampling because the two escalations that must never be lost - JITOrphanedGrant (a live rule nothing tracks) and JITRemoveStuck (a hole that will not close) - are raised with Write-Error and arrive as exceptions. Traces are deliberately NOT excluded: every Write-Host would be exempted, at real cost. The durable record of grants and revocations is the JITRulesAudit table, which Application Insights sampling cannot touch.",
+            "samplingSettings": {
+                "isEnabled": true,
+                "maxTelemetryItemsPerSecond": 20,
+                "excludedTypes": "Exception"
+            }
+        },
+        "logLevel": {
+            "default": "Information"
+        }
     }
 }

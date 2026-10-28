@@ -12,6 +12,57 @@ Import-Module "$PSScriptRoot/../Modules/JITTargets/JITTargets.psm1"   -Force
 
 $tableName = if ($env:JIT_TABLE_NAME) { $env:JIT_TABLE_NAME } else { 'JITRules' }
 
+# A removal that keeps failing used to retry every 5 minutes forever with no
+# counter, no escalation and no alert - so an open firewall hole looked exactly
+# like a healthy system. Past this many consecutive failures the row is
+# reported as JITRemoveStuck (alert on it; see azuredeploy.json).
+$stuckThreshold = if ($env:JIT_REMOVE_STUCK_THRESHOLD) { [int]$env:JIT_REMOVE_STUCK_THRESHOLD } else { 12 }
+
+# The host kills a run at functionTimeout (host.json: 9 minutes). A single
+# removal can poll a long-running ARM operation for 180-300s, so a handful of
+# slow ones used to get the run killed MID-ROW. Stop at ~80% of the budget and
+# say what was deferred; the next tick picks the rest up.
+$budgetSeconds = if ($env:JIT_CLEANUP_BUDGET_SECONDS) { [int]$env:JIT_CLEANUP_BUDGET_SECONDS } else { 430 }
+$deadline      = [DateTime]::UtcNow.AddSeconds($budgetSeconds)
+
+# Consecutive-failure count carried on the row itself.
+function script:Get-RowRemoveAttempts {
+    param($Row)
+    $n = 0
+    $raw = $Row.RemoveAttempts
+    if ($null -ne $raw) { [void][int]::TryParse("$raw", [ref]$n) }
+    return $n
+}
+
+# Records one failed removal attempt on the row and escalates once the count
+# crosses the threshold. Never throws - the caller is already on a failure path.
+function script:Register-RemoveFailure {
+    param($Row, [string]$Label, [hashtable]$Extra = @{})
+
+    $attempts = (Get-RowRemoveAttempts $Row) + 1
+    try {
+        Update-JITTableRow -TableName $tableName `
+            -PartitionKey $Row.PartitionKey -RowKey $Row.RowKey `
+            -Properties @{ RemoveAttempts = $attempts }
+    }
+    catch {
+        Write-Warning "  Could not record RemoveAttempts=$attempts for $($Row.RowKey) - $_"
+    }
+
+    if ($attempts -ge $stuckThreshold) {
+        $stuckExtra = @{ removeAttempts = $attempts; threshold = $stuckThreshold }
+        foreach ($k in $Extra.Keys) { $stuckExtra[$k] = $Extra[$k] }
+        Write-JITAuditEvent -EventType JITRemoveStuck `
+            -Caller $Row.RequestedBy -CallerIp $Row.CallerIp `
+            -TargetType $Row.TargetType -ResourceName $Row.ResourceName `
+            -ResourceGroup $Row.ResourceRg -SubscriptionId $Row.SubscriptionId `
+            -RuleId $Row.RowKey -Extra $stuckExtra
+        Write-Error ("JIT STUCK: $Label has failed removal $attempts time(s). The IP is still " +
+                     "allowed on the resource and the rule has outlived its expiry. Investigate.")
+    }
+    return $attempts
+}
+
 Write-Host "JIT cleanup started at $(Get-Date -Format u)"
 
 #region ── Load expired records ───────────────────────────────────────────────
@@ -27,8 +78,11 @@ catch {
 
 $now     = [DateTime]::UtcNow
 $expired = $allRows | Where-Object {
-    try   { [DateTimeOffset]::Parse($_.ExpiryUtc).UtcDateTime -lt $now }
-    catch { $false }
+    $e = ConvertTo-JITUtc $_.ExpiryUtc
+    # Unparseable expiry: leave the row alone rather than guess. It surfaces
+    # as a row that never clears, which is visible, instead of a rule revoked
+    # early or one deleted without being revoked.
+    $e -and $e -lt $now
 }
 
 if (-not $expired) {
@@ -42,14 +96,22 @@ Write-Host "JIT cleanup: found $($expired.Count) expired rule(s) to remove."
 
 #region ── Remove each expired rule ──────────────────────────────────────────
 
-$supportedTypes = @(
-    'nsg', 'sqlServer', 'postgresqlFlexibleServer', 'storageAccount', 'keyVault',
-    'mysqlFlexibleServer', 'redis', 'synapse', 'cosmosDb', 'containerRegistry',
-    'aiSearch', 'cognitiveServices', 'kusto', 'iotHub', 'signalR',
-    'eventHub', 'serviceBus', 'appService', 'aks'
-)
+# Single source of truth (Modules/JITTargets). Keeping a second hand-written
+# copy here is how a type ends up accepted for grant but unknown at expiry.
+$supportedTypes = Get-JITSupportedTargetTypes
+
+$deferred = 0
 
 foreach ($row in $expired) {
+    # Out of budget: leave the rest for the next tick rather than be killed
+    # part-way through a removal.
+    if ([DateTime]::UtcNow -ge $deadline) { $deferred++; continue }
+
+    # Scoped per iteration: this used to persist across the loop, so the outer
+    # catch could read the PREVIOUS row's result and attribute one resource's
+    # state to another.
+    $removeResult = $null
+
     $label = "'$($row.RuleIdentifier)' ($($row.TargetType)) on '$($row.ResourceName)' (expired $($row.ExpiryUtc))"
 
     # Unknown type — we can't act on the resource, but the record is expired and
@@ -84,6 +146,14 @@ foreach ($row in $expired) {
             'serviceBus'               { Remove-JITServiceBusRule           -Row $row }
             'appService'               { Remove-JITAppServiceRule           -Row $row }
             'aks'                      { Remove-JITAksRule                  -Row $row }
+            default {
+                # Reached only if a type is in Get-JITSupportedTargetTypes but
+                # has no arm here. Throwing routes it to the catch below, which
+                # KEEPS the row and audits - the silent alternative is falling
+                # through with a null result, being treated as 'Removed', and
+                # deleting the tracking row for a rule still on the resource.
+                throw "No removal handler wired for supported targetType '$($row.TargetType)'."
+            }
         }
 
         # Remove handlers return a Status: Removed | NotFound | Refused. A handler
@@ -118,6 +188,7 @@ foreach ($row in $expired) {
             catch {
                 Write-Warning "  JITRulesAudit write failed for refused removal of ${label}: $_"
             }
+            Register-RemoveFailure -Row $row -Label $label -Extra @{ reason = 'refused-would-open-cluster' } | Out-Null
             # $removed stays $false — the record is intentionally preserved.
         }
         else {
@@ -170,6 +241,7 @@ foreach ($row in $expired) {
         catch {
             Write-Warning "  JITRulesAudit write failed for remove-failure of ${label}: $_"
         }
+        Register-RemoveFailure -Row $row -Label $label -Extra @{ error = $_.ToString() } | Out-Null
         # Leave the table record so we retry on the next tick.
     }
 
@@ -185,5 +257,10 @@ foreach ($row in $expired) {
 }
 
 #endregion
+
+if ($deferred -gt 0) {
+    Write-Warning ("JIT cleanup: ran out of time budget (${budgetSeconds}s) with $deferred expired " +
+                   "rule(s) not yet attempted. They will be retried on the next tick.")
+}
 
 Write-Host "JIT cleanup complete."
