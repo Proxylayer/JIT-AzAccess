@@ -61,15 +61,25 @@ $requestedBy = if ($claims.upn)         { $claims.upn }
 
 try {
     Get-JITTableName -TableName $tableName | Out-Null
-    $allRows    = Get-JITTableRows -TableName $tableName
+
+    # Filter by owner SERVER-side. This used to download every row in the table
+    # and filter in the worker, so each poll pulled every other caller's UPN,
+    # IP and justification across the wire just to throw them away.
+    # UPNs can contain apostrophes (o'brien@contoso.com); OData escapes a
+    # single quote by doubling it.
+    $oDataRequestedBy = $requestedBy -replace "'", "''"
+    $allRows = Get-JITTableRows -TableName $tableName -Filter "RequestedBy eq '$oDataRequestedBy'"
 
     $now    = [DateTime]::UtcNow
+    # Expiry stays a client-side comparison: ExpiryUtc is stored as a string,
+    # so an OData range filter would depend on every row having been written in
+    # the same lexicographically-sortable format. Dropping a row here means
+    # hiding a live grant from its owner, so this one is not worth optimising.
     $active = $allRows | Where-Object {
         try { [DateTime]::Parse($_.ExpiryUtc) -gt $now } catch { $false }
     }
 
-    # Callers see only the rules they personally requested.
-    $active = @($active | Where-Object { $_.RequestedBy -eq $requestedBy })
+    $active = @($active)
 
     $result = @($active | ForEach-Object {
         @{

@@ -65,6 +65,12 @@ Describe 'Request-JITAccess endpoint branching' {
         Mock Invoke-JwtValidation           { return @{ oid = 'oid-1'; upn = 'alice@contoso.com' } }
         Mock Test-CallerHasJitRequesterRole { return $true }
         Mock Test-JustificationRequired     { return $true }
+        # run.ps1 resolves the caller IP through Resolve-JITCallerIp so it can
+        # also reject a client-supplied X-Forwarded-For chain. Default: a clean
+        # platform-only chain.
+        Mock Resolve-JITCallerIp {
+            return @{ IpAddress = '10.1.2.3'; ClaimedIp = $null; Spoofed = $false; EntryCount = 1 }
+        }
         Mock Get-CallerIp                   { return '10.1.2.3' }
 
         # Table layer — abuse-prevention filters (RequestedBy/ResourceName) return

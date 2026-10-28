@@ -440,19 +440,36 @@ function Invoke-TableRest {
         [hashtable] $ExtraHeaders = @{}
     )
 
+    $params = New-TableRequestParams -Method $Method -Path $Path -Query $Query `
+                                     -Body $Body -ExtraHeaders $ExtraHeaders
+
+    return Invoke-RestMethod @params -ErrorAction Stop
+}
+
+function script:New-TableRequestParams {
+    <#
+    .SYNOPSIS
+        Builds the splat shared by Invoke-TableRest and Invoke-TableRestRaw so
+        the two can never drift on auth, api-version or Accept negotiation.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $Method,
+        [Parameter(Mandatory)][string] $Path,
+        [string]    $Query        = '',
+        $Body                     = $null,
+        [hashtable] $ExtraHeaders = @{}
+    )
+
     $sp   = Get-StorageParts
     $date = [DateTime]::UtcNow.ToString('R')
     $url  = "https://$($sp.Account).table.$($sp.Suffix)$Path"
     if ($Query) { $url = "$url`?$Query" }
 
     $bodyBytes = $null
-    $bodyJson  = $null
     if ($null -ne $Body) {
         $bodyJson  = if ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Depth 20 -Compress }
         $bodyBytes = [Text.Encoding]::UTF8.GetBytes($bodyJson)
     }
-
-    $contentType = if ($null -ne $Body) { 'application/json' } else { '' }
 
     # 2020-12-06 is the minimum version Microsoft documents for AAD (Bearer)
     # auth against the Table service. The old 2019-02-02 does still answer a
@@ -477,10 +494,60 @@ function Invoke-TableRest {
     }
     if ($bodyBytes) {
         $params.Body        = $bodyBytes
-        $params.ContentType = $contentType
+        $params.ContentType = 'application/json'
     }
 
-    return Invoke-RestMethod @params -ErrorAction Stop
+    return $params
+}
+
+function Invoke-TableRestRaw {
+    <#
+    .SYNOPSIS
+        Same request shape as Invoke-TableRest, but returns the raw response so
+        callers can read the response HEADERS.
+
+    .DESCRIPTION
+        Azure Table Storage returns at most 1000 entities per request and
+        reports "there is more" ONLY in the
+        `x-ms-continuation-NextPartitionKey` / `x-ms-continuation-NextRowKey`
+        response headers. Invoke-RestMethod discards headers, so a query made
+        through it silently truncates at the first page — which, for the JIT
+        rules table, means expired rules are never revoked and limit counts are
+        wrong. Paged readers (Get-JITTableRows) must use this instead.
+
+        Returns a hashtable:
+            @{ StatusCode = <int>; Headers = <hashtable>; Content = <string> }
+
+        Headers is a case-insensitive hashtable of single string values.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $Method,
+        [Parameter(Mandatory)][string] $Path,
+        [string]    $Query        = '',
+        $Body                     = $null,
+        [hashtable] $ExtraHeaders = @{}
+    )
+
+    $params = New-TableRequestParams -Method $Method -Path $Path -Query $Query `
+                                     -Body $Body -ExtraHeaders $ExtraHeaders
+
+    $resp = Invoke-WebRequest @params -ErrorAction Stop
+
+    # Collapse PS7's string[] header values the same way Invoke-ArmRestRaw does.
+    $headers = @{}
+    if ($resp.Headers) {
+        foreach ($h in $resp.Headers.GetEnumerator()) {
+            $val = $h.Value
+            if ($val -is [System.Array]) { $val = ($val -join ',') }
+            $headers[[string]$h.Key] = [string]$val
+        }
+    }
+
+    return @{
+        StatusCode = [int]$resp.StatusCode
+        Headers    = $headers
+        Content    = [string]$resp.Content
+    }
 }
 
 #endregion
@@ -494,5 +561,6 @@ Export-ModuleMember -Function @(
     'Test-ContainerExists'
     'New-Container'
     'Invoke-TableRest'
+    'Invoke-TableRestRaw'
     'Get-StatusFromError'
 )

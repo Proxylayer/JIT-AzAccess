@@ -47,6 +47,11 @@ $maxRulesPerResource = if ($env:JIT_MAX_RULES_PER_RESOURCE) { [int]$env:JIT_MAX_
 
 #region ── Helpers ────────────────────────────────────────────────────────────
 
+# Correlation id for this request. Internal failure detail is logged against
+# it and only the id goes back to the caller, so ARM URLs, resource ids and RP
+# error text stay out of the HTTP response.
+$correlationId = [guid]::NewGuid().ToString('N').Substring(0, 12)
+
 function Write-JsonResponse {
     param([HttpStatusCode]$Status, [hashtable]$Body)
     Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
@@ -227,7 +232,25 @@ if (-not (Test-CallerHasJitRequesterRole -CallerObjectId $callerObjectId -Subscr
 
 # Shared helper (also used by Get-JITRules) so the IP this grant whitelists is
 # exactly the IP reported back to clients for already-allowed detection.
-$callerIp = Get-CallerIp -Request $Request
+# Resolve-JITCallerIp reads the PLATFORM-written end of X-Forwarded-For, not
+# the client-written end, and reports whether the client tried to supply a
+# chain of its own. This IP is what gets a firewall hole punched for it, so the
+# caller must not be able to choose it.
+$callerIpInfo = Resolve-JITCallerIp -Request $Request
+$callerIp     = $callerIpInfo.IpAddress
+
+if ($callerIpInfo.Spoofed) {
+    Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp $callerIp `
+        -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
+        -SubscriptionId $subscriptionId -DenyReason 'SpoofedForwardedFor' `
+        -Extra @{ claimedIp = $callerIpInfo.ClaimedIp; xffEntryCount = $callerIpInfo.EntryCount }
+    Write-Warning ("Rejected request from ${requestedBy}: client supplied its own X-Forwarded-For " +
+                   "(claimed '$($callerIpInfo.ClaimedIp)', trusted '$callerIp').")
+    Write-JsonResponse -Status BadRequest -Body @{
+        error = 'Request carried a client-supplied X-Forwarded-For header; the caller IP could not be trusted.'
+    }
+    return
+}
 
 if (-not $callerIp -or $callerIp -eq '::1' -or $callerIp -eq '127.0.0.1') {
     Write-JsonResponse -Status BadRequest -Body @{ error = 'Could not determine caller IP address.' }
@@ -386,13 +409,16 @@ catch {
         return
     }
 
-    Write-Error "JIT target modification failed: $_"
+    # Log the detail; return only the correlation id. The exception text can
+    # carry ARM URLs, resource ids and raw resource-provider error bodies.
+    Write-Error "JIT target modification failed [correlationId=$correlationId]: $_"
     Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp $callerIp `
         -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
-        -SubscriptionId $subscriptionId -RuleId $ruleId -DenyReason 'TargetModificationFailed'
+        -SubscriptionId $subscriptionId -RuleId $ruleId -DenyReason 'TargetModificationFailed' `
+        -Extra @{ correlationId = $correlationId }
     Write-JsonResponse -Status InternalServerError -Body @{
-        error  = "Failed to modify $targetType. Verify the function app has the JIT-AzAccess Manager role on the target subscription."
-        detail = $_.ToString()
+        error         = "Failed to modify $targetType. Verify the function app has the JIT-AzAccess Manager role on the target subscription."
+        correlationId = $correlationId
     }
     return
 }
@@ -551,7 +577,106 @@ switch ($grantStatus) {
             }
         }
         catch {
-            Write-Warning "Table write failed. Rule '$ruleIdentifier' was added but expiry record was not saved: $_"
+            # WORST CASE: the rule is LIVE on the resource but nothing is
+            # tracking it, so Remove-ExpiredRules will never revoke it — a
+            # firewall hole open forever. Previously this was a Write-Warning
+            # and the endpoint still answered "200 Created".
+            #
+            # Undo the grant instead of reporting success for access that can
+            # never expire.
+            Write-Error "Table write failed for rule '$ruleIdentifier' [correlationId=$correlationId]: $_"
+
+            # Shaped like a JITRules row so the Remove handlers read it the
+            # same way the timer and Revoke-JITAccess do.
+            $rollbackRow = [pscustomobject]@{
+                PartitionKey   = $subscriptionId
+                RowKey         = $ruleId
+                TargetType     = $targetType
+                ResourceName   = $resourceName
+                ResourceRg     = $resourceGroup
+                SubscriptionId = $subscriptionId
+                RuleIdentifier = $ruleIdentifier
+                CallerIp       = $callerIp
+                Port           = $portVal
+                RequestedBy    = $requestedBy
+                ExpiryUtc      = $expiry.ToString('o')
+                Justification  = if ($justification) { $justification } else { '' }
+            }
+
+            $rolledBack = $false
+            try {
+                $undo       = Invoke-JITTargetRemove -Row $rollbackRow
+                # No Status (unknown/legacy handler) is treated as Removed, the
+                # same convention the timer and Revoke use.
+                $undoStatus = if ($undo -and $undo.Status) { $undo.Status } else { 'Removed' }
+                $rolledBack = ($undoStatus -in @('Removed', 'NotFound'))
+                if (-not $rolledBack) {
+                    # AKS refuses to remove the last authorized range. The rule
+                    # stays, untracked — that is an orphan, reported below.
+                    Write-Warning "Rollback of '$ruleIdentifier' returned status '$undoStatus'."
+                }
+            }
+            catch {
+                Write-Error "Rollback FAILED for rule '$ruleIdentifier' [correlationId=$correlationId]: $_"
+            }
+
+            if ($rolledBack) {
+                Write-JITAuditEvent -EventType JITGrantRolledBack -Caller $requestedBy -CallerIp $callerIp `
+                    -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
+                    -SubscriptionId $subscriptionId -RuleId $ruleId `
+                    -Extra @{ correlationId = $correlationId; reason = 'RulesTableWriteFailed' }
+
+                # Best-effort history row. The audit table shares the storage
+                # account that just failed, so this may fail too — the stdout
+                # audit event above is the reliable channel.
+                try {
+                    Add-JITAuditRow -Action 'GrantRolledBack' `
+                        -SubscriptionId $subscriptionId -TargetType $targetType `
+                        -ResourceName $resourceName -ResourceRg $resourceGroup `
+                        -RuleIdentifier $ruleIdentifier -CallerIp $callerIp `
+                        -Port $portVal -RequestedBy $requestedBy `
+                        -ExpiryUtc $expiry.ToString('o') -Justification $justification `
+                        -Extra @{ correlationId = $correlationId } `
+                        -Details $grantDetails
+                }
+                catch { Write-Warning "JITRulesAudit write failed for rollback of '$ruleId': $_" }
+
+                Write-JsonResponse -Status InternalServerError -Body @{
+                    error         = 'The access rule could not be recorded, so it was rolled back. No access was granted. Please retry.'
+                    correlationId = $correlationId
+                }
+            }
+            else {
+                # Nothing else in the system knows this rule exists. Loudest
+                # possible signal: a human has to remove it by hand.
+                Write-JITAuditEvent -EventType JITOrphanedGrant -Caller $requestedBy -CallerIp $callerIp `
+                    -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
+                    -SubscriptionId $subscriptionId -RuleId $ruleId `
+                    -Extra @{ correlationId = $correlationId; reason = 'RulesTableWriteFailed'; rollback = 'failed' }
+                Write-Error ("ORPHANED JIT GRANT: rule '$ruleIdentifier' ($targetType) is live on " +
+                             "'$resourceName' in subscription $subscriptionId for IP $callerIp, is NOT " +
+                             "tracked in '$tableName', and could not be rolled back. It will never expire. " +
+                             "Remove it manually. [correlationId=$correlationId]")
+
+                try {
+                    Add-JITAuditRow -Action 'OrphanedGrant' `
+                        -SubscriptionId $subscriptionId -TargetType $targetType `
+                        -ResourceName $resourceName -ResourceRg $resourceGroup `
+                        -RuleIdentifier $ruleIdentifier -CallerIp $callerIp `
+                        -Port $portVal -RequestedBy $requestedBy `
+                        -ExpiryUtc $expiry.ToString('o') -Justification $justification `
+                        -Extra @{ correlationId = $correlationId } `
+                        -Details $grantDetails
+                }
+                catch { Write-Warning "JITRulesAudit write failed for orphaned grant '$ruleId': $_" }
+
+                Write-JsonResponse -Status InternalServerError -Body @{
+                    error         = 'The access rule could not be recorded and could not be rolled back. It has been reported for manual removal.'
+                    correlationId = $correlationId
+                }
+            }
+
+            return
         }
 
         # Append a lifecycle event to the audit history table. Best-effort — an

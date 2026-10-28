@@ -13,8 +13,22 @@
 
 #region ── Per-worker Caches ────────────────────────────────────────────────────────
 # Module-scoped variables persist within a worker process lifetime.
-$script:JwksCache    = $null   # { Keys: [...], FetchedAt: [DateTime] }
+# Keyed by tenant id: @{ <tenantId> = @{ Keys = [...]; FetchedAt = [DateTime] } }.
+# Was a single slot that ignored the tenant it was fetched for - harmless while
+# the app is single-tenant, a silent cross-tenant key mix-up the day it is not.
+$script:JwksCache    = @{}
 $script:JwksCacheTtl = [TimeSpan]::FromHours(1)
+
+# Last forced (kid-miss) JWKS refresh per tenant, and the floor between them.
+# The HTTP endpoints are anonymous and the token's `kid` is read BEFORE any
+# signature check, so without a floor a stream of junk tokens carrying random
+# kids turns into one outbound JWKS fetch per request.
+$script:JwksForcedRefreshAt          = @{}
+$script:JwksForcedRefreshMinInterval = [TimeSpan]::FromSeconds(60)
+
+# One-shot latch so an unset client allowlist is reported once per worker
+# rather than on every single request.
+$script:WarnedNoClientAppIdAllowlist = $false
 
 # The custom RBAC role a caller must hold (in the target subscription) to use
 # the JIT API. Hardcoded — deliberately NOT configurable via env var.
@@ -49,18 +63,47 @@ $script:DefaultArmAudiences = @(
 )
 
 function Get-CachedJwks {
-    param([string]$TenantId)
+    <#
+    .SYNOPSIS
+        Azure AD signing keys for a tenant, cached per worker for one hour.
 
-    $now = [DateTime]::UtcNow
+    .PARAMETER Force
+        Bypass the TTL - used when a token names a `kid` we do not hold, which
+        is the legitimate key-rotation path. Rate-limited per tenant (see
+        $script:JwksForcedRefreshMinInterval) because an unauthenticated caller
+        can trigger it at will with a forged `kid`; when the floor blocks a
+        refresh the cached keys are returned and the token simply fails to
+        validate, which is the safe outcome.
+    #>
+    param(
+        [string]$TenantId,
+        [switch]$Force
+    )
 
-    if ($script:JwksCache -and ($now - $script:JwksCache.FetchedAt) -lt $script:JwksCacheTtl) {
-        return $script:JwksCache.Keys
+    $now   = [DateTime]::UtcNow
+    $entry = $script:JwksCache[$TenantId]
+
+    if (-not $Force -and $entry -and ($now - $entry.FetchedAt) -lt $script:JwksCacheTtl) {
+        return $entry.Keys
     }
 
-    Write-Host "JIT: refreshing JWKS from Azure AD..."
-    $jwks = Invoke-RestMethod -Uri "https://login.microsoftonline.com/$TenantId/discovery/v2.0/keys" `
-                              -Method Get -ErrorAction Stop
-    $script:JwksCache = @{ Keys = $jwks.keys; FetchedAt = $now }
+    if ($Force) {
+        $lastForced = $script:JwksForcedRefreshAt[$TenantId]
+        if ($lastForced -and ($now - $lastForced) -lt $script:JwksForcedRefreshMinInterval) {
+            Write-Warning "JWT: JWKS force-refresh for tenant '$TenantId' is rate-limited; using cached keys."
+            if ($entry) { return $entry.Keys } else { return @() }
+        }
+        $script:JwksForcedRefreshAt[$TenantId] = $now
+    }
+
+    # Authority host is derivable so sovereign clouds work without a code change
+    # (the accepted audiences already are, via EXPECTED_AUDIENCES).
+    $authority = if ($env:JIT_AAD_AUTHORITY_HOST) { $env:JIT_AAD_AUTHORITY_HOST } else { 'login.microsoftonline.com' }
+
+    Write-Host "JIT: refreshing JWKS from $authority for tenant $TenantId ..."
+    $jwks = Invoke-RestMethod -Uri "https://$authority/$TenantId/discovery/v2.0/keys" `
+                              -Method Get -TimeoutSec 10 -ErrorAction Stop
+    $script:JwksCache[$TenantId] = @{ Keys = $jwks.keys; FetchedAt = $now }
     return $jwks.keys
 }
 
@@ -203,14 +246,55 @@ function Invoke-JwtValidation {
             return $null
         }
 
+        # -- Claim: principal type -------------------------------------------
+        # JIT grants are for a person's own IP. An app-only token has no human
+        # behind it, so refuse it rather than let a service principal open a
+        # firewall for whatever IP it happens to be calling from.
+        if ($payload.idtyp -eq 'app') {
+            Write-Warning 'JWT: app-only token rejected (idtyp=app) - JIT requires a user token.'
+            return $null
+        }
+
+        # -- Claim: client application ---------------------------------------
+        # The accepted audience is plain ARM, so on its own this check-set lets
+        # through ANY ARM token minted anywhere in the tenant: Azure CLI, Azure
+        # PowerShell, any app the user has consented to, any service principal.
+        # JIT_ALLOWED_CLIENT_APPIDS binds the token to the client we expect
+        # (Deploy.ps1 writes the AzureTray app registration's appId into it).
+        # Left unset the behaviour is unchanged, so an existing deployment keeps
+        # working across an upgrade - but it is warned about once per worker.
+        $allowedAppIdsRaw = $env:JIT_ALLOWED_CLIENT_APPIDS
+        if ($allowedAppIdsRaw) {
+            $allowedAppIds = @(($allowedAppIdsRaw -split ',') |
+                                ForEach-Object { $_.Trim() } |
+                                Where-Object   { $_ })
+            # v1 tokens carry appid; v2 tokens carry azp.
+            $clientAppId = if ($payload.appid) { $payload.appid } else { $payload.azp }
+
+            if (-not $clientAppId) {
+                Write-Warning 'JWT: token has no appid/azp claim; cannot identify the client application.'
+                return $null
+            }
+            if ($clientAppId -notin $allowedAppIds) {
+                Write-Warning "JWT: client application '$clientAppId' is not in JIT_ALLOWED_CLIENT_APPIDS."
+                return $null
+            }
+        }
+        elseif (-not $script:WarnedNoClientAppIdAllowlist) {
+            $script:WarnedNoClientAppIdAllowlist = $true
+            Write-Warning ('JWT: JIT_ALLOWED_CLIENT_APPIDS is not set - every ARM-audience token in ' +
+                           'this tenant is accepted. Set it to the AzureTray app registration appId.')
+        }
+
         # ── Signature: fetch JWKS and verify RS256 ────────────────────────────
         $allKeys  = Get-CachedJwks -TenantId $TenantId
         $jwkKey   = $allKeys | Where-Object { $_.kid -eq $header.kid } | Select-Object -First 1
 
-        # On cache miss, force a refresh and retry once (handles key rotation)
+        # On cache miss, force a refresh and retry once (handles key rotation).
+        # Get-CachedJwks rate-limits the forced path, so a forged kid cannot be
+        # used to drive one outbound fetch per request.
         if (-not $jwkKey) {
-            $script:JwksCache = $null
-            $allKeys  = Get-CachedJwks -TenantId $TenantId
+            $allKeys  = Get-CachedJwks -TenantId $TenantId -Force
             $jwkKey   = $allKeys | Where-Object { $_.kid -eq $header.kid } | Select-Object -First 1
         }
 
@@ -219,21 +303,28 @@ function Invoke-JwtValidation {
             return $null
         }
 
+        # RSA.Create() is IDisposable and this runs on every request in a
+        # long-lived worker, so release the key handle deterministically.
         $rsa = [System.Security.Cryptography.RSA]::Create()
-        $rsaParams = New-Object System.Security.Cryptography.RSAParameters
-        $rsaParams.Modulus  = ConvertFrom-Base64UrlBytes $jwkKey.n
-        $rsaParams.Exponent = ConvertFrom-Base64UrlBytes $jwkKey.e
-        $rsa.ImportParameters($rsaParams)
+        try {
+            $rsaParams = New-Object System.Security.Cryptography.RSAParameters
+            $rsaParams.Modulus  = ConvertFrom-Base64UrlBytes $jwkKey.n
+            $rsaParams.Exponent = ConvertFrom-Base64UrlBytes $jwkKey.e
+            $rsa.ImportParameters($rsaParams)
 
-        $signingInput  = [System.Text.Encoding]::ASCII.GetBytes("$($parts[0]).$($parts[1])")
-        $signatureBytes = ConvertFrom-Base64UrlBytes $parts[2]
+            $signingInput   = [System.Text.Encoding]::ASCII.GetBytes("$($parts[0]).$($parts[1])")
+            $signatureBytes = ConvertFrom-Base64UrlBytes $parts[2]
 
-        $valid = $rsa.VerifyData(
-            $signingInput,
-            $signatureBytes,
-            [System.Security.Cryptography.HashAlgorithmName]::SHA256,
-            [System.Security.Cryptography.RSASignaturePadding]::Pkcs1
-        )
+            $valid = $rsa.VerifyData(
+                $signingInput,
+                $signatureBytes,
+                [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+                [System.Security.Cryptography.RSASignaturePadding]::Pkcs1
+            )
+        }
+        finally {
+            $rsa.Dispose()
+        }
 
         if (-not $valid) {
             Write-Warning 'JWT: RS256 signature verification failed'
@@ -520,7 +611,13 @@ function Write-JITAuditEvent {
     #>
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('JITGranted','JITDenied','JITExpired','JITRemoveFailed','JITRevoked')]
+        # JITGrantRolledBack / JITOrphanedGrant cover the compensating-remove path in
+        # Request-JITAccess: a rule reached the resource but its tracking row did not
+        # reach the table. RolledBack = the rule was successfully undone.
+        # OrphanedGrant = it could NOT be undone and a human must intervene, because
+        # nothing else in the system now knows the rule exists.
+        [ValidateSet('JITGranted','JITDenied','JITExpired','JITRemoveFailed','JITRevoked',
+                     'JITGrantRolledBack','JITOrphanedGrant')]
         [string]$EventType,
 
         [string]$Caller,
@@ -787,15 +884,77 @@ function Get-JITTableName {
 function Get-JITTableRows {
     <#
     .SYNOPSIS
-        Reads rows from a Table Storage table. Optional OData $filter.
+        Reads rows from a Table Storage table, following continuation tokens.
+        Optional OData $filter.
+
+    .DESCRIPTION
+        Azure Table Storage caps a single response at 1000 entities and signals
+        "more to come" only through the x-ms-continuation-NextPartitionKey /
+        x-ms-continuation-NextRowKey RESPONSE HEADERS. This used to go through
+        Invoke-TableRest (Invoke-RestMethod), which discards headers, so every
+        caller silently saw only the first page:
+
+          * Remove-ExpiredRules never revoked rules past page one — a firewall
+            hole that stays open forever, with nothing logged.
+          * Revoke-JITAccess could 404 on a rule that exists, because a FILTERED
+            scan may return an empty page WITH a continuation token when the
+            match lives in a later page.
+          * The per-caller / per-resource limits and the cooldown under-counted.
+
+        So this now loops on Invoke-TableRestRaw until the service stops
+        handing back a continuation token. A filtered query returning an empty
+        page is NOT the end of the result set — only the absence of both
+        continuation headers is.
+
+    .PARAMETER MaxPages
+        Safety stop so a pathological table (or a service bug that keeps
+        echoing a token) cannot spin forever. Hitting it means the result is
+        INCOMPLETE, which is loud rather than silent: a warning is written and
+        callers that must not act on partial data should treat it as an error.
     #>
     param(
         [Parameter(Mandatory)][string]$TableName,
-        [string]$Filter = ''
+        [string]$Filter = '',
+        [int]$MaxPages  = 50
     )
-    $query = if ($Filter) { '$filter=' + [Uri]::EscapeDataString($Filter) } else { '' }
-    $resp  = Invoke-TableRest -Method GET -Path "/$TableName()" -Query $query
-    return @($resp.value)
+
+    $rows   = [System.Collections.Generic.List[object]]::new()
+    $nextPk = $null
+    $nextRk = $null
+    $page   = 0
+
+    do {
+        $page++
+
+        $qs = @()
+        if ($Filter) { $qs += '$filter=' + [Uri]::EscapeDataString($Filter) }
+        # Continuation values are opaque strings and may contain characters
+        # that are not URL-safe, so they are escaped like any other value.
+        if ($nextPk) { $qs += 'NextPartitionKey=' + [Uri]::EscapeDataString($nextPk) }
+        if ($nextRk) { $qs += 'NextRowKey='       + [Uri]::EscapeDataString($nextRk) }
+
+        $raw = Invoke-TableRestRaw -Method GET -Path "/$TableName()" -Query ($qs -join '&')
+
+        if ($raw.Content) {
+            $parsed = $raw.Content | ConvertFrom-Json
+            if ($null -ne $parsed.value) {
+                foreach ($r in @($parsed.value)) { $rows.Add($r) }
+            }
+        }
+
+        # $raw.Headers is a case-insensitive hashtable; a missing key yields $null.
+        $nextPk = $raw.Headers['x-ms-continuation-NextPartitionKey']
+        $nextRk = $raw.Headers['x-ms-continuation-NextRowKey']
+        $more   = [bool]($nextPk -or $nextRk)
+    } while ($more -and $page -lt $MaxPages)
+
+    if ($more) {
+        Write-Warning ("Get-JITTableRows: stopped at the $MaxPages-page cap on '$TableName' " +
+                       "with a continuation token still pending — RESULTS ARE INCOMPLETE " +
+                       "($($rows.Count) row(s) returned).")
+    }
+
+    return @($rows)
 }
 
 function Add-JITTableRow {
@@ -1024,27 +1183,128 @@ function Add-JITAuditRow {
 
 #region ── Caller IP ──────────────────────────────────────────────────────────
 
-function Get-CallerIp {
+function script:ConvertFrom-ForwardedForEntry {
+    # One X-Forwarded-For element to a bare IP. Entries may be "ip:port"
+    # (IPv4), "[ipv6]:port", or bare.
+    param([string]$Entry)
+    $e = $Entry.Trim()
+    if ($e -match '^\[(.+)\]:\d+$')                 { return $matches[1] }  # [ipv6]:port
+    if ($e -match '^(\d{1,3}(\.\d{1,3}){3}):\d+$') { return $matches[1] }  # ipv4:port
+    return $e                                                                 # bare ip
+}
+
+function script:Get-SocketRemoteIp {
+    # The transport-level peer address, used when no X-Forwarded-For is present.
+    # Guarded because the property chain is absent on a non-HTTP-shaped request
+    # object (and would throw under Set-StrictMode rather than yield $null).
+    param($Request)
+    try {
+        return $Request.HttpContext.Connection.RemoteIpAddress.ToString()
+    }
+    catch {
+        Write-Verbose "Resolve-JITCallerIp: no socket remote address available - $_"
+        return $null
+    }
+}
+
+function Resolve-JITCallerIp {
     <#
     .SYNOPSIS
-        Extracts the caller's public IP from the request. Azure injects the real
-        client IP into X-Forwarded-For (leftmost entry is the originating IP);
-        entries may be "ip:port" (IPv4), "[ipv6]:port", or bare. Falls back to
-        the socket remote address. Shared by Request-JITAccess (to write the
-        firewall rule) and Get-JITRules (to report the IP back to the client),
-        so both agree on exactly which IP a grant would use.
+        Resolves the caller's public IP from the request, from the part of
+        X-Forwarded-For the PLATFORM wrote rather than the part the client can
+        write, and reports whether the client tried to supply its own chain.
+
+    .DESCRIPTION
+        This value is what a JIT grant punches a firewall hole for, so where it
+        comes from is a security decision, not a parsing detail.
+
+        X-Forwarded-For is append-ordered: each hop appends the address it
+        received the connection from, so the LAST entry is the one written by
+        the hop closest to us — the App Service front end — and the leftmost
+        entries are whatever the client chose to send. Reading the leftmost
+        entry (as this did before) lets any caller name an arbitrary IP and
+        have it allowlisted. Microsoft's own Front Door header reference is
+        explicit that a client IP carried in a request header "can be
+        arbitrarily overwritten by a user".
+
+        So: take the rightmost entry, skipping JIT_TRUSTED_XFF_DEPTH additional
+        entries for each extra trusted proxy in front of the app (default 0 —
+        the app is reached directly, so exactly one platform-appended entry is
+        expected). Anything the client supplied beyond that is reported as
+        Spoofed; Request-JITAccess audits and rejects on it. A legitimate
+        AzureTray client never sends X-Forwarded-For at all.
+
+        MEASURED, not assumed: Azure App Service, Linux, westus2, 2026-10-27,
+        using a throwaway echo app deployed for the purpose and then deleted.
+        192.0.2.10 below stands in for the probe machine's real public IP.
+        The platform APPENDS its own "<ip>:<port>" entry to whatever the
+        client sent:
+
+          client sends nothing          -> 192.0.2.10:65221
+          client sends 203.0.113.50     -> 203.0.113.50, 192.0.2.10:65224
+          client sends two entries      -> 203.0.113.50, 198.51.100.77, 192.0.2.10:65227
+          client sends "203.0.113.50,"  -> 203.0.113.50,, 192.0.2.10:57877
+
+        It does NOT overwrite, so the leftmost entry is purely client-supplied
+        and the rightmost is the only trustworthy one. The same run confirmed
+        X-Client-IP is appendable too ("1.2.3.4, 192.0.2.10" when spoofed),
+        so it is no safer than X-Forwarded-For and is deliberately not used
+        here. X-Azure-ClientIP / X-Azure-SocketIP are Front Door headers and
+        were absent on App Service.
+
+        Falls back to the socket remote address when the header is absent.
+
+    .OUTPUTS
+        Hashtable:
+          IpAddress  - the trusted IP to act on (may be $null if undeterminable)
+          ClaimedIp  - the leftmost (client-controlled) entry, when one exists
+          Spoofed    - $true when the client supplied entries of its own
+          EntryCount - number of X-Forwarded-For entries seen
     #>
     param([Parameter(Mandatory)]$Request)
 
+    $trustedDepth = if ($env:JIT_TRUSTED_XFF_DEPTH) { [int]$env:JIT_TRUSTED_XFF_DEPTH } else { 0 }
+    if ($trustedDepth -lt 0) { $trustedDepth = 0 }
+
     $xff = $Request.Headers['X-Forwarded-For']
-    if ($xff) {
-        $first = ($xff.ToString() -split ',')[0].Trim()
-        if ($first -match '^\[(.+)\]:\d+$')                  { return $matches[1] }  # [ipv6]:port
-        if ($first -match '^(\d{1,3}(\.\d{1,3}){3}):\d+$')   { return $matches[1] }  # ipv4:port
-        return $first                                                                # bare ip
+    if (-not $xff) {
+        return @{ IpAddress = (Get-SocketRemoteIp -Request $Request); ClaimedIp = $null; Spoofed = $false; EntryCount = 0 }
     }
 
-    return $Request.HttpContext.Connection.RemoteIpAddress.ToString()
+    $entries = @(($xff.ToString() -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($entries.Count -eq 0) {
+        return @{ IpAddress = (Get-SocketRemoteIp -Request $Request); ClaimedIp = $null; Spoofed = $false; EntryCount = 0 }
+    }
+
+    # Expected chain length when nobody is lying: one entry appended by the
+    # App Service front end, plus one per additional trusted proxy.
+    $expected = 1 + $trustedDepth
+    $spoofed  = $entries.Count -gt $expected
+
+    # Index from the right so extra entries prepended by the client cannot
+    # shift which element we read.
+    $idx = $entries.Count - 1 - $trustedDepth
+    if ($idx -lt 0) { $idx = 0 }
+
+    return @{
+        IpAddress  = ConvertFrom-ForwardedForEntry $entries[$idx]
+        ClaimedIp  = ConvertFrom-ForwardedForEntry $entries[0]
+        Spoofed    = $spoofed
+        EntryCount = $entries.Count
+    }
+}
+
+function Get-CallerIp {
+    <#
+    .SYNOPSIS
+        The trusted caller IP as a bare string. Thin wrapper over
+        Resolve-JITCallerIp for callers that only need the address and have no
+        spoof decision to make (Get-JITRules reports it back to the client).
+        Request-JITAccess uses Resolve-JITCallerIp directly so it can reject a
+        client-supplied chain.
+    #>
+    param([Parameter(Mandatory)]$Request)
+    return (Resolve-JITCallerIp -Request $Request).IpAddress
 }
 
 #endregion
@@ -1070,4 +1330,5 @@ Export-ModuleMember -Function @(
     'Get-JITAuditTableName'
     'Add-JITAuditRow'
     'Get-CallerIp'
+    'Resolve-JITCallerIp'
 )
