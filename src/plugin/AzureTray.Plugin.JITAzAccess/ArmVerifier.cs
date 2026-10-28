@@ -1,4 +1,5 @@
 using System;
+using System.Net;
 using System.Net.Http;
 using System.Text.Json;
 using System.Threading;
@@ -118,8 +119,8 @@ internal sealed class ArmVerifier
                   $"/providers/Microsoft.Network/networkSecurityGroups/{grant.ResourceName}" +
                   $"/securityRules/{grant.RuleId}?api-version={NsgApi}";
 
-        var response = await ArmGetAsync(tenantId, url, ct).ConfigureAwait(false);
-        return response.IsSuccessStatusCode ? VerificationResult.Confirmed : VerificationResult.NotFound;
+        using var response = await ArmGetAsync(tenantId, url, ct).ConfigureAwait(false);
+        return ClassifyRuleProbe(response, url);
     }
 
     // ── Azure SQL Server — check firewall rule by name ────────────────────────
@@ -131,8 +132,8 @@ internal sealed class ArmVerifier
                   $"/providers/Microsoft.Sql/servers/{grant.ResourceName}" +
                   $"/firewallRules/{grant.RuleId}?api-version={SqlApi}";
 
-        var response = await ArmGetAsync(tenantId, url, ct).ConfigureAwait(false);
-        return response.IsSuccessStatusCode ? VerificationResult.Confirmed : VerificationResult.NotFound;
+        using var response = await ArmGetAsync(tenantId, url, ct).ConfigureAwait(false);
+        return ClassifyRuleProbe(response, url);
     }
 
     // ── Azure Database for PostgreSQL Flexible Server — check firewall rule by name ──
@@ -144,17 +145,17 @@ internal sealed class ArmVerifier
                   $"/providers/Microsoft.DBforPostgreSQL/flexibleServers/{grant.ResourceName}" +
                   $"/firewallRules/{grant.RuleId}?api-version={PostgresApi}";
 
-        var response = await ArmGetAsync(tenantId, url, ct).ConfigureAwait(false);
-        return response.IsSuccessStatusCode ? VerificationResult.Confirmed : VerificationResult.NotFound;
+        using var response = await ArmGetAsync(tenantId, url, ct).ConfigureAwait(false);
+        return ClassifyRuleProbe(response, url);
     }
 
     // ── Child firewallRules types (MySQL / Redis / Synapse) ───────────────────
 
     /// <summary>
     /// Verifies a firewall rule that exists as an addressable child resource:
-    /// GET <c>.../{armType}/{name}/firewallRules/{ruleId}</c> — 200 = Confirmed,
-    /// anything else (typically 404) = NotFound. <paramref name="armType"/> is
-    /// the provider-cased type, e.g. <c>Microsoft.Cache/Redis</c>.
+    /// GET <c>.../{armType}/{name}/firewallRules/{ruleId}</c>, classified by
+    /// <see cref="ClassifyRuleProbe"/>. <paramref name="armType"/> is the
+    /// provider-cased type, e.g. <c>Microsoft.Cache/Redis</c>.
     /// </summary>
     private async Task<VerificationResult> VerifyChildFirewallRuleAsync(
         JitGrantResponse grant, string tenantId, string armType, string apiVersion, CancellationToken ct)
@@ -163,8 +164,8 @@ internal sealed class ArmVerifier
                   $"/providers/{armType}/{grant.ResourceName}" +
                   $"/firewallRules/{grant.RuleId}?api-version={apiVersion}";
 
-        var response = await ArmGetAsync(tenantId, url, ct).ConfigureAwait(false);
-        return response.IsSuccessStatusCode ? VerificationResult.Confirmed : VerificationResult.NotFound;
+        using var response = await ArmGetAsync(tenantId, url, ct).ConfigureAwait(false);
+        return ClassifyRuleProbe(response, url);
     }
 
     // ── Storage Account — check IP rule by value ──────────────────────────────
@@ -176,7 +177,7 @@ internal sealed class ArmVerifier
                   $"/providers/Microsoft.Storage/storageAccounts/{grant.ResourceName}" +
                   $"?api-version={StorageApi}";
 
-        var response = await ArmGetAsync(tenantId, url, ct).ConfigureAwait(false);
+        using var response = await ArmGetAsync(tenantId, url, ct).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
         {
             _context.Logger.LogWarning(
@@ -198,10 +199,17 @@ internal sealed class ArmVerifier
         }
         if (!acls.TryGetProperty("ipRules", out var ipRules)) return VerificationResult.NotFound;
 
+        // Exact match only. A prefix match confirms the wrong rule: caller IP
+        // 10.1.1.1 "matches" an existing 10.1.1.10 entry, so the user is told
+        // their grant landed when nothing was written for them. Storage
+        // normalises a /32 away, but accept both spellings rather than depend
+        // on that.
         foreach (var rule in ipRules.EnumerateArray())
         {
-            if (rule.TryGetProperty("value", out var v) &&
-                v.GetString()?.StartsWith(grant.CallerIp) == true)
+            if (!rule.TryGetProperty("value", out var v)) continue;
+            var value = v.GetString();
+            if (string.Equals(value, grant.CallerIp, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(value, grant.CallerIp + "/32", StringComparison.OrdinalIgnoreCase))
                 return VerificationResult.Confirmed;
         }
 
@@ -217,7 +225,7 @@ internal sealed class ArmVerifier
                   $"/providers/Microsoft.KeyVault/vaults/{grant.ResourceName}" +
                   $"?api-version={KeyVaultApi}";
 
-        var response = await ArmGetAsync(tenantId, url, ct).ConfigureAwait(false);
+        using var response = await ArmGetAsync(tenantId, url, ct).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
         {
             _context.Logger.LogWarning(
@@ -239,24 +247,53 @@ internal sealed class ArmVerifier
         }
         if (!acls.TryGetProperty("ipRules", out var ipRules)) return VerificationResult.NotFound;
 
-        var expected = $"{grant.CallerIp}/32";
+        // Key Vault stores the caller IP as a /32 CIDR; accept the bare address
+        // too so a server-side normalisation change can't turn every grant into
+        // a "verification failed" toast.
         foreach (var rule in ipRules.EnumerateArray())
         {
-            if (rule.TryGetProperty("value", out var v) && v.GetString() == expected)
+            if (!rule.TryGetProperty("value", out var v)) continue;
+            var value = v.GetString();
+            if (string.Equals(value, grant.CallerIp + "/32", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(value, grant.CallerIp, StringComparison.OrdinalIgnoreCase))
                 return VerificationResult.Confirmed;
         }
 
         return VerificationResult.NotFound;
     }
 
-    // ── Shared ARM helper ──────────────────────────────────────────────────────
+    // ── Shared ARM helpers ────────────────────────────────────────────────────
 
-    private Task<HttpResponseMessage> ArmGetAsync(
+    private async Task<HttpResponseMessage> ArmGetAsync(
         string tenantId, string url, CancellationToken ct)
     {
-        var request = new HttpRequestMessage(HttpMethod.Get, url);
-        return _context.GetHttpClient(tenantId).SendAsync(
-            PluginHttpClientNames.Arm, _context.ArmScope, request, ct);
+        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        return await _context.GetHttpClient(tenantId)
+            .SendAsync(PluginHttpClientNames.Arm, _context.ArmScope, request, ct)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Maps the status of a "GET the rule by name" probe to a verification
+    /// result.
+    /// </summary>
+    /// <remarks>
+    /// Only a 404 means the rule is genuinely absent. A 403 (no ARM read on the
+    /// resource), 429 (throttled) or 5xx says we could not look — and reporting
+    /// that as <see cref="VerificationResult.NotFound"/> tells the user their
+    /// grant did not take effect when it very likely did. That is a false alarm
+    /// on the safe side, but it trains people to ignore the warning, which is
+    /// not. Anything that is not a clear yes or a clear no is an Error.
+    /// </remarks>
+    private VerificationResult ClassifyRuleProbe(HttpResponseMessage response, string url)
+    {
+        if (response.IsSuccessStatusCode)                   return VerificationResult.Confirmed;
+        if (response.StatusCode == HttpStatusCode.NotFound) return VerificationResult.NotFound;
+
+        _context.Logger.LogWarning(
+            "JIT ARM verify: GET {Url} returned {Status} — cannot tell whether the rule exists.",
+            url, (int)response.StatusCode);
+        return VerificationResult.Error;
     }
 }
 

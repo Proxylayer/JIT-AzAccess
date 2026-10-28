@@ -4,9 +4,9 @@ using System.Text.Json.Serialization;
 namespace AzureTray.Plugin.JITAzAccess.Models;
 
 /// <summary>
-/// An active JIT rule as returned by GET /api/Get-JITRules.
-/// Unlike the locally-tracked <see cref="ActiveRule"/>, this comes from the server
-/// and therefore reflects rules granted from any machine or session.
+/// An active JIT rule as returned by GET /api/Get-JITRules. The server is the
+/// only source of truth for what is currently granted, so these reflect rules
+/// granted from any machine or session.
 /// </summary>
 public sealed record JitServerRule
 {
@@ -38,6 +38,7 @@ public sealed record JitServerRule
     public string RequestedBy { get; init; } = string.Empty;
 
     [JsonPropertyName("expiresUtc")]
+    [JsonConverter(typeof(UtcDateTimeConverter))]
     public DateTime ExpiresUtc { get; init; }
 
     [JsonPropertyName("justification")]
