@@ -625,9 +625,37 @@ catch {
         return
     }
 
+    # Did the write possibly land? An ARM rejection (403, 400, a provider
+    # refusal) means nothing was created and the slot should go back. A
+    # long-running operation we stopped waiting for is different: the rule may
+    # have been created a second after we gave up. Releasing the reservation
+    # there would leave a live rule with nothing tracking it -- the orphan this
+    # whole design exists to avoid -- so the slot is KEPT and the cleanup timer
+    # reconciles it when the short reservation expires (the remove handlers are
+    # idempotent and answer NotFound if nothing was ever created).
+    #
+    # Wait-JITArmAsyncOperation marks exactly that case; keep the literal in
+    # sync with the throw in _Shared.ps1.
+    $outcomeUnknown = ($_.Exception.Message -like 'ARM_LRO_UNRESOLVED:*')
+
     # Log the detail; return only the correlation id. The exception text can
     # carry ARM URLs, resource ids and raw resource-provider error bodies.
     Write-Error "JIT target modification failed [correlationId=$correlationId]: $_"
+
+    if ($outcomeUnknown) {
+        Write-Warning ("Grant for '$ruleId' timed out waiting on ARM; the rule MAY exist. Keeping the " +
+                       "reservation row so the cleanup timer reconciles it at $($reservationTtlMinutes)m.")
+        Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp $callerIp `
+            -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `
+            -SubscriptionId $subscriptionId -RuleId $ruleId -DenyReason 'TargetModificationUnresolved' `
+            -Extra @{ correlationId = $correlationId; reservationRetained = $true }
+        Write-JsonResponse -Status InternalServerError -Body @{
+            error         = "The $targetType change did not confirm in time. If access appears shortly it will be revoked automatically; retry in a few minutes."
+            correlationId = $correlationId
+        }
+        return
+    }
+
     Remove-JITReservation -Why 'grant failed'
     Write-JITAuditEvent -EventType JITDenied -Caller $requestedBy -CallerIp $callerIp `
         -TargetType $targetType -ResourceName $resourceName -ResourceGroup $resourceGroup `

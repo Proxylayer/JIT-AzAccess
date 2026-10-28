@@ -140,18 +140,51 @@ function Wait-JITArmAsyncOperation {
             try { $status = ($raw.Content | ConvertFrom-Json -ErrorAction Stop).status } catch { $status = $null }
         }
 
-        Write-Host "  ARM LRO poll #$poll -> status=$status"
+        Write-Host "  ARM LRO poll #$poll -> status=$status http=$($raw.StatusCode)"
 
         switch ($status) {
             'Succeeded' { return }
             'Failed'    { throw "Async operation failed: $($raw.Content)" }
             'Canceled'  { throw "Async operation was canceled: $($raw.Content)" }
             'Cancelled' { throw "Async operation was canceled: $($raw.Content)" }
-            default     { }   # InProgress / Running / Accepted / null — keep polling
+            default     {
+                # No `status` field. That is the NORMAL shape of the Location
+                # style of LRO, which this function explicitly falls back to
+                # above: the poll URL answers 202 while the operation runs and
+                # 200/204 with the resource (or nothing) once it is done -- the
+                # HTTP code IS the signal, and there is no status JSON at all.
+                #
+                # Reading only the JSON meant a Location-style operation could
+                # never be seen to finish: every poll looked "still running"
+                # until the overall timeout, so a SUCCESSFUL operation was
+                # reported as a failure. On the grant path that is the bad
+                # direction, because the rule exists by then.
+                #
+                # An Azure-AsyncOperation URL always carries the status field,
+                # so checking it first keeps that shape behaving exactly as
+                # before; this only decides the case where it is absent.
+                # ONLY when the body carries no status at all. 'InProgress'
+                # also lands in this default arm, and an Azure-AsyncOperation
+                # poll reports InProgress with HTTP 200 — so consulting the
+                # code unconditionally would call a running operation finished
+                # on its first poll.
+                if ([string]::IsNullOrWhiteSpace([string]$status) -and
+                    $raw.StatusCode -in 200, 201, 204) {
+                    return
+                }
+                # 202, or a status we don't recognise: keep polling.
+            }
         }
     }
 
-    throw "Async operation did not complete within $TimeoutSeconds seconds (timeout)."
+    # Sentinel prefix: the OUTCOME IS UNKNOWN, which is not the same as failed.
+    # The operation may well have completed just after we stopped looking, so a
+    # caller that created something must assume it exists rather than assume it
+    # does not. Request-JITAccess keys off this to keep its reservation row so
+    # the cleanup timer reconciles, instead of releasing it and leaving a live
+    # rule untracked. Keep this literal in sync with that check.
+    throw "ARM_LRO_UNRESOLVED: Async operation did not complete within $TimeoutSeconds seconds (timeout)."
+
 }
 
 function Remove-JITChildRuleWithLro {
