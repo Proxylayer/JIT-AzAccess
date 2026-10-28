@@ -23,9 +23,11 @@
 # the mock scriptblocks run in the module's session state and cannot see the test
 # file's locals. Everything is reset in BeforeEach.
 #
-# Pester 3.4.0 compatible (no BeforeAll at top level, no Should -Verb syntax).
+# Pester 5+ (setup in BeforeAll, `Should -Verb` syntax, native `Should -Throw`).
 #
 # Run:  ./test.ps1 -Target AppService
+
+BeforeAll {
 
 Import-Module "$PSScriptRoot/../Modules/HttpHelpers/HttpHelpers.psm1" -Force -DisableNameChecking
 Import-Module "$PSScriptRoot/../Modules/JITHelpers/JITHelpers.psm1"   -Force
@@ -123,18 +125,13 @@ function script:Get-PatchesFor {
     return ,@($global:AppSvcPatches | Where-Object { $_.Path -like $PathLike })
 }
 
-function script:Test-Throws {
-    # Pester 3.4's `Should Throw` does not work under PowerShell 7, so terminating
-    # behavior is asserted with an explicit try/catch instead.
-    param([scriptblock]$Action)
-    try { & $Action | Out-Null; return $false } catch { return $true }
-}
-
 function script:Get-JitEntry {
     # The JIT entry this handler appended to one of the two lists in a PATCH body.
     param($Patch, [string]$List = 'ipSecurityRestrictions')
     return @($Patch.Body.properties.$List | Where-Object { $_.name -eq $script:RuleId })[0]
 }
+
+}   # end BeforeAll
 
 # ─────────────────────────────────────────────────────────────────────────────
 Describe 'Add-JITAppServiceRule — deployment slot coverage' {
@@ -186,13 +183,13 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
         $r = Add-JITAppServiceRule -SubscriptionId $script:Sub -ResourceGroup $script:Rg `
                 -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId
 
-        $r.Status                     | Should Be 'Created'
-        $r.RuleIdentifier             | Should Be $script:RuleId
-        $r.Details.site               | Should Be 'Created'
-        $r.Details.slotCount          | Should Be 2
-        $r.Details.slots['staging']   | Should Be 'Created'
-        $r.Details.slots['qa']        | Should Be 'Created'
-        $global:AppSvcPatches.Count   | Should Be 3
+        $r.Status                     | Should -Be 'Created'
+        $r.RuleIdentifier             | Should -Be $script:RuleId
+        $r.Details.site               | Should -Be 'Created'
+        $r.Details.slotCount          | Should -Be 2
+        $r.Details.slots['staging']   | Should -Be 'Created'
+        $r.Details.slots['qa']        | Should -Be 'Created'
+        $global:AppSvcPatches.Count   | Should -Be 3
     }
 
     It 'PATCHes the site config and each slot config path exactly once' {
@@ -204,13 +201,13 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
         Add-JITAppServiceRule -SubscriptionId $script:Sub -ResourceGroup $script:Rg `
             -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId | Out-Null
 
-        Assert-MockCalled -ModuleName JITTargets Invoke-ArmRestRaw -Exactly -Times 1 -Scope It -ParameterFilter {
+        Should -Invoke -CommandName Invoke-ArmRestRaw -ModuleName JITTargets -Exactly -Times 1 -Scope It -ParameterFilter {
             $Method -eq 'PATCH' -and $Path -like '*/sites/contoso-web/config/web'
         }
-        Assert-MockCalled -ModuleName JITTargets Invoke-ArmRestRaw -Exactly -Times 1 -Scope It -ParameterFilter {
+        Should -Invoke -CommandName Invoke-ArmRestRaw -ModuleName JITTargets -Exactly -Times 1 -Scope It -ParameterFilter {
             $Method -eq 'PATCH' -and $Path -like '*/sites/contoso-web/slots/staging/config/web'
         }
-        Assert-MockCalled -ModuleName JITTargets Invoke-ArmRestRaw -Exactly -Times 1 -Scope It -ParameterFilter {
+        Should -Invoke -CommandName Invoke-ArmRestRaw -ModuleName JITTargets -Exactly -Times 1 -Scope It -ParameterFilter {
             $Method -eq 'PATCH' -and $Path -like '*/sites/contoso-web/slots/qa/config/web'
         }
     }
@@ -226,10 +223,10 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
 
         foreach ($p in $global:AppSvcPatches) {
             $entry = Get-JitEntry -Patch $p
-            $entry               | Should Not BeNullOrEmpty
-            $entry.name          | Should Be $script:RuleId
-            $entry.ipAddress     | Should Be "$script:CallerIp/32"
-            $entry.action        | Should Be 'Allow'
+            $entry               | Should -Not -BeNullOrEmpty
+            $entry.name          | Should -Be $script:RuleId
+            $entry.ipAddress     | Should -Be "$script:CallerIp/32"
+            $entry.action        | Should -Be 'Allow'
         }
     }
 
@@ -242,8 +239,8 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
             -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId | Out-Null
 
         $slotPatch = @(Get-PatchesFor '*/slots/staging/config/web')
-        $slotPatch.Count            | Should Be 1
-        $slotPatch[0].ApiVersion    | Should Be '2024-04-01'
+        $slotPatch.Count            | Should -Be 1
+        $slotPatch[0].ApiVersion    | Should -Be '2024-04-01'
     }
 
     It 'enumerates slots with GET on the sites/{name}/slots collection at 2024-04-01' {
@@ -253,7 +250,7 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
         Add-JITAppServiceRule -SubscriptionId $script:Sub -ResourceGroup $script:Rg `
             -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId | Out-Null
 
-        Assert-MockCalled -ModuleName JITTargets Invoke-ArmRestRaw -Exactly -Times 1 -Scope It -ParameterFilter {
+        Should -Invoke -CommandName Invoke-ArmRestRaw -ModuleName JITTargets -Exactly -Times 1 -Scope It -ParameterFilter {
             $Method -eq 'GET' -and $Path -like '*/sites/contoso-web/slots' -and $ApiVersion -eq '2024-04-01'
         }
     }
@@ -268,11 +265,11 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
         $r = Add-JITAppServiceRule -SubscriptionId $script:Sub -ResourceGroup $script:Rg `
                 -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId
 
-        $r.Status                   | Should Be 'Created'
-        $r.Details.site             | Should Be 'Created'
-        $r.Details.slots['staging'] | Should Be 'SkippedOpen'
-        (Get-PatchesFor '*/slots/staging/config/web').Count | Should Be 0
-        Assert-MockCalled -ModuleName JITTargets Invoke-ArmRestRaw -Exactly -Times 0 -Scope It -ParameterFilter {
+        $r.Status                   | Should -Be 'Created'
+        $r.Details.site             | Should -Be 'Created'
+        $r.Details.slots['staging'] | Should -Be 'SkippedOpen'
+        (Get-PatchesFor '*/slots/staging/config/web').Count | Should -Be 0
+        Should -Invoke -CommandName Invoke-ArmRestRaw -ModuleName JITTargets -Exactly -Times 0 -Scope It -ParameterFilter {
             $Method -eq 'PATCH' -and $Path -like '*/slots/staging/config/web'
         }
     }
@@ -286,8 +283,8 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
         $r = Add-JITAppServiceRule -SubscriptionId $script:Sub -ResourceGroup $script:Rg `
                 -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId
 
-        $r.Details.slots['staging'] | Should Be 'SkippedOpen'
-        (Get-PatchesFor '*/slots/staging/config/web').Count | Should Be 0
+        $r.Details.slots['staging'] | Should -Be 'SkippedOpen'
+        (Get-PatchesFor '*/slots/staging/config/web').Count | Should -Be 0
     }
 
     It 'treats a slot with DefaultAction Deny and no rules as restricted' {
@@ -299,7 +296,7 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
         $r = Add-JITAppServiceRule -SubscriptionId $script:Sub -ResourceGroup $script:Rg `
                 -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId
 
-        $r.Details.slots['staging'] | Should Be 'Created'
+        $r.Details.slots['staging'] | Should -Be 'Created'
     }
 
     It 'treats a slot holding only a vnet rule as restricted' {
@@ -311,7 +308,7 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
         $r = Add-JITAppServiceRule -SubscriptionId $script:Sub -ResourceGroup $script:Rg `
                 -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId
 
-        $r.Details.slots['staging'] | Should Be 'Created'
+        $r.Details.slots['staging'] | Should -Be 'Created'
     }
 
     # ── (3) Aggregation is NOT site-driven ────────────────────────────────────
@@ -324,11 +321,11 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
         $r = Add-JITAppServiceRule -SubscriptionId $script:Sub -ResourceGroup $script:Rg `
                 -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId
 
-        $r.Status                   | Should Be 'Created'
-        $r.Details.site             | Should Be 'SkippedOpen'
-        $r.Details.slots['staging'] | Should Be 'Created'
-        $r.Details.note             | Should BeNullOrEmpty
-        (Get-PatchesFor '*/sites/contoso-web/config/web').Count | Should Be 0
+        $r.Status                   | Should -Be 'Created'
+        $r.Details.site             | Should -Be 'SkippedOpen'
+        $r.Details.slots['staging'] | Should -Be 'Created'
+        $r.Details.note             | Should -BeNullOrEmpty
+        (Get-PatchesFor '*/sites/contoso-web/config/web').Count | Should -Be 0
     }
 
     # ── (4) Everything open ───────────────────────────────────────────────────
@@ -342,12 +339,12 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
         $r = Add-JITAppServiceRule -SubscriptionId $script:Sub -ResourceGroup $script:Rg `
                 -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId
 
-        $r.Status                   | Should Be 'SkippedOpen'
-        $r.Details.site             | Should Be 'SkippedOpen'
-        $r.Details.slots['staging'] | Should Be 'SkippedOpen'
-        $r.Details.slots['qa']      | Should Be 'SkippedOpen'
-        $r.Details.note             | Should Not BeNullOrEmpty
-        $global:AppSvcPatches.Count | Should Be 0
+        $r.Status                   | Should -Be 'SkippedOpen'
+        $r.Details.site             | Should -Be 'SkippedOpen'
+        $r.Details.slots['staging'] | Should -Be 'SkippedOpen'
+        $r.Details.slots['qa']      | Should -Be 'SkippedOpen'
+        $r.Details.note             | Should -Not -BeNullOrEmpty
+        $global:AppSvcPatches.Count | Should -Be 0
     }
 
     # ── (5) Already present, by caller IP ─────────────────────────────────────
@@ -362,11 +359,11 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
         $r = Add-JITAppServiceRule -SubscriptionId $script:Sub -ResourceGroup $script:Rg `
                 -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId
 
-        $r.Status                   | Should Be 'AlreadyPresent'
-        $r.Details.site             | Should Be 'AlreadyPresent'
-        $r.Details.slots['staging'] | Should Be 'AlreadyPresent'
-        $r.Details.note             | Should Not BeNullOrEmpty
-        $global:AppSvcPatches.Count | Should Be 0
+        $r.Status                   | Should -Be 'AlreadyPresent'
+        $r.Details.site             | Should -Be 'AlreadyPresent'
+        $r.Details.slots['staging'] | Should -Be 'AlreadyPresent'
+        $r.Details.note             | Should -Not -BeNullOrEmpty
+        $global:AppSvcPatches.Count | Should -Be 0
     }
 
     It 'detects the caller IP in bare (non-CIDR) form too' {
@@ -378,7 +375,7 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
         $r = Add-JITAppServiceRule -SubscriptionId $script:Sub -ResourceGroup $script:Rg `
                 -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId
 
-        $r.Status | Should Be 'AlreadyPresent'
+        $r.Status | Should -Be 'AlreadyPresent'
     }
 
     # ── (6) Priority is computed PER RESOURCE ─────────────────────────────────
@@ -396,9 +393,9 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
         $sitePri = (Get-JitEntry -Patch (Get-PatchesFor '*/sites/contoso-web/config/web')[0]).priority
         $slotPri = (Get-JitEntry -Patch (Get-PatchesFor '*/slots/staging/config/web')[0]).priority
 
-        $sitePri | Should Be 3000
-        $slotPri | Should Not Be 3000
-        ($slotPri -ge 3000 -and $slotPri -le 3900) | Should Be $true
+        $sitePri | Should -Be 3000
+        $slotPri | Should -Not -Be 3000
+        ($slotPri -ge 3000 -and $slotPri -le 3900) | Should -Be $true
     }
 
     It 'keeps the existing rules in the slot body (read-modify-write, not replace)' {
@@ -410,8 +407,8 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
             -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId | Out-Null
 
         $body = (Get-PatchesFor '*/slots/staging/config/web')[0].Body
-        @($body.properties.ipSecurityRestrictions).Count | Should Be 2
-        @($body.properties.ipSecurityRestrictions | Where-Object { $_.ipAddress -eq '198.51.100.9/32' }).Count | Should Be 1
+        @($body.properties.ipSecurityRestrictions).Count | Should -Be 2
+        @($body.properties.ipSecurityRestrictions | Where-Object { $_.ipAddress -eq '198.51.100.9/32' }).Count | Should -Be 1
     }
 
     # ── (7) SCM list handling per slot ────────────────────────────────────────
@@ -428,8 +425,8 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
             -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId | Out-Null
 
         $body = (Get-PatchesFor '*/slots/staging/config/web')[0].Body
-        $body.properties.ContainsKey('ipSecurityRestrictions')    | Should Be $true
-        $body.properties.ContainsKey('scmIpSecurityRestrictions') | Should Be $false
+        $body.properties.ContainsKey('ipSecurityRestrictions')    | Should -Be $true
+        $body.properties.ContainsKey('scmIpSecurityRestrictions') | Should -Be $false
     }
 
     It 'writes both lists on a slot whose SCM is separately restricted' {
@@ -444,10 +441,10 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
             -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId | Out-Null
 
         $body = (Get-PatchesFor '*/slots/staging/config/web')[0].Body
-        $body.properties.ContainsKey('ipSecurityRestrictions')    | Should Be $true
-        $body.properties.ContainsKey('scmIpSecurityRestrictions') | Should Be $true
+        $body.properties.ContainsKey('ipSecurityRestrictions')    | Should -Be $true
+        $body.properties.ContainsKey('scmIpSecurityRestrictions') | Should -Be $true
         (Get-JitEntry -Patch (Get-PatchesFor '*/slots/staging/config/web')[0] -List 'scmIpSecurityRestrictions').name |
-            Should Be $script:RuleId
+            Should -Be $script:RuleId
     }
 
     It 'writes only the SCM list on a slot whose main list is open but SCM is restricted' {
@@ -461,8 +458,8 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
             -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId | Out-Null
 
         $body = (Get-PatchesFor '*/slots/staging/config/web')[0].Body
-        $body.properties.ContainsKey('ipSecurityRestrictions')    | Should Be $false
-        $body.properties.ContainsKey('scmIpSecurityRestrictions') | Should Be $true
+        $body.properties.ContainsKey('ipSecurityRestrictions')    | Should -Be $false
+        $body.properties.ContainsKey('scmIpSecurityRestrictions') | Should -Be $true
     }
 
     # ── (8) Paging over the slots collection ──────────────────────────────────
@@ -480,11 +477,11 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
         $r = Add-JITAppServiceRule -SubscriptionId $script:Sub -ResourceGroup $script:Rg `
                 -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId
 
-        $global:AppSvcSlotCalls     | Should Be 2
-        $r.Details.slotCount        | Should Be 2
-        $r.Details.slots['staging'] | Should Be 'Created'
-        $r.Details.slots['qa']      | Should Be 'Created'
-        (Get-PatchesFor '*/slots/qa/config/web').Count | Should Be 1
+        $global:AppSvcSlotCalls     | Should -Be 2
+        $r.Details.slotCount        | Should -Be 2
+        $r.Details.slots['staging'] | Should -Be 'Created'
+        $r.Details.slots['qa']      | Should -Be 'Created'
+        (Get-PatchesFor '*/slots/qa/config/web').Count | Should -Be 1
     }
 
     # ── (9) A site with no slots behaves exactly like the old site-only path ──
@@ -496,12 +493,12 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
         $r = Add-JITAppServiceRule -SubscriptionId $script:Sub -ResourceGroup $script:Rg `
                 -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId
 
-        $r.Status                   | Should Be 'Created'
-        $r.Details.site             | Should Be 'Created'
-        $r.Details.slotCount        | Should Be 0
-        $r.Details.slots.Count      | Should Be 0
-        $global:AppSvcPatches.Count | Should Be 1
-        $r.Details.ContainsKey('slotFailures') | Should Be $false
+        $r.Status                   | Should -Be 'Created'
+        $r.Details.site             | Should -Be 'Created'
+        $r.Details.slotCount        | Should -Be 0
+        $r.Details.slots.Count      | Should -Be 0
+        $global:AppSvcPatches.Count | Should -Be 1
+        $r.Details.ContainsKey('slotFailures') | Should -Be $false
     }
 
     # ── (10) Slot enumeration failure is non-fatal ────────────────────────────
@@ -513,13 +510,13 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
         $r = Add-JITAppServiceRule -SubscriptionId $script:Sub -ResourceGroup $script:Rg `
                 -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId
 
-        $r.Status                       | Should Be 'Created'
-        $r.Details.site                 | Should Be 'Created'
-        $r.Details.slotEnumerationFailed | Should Be $true
-        $r.Details.slotEnumerationError | Should Not BeNullOrEmpty
-        $r.Details.slotCount            | Should Be 0
-        $global:AppSvcPatches.Count     | Should Be 1
-        Assert-MockCalled -ModuleName JITTargets Write-Warning -Times 1 -Scope It
+        $r.Status                       | Should -Be 'Created'
+        $r.Details.site                 | Should -Be 'Created'
+        $r.Details.slotEnumerationFailed | Should -Be $true
+        $r.Details.slotEnumerationError | Should -Not -BeNullOrEmpty
+        $r.Details.slotCount            | Should -Be 0
+        $global:AppSvcPatches.Count     | Should -Be 1
+        Should -Invoke -CommandName Write-Warning -ModuleName JITTargets -Times 1 -Scope It
     }
 
     # ── (11) A single slot's write failure does not cost the others ───────────
@@ -534,12 +531,12 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
         $r = Add-JITAppServiceRule -SubscriptionId $script:Sub -ResourceGroup $script:Rg `
                 -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId
 
-        $r.Status                          | Should Be 'Created'
-        $r.Details.slots['staging']        | Should Be 'Failed'
-        $r.Details.slots['qa']             | Should Be 'Created'
-        $r.Details.slotFailures['staging'] | Should Not BeNullOrEmpty
-        $r.Details.slotFailures.ContainsKey('qa') | Should Be $false
-        (Get-PatchesFor '*/slots/qa/config/web').Count | Should Be 1
+        $r.Status                          | Should -Be 'Created'
+        $r.Details.slots['staging']        | Should -Be 'Failed'
+        $r.Details.slots['qa']             | Should -Be 'Created'
+        $r.Details.slotFailures['staging'] | Should -Not -BeNullOrEmpty
+        $r.Details.slotFailures.ContainsKey('qa') | Should -Be $false
+        (Get-PatchesFor '*/slots/qa/config/web').Count | Should -Be 1
     }
 
     # ── (12) A SITE-level failure must NOT be swallowed ───────────────────────
@@ -548,8 +545,8 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
         $global:AppSvcGetFailPaths = @($script:SitePath)
         $global:AppSvcSlotPages    = @((New-SlotPageJson -Slots @()))
 
-        Test-Throws { Add-JITAppServiceRule -SubscriptionId $script:Sub -ResourceGroup $script:Rg `
-              -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId } | Should Be $true
+        { Add-JITAppServiceRule -SubscriptionId $script:Sub -ResourceGroup $script:Rg `
+              -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId } | Should -Throw
     }
 
     It 'propagates a failed WRITE on the site itself' {
@@ -557,8 +554,8 @@ Describe 'Add-JITAppServiceRule — deployment slot coverage' {
         $global:AppSvcPatchFailPaths = @($script:SitePath)
         $global:AppSvcSlotPages      = @((New-SlotPageJson -Slots @()))
 
-        Test-Throws { Add-JITAppServiceRule -SubscriptionId $script:Sub -ResourceGroup $script:Rg `
-              -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId } | Should Be $true
+        { Add-JITAppServiceRule -SubscriptionId $script:Sub -ResourceGroup $script:Rg `
+              -ResourceName $script:Site -CallerIp $script:CallerIp -RuleId $script:RuleId } | Should -Throw
     }
 }
 
@@ -615,12 +612,12 @@ Describe 'Remove-JITAppServiceRule' {
 
         $r = Remove-JITAppServiceRule -Row (New-JitRow)
 
-        $r.Status                   | Should Be 'Removed'
-        $r.Details.site             | Should Be 'Removed'
-        $r.Details.slotCount        | Should Be 2
-        $r.Details.slots['staging'] | Should Be 'Removed'
-        $r.Details.slots['qa']      | Should Be 'Removed'
-        $global:AppSvcPatches.Count | Should Be 3
+        $r.Status                   | Should -Be 'Removed'
+        $r.Details.site             | Should -Be 'Removed'
+        $r.Details.slotCount        | Should -Be 2
+        $r.Details.slots['staging'] | Should -Be 'Removed'
+        $r.Details.slots['qa']      | Should -Be 'Removed'
+        $global:AppSvcPatches.Count | Should -Be 3
     }
 
     It 'leaves the other rules in place when stripping the JIT rule' {
@@ -630,8 +627,8 @@ Describe 'Remove-JITAppServiceRule' {
         Remove-JITAppServiceRule -Row (New-JitRow) | Out-Null
 
         $body = (Get-PatchesFor '*/sites/contoso-web/config/web')[0].Body
-        @($body.properties.ipSecurityRestrictions).Count | Should Be 1
-        @($body.properties.ipSecurityRestrictions)[0].name | Should Be 'corp-hq'
+        @($body.properties.ipSecurityRestrictions).Count | Should -Be 1
+        @($body.properties.ipSecurityRestrictions)[0].name | Should -Be 'corp-hq'
     }
 
     It 'reports NotFound and writes nothing when the rule is already gone everywhere' {
@@ -641,10 +638,10 @@ Describe 'Remove-JITAppServiceRule' {
 
         $r = Remove-JITAppServiceRule -Row (New-JitRow)
 
-        $r.Status                   | Should Be 'NotFound'
-        $r.Details.site             | Should Be 'NotFound'
-        $r.Details.slots['staging'] | Should Be 'NotFound'
-        $global:AppSvcPatches.Count | Should Be 0
+        $r.Status                   | Should -Be 'NotFound'
+        $r.Details.site             | Should -Be 'NotFound'
+        $r.Details.slots['staging'] | Should -Be 'NotFound'
+        $global:AppSvcPatches.Count | Should -Be 0
     }
 
     It 'reports Removed when the rule only survived on a slot' {
@@ -654,11 +651,11 @@ Describe 'Remove-JITAppServiceRule' {
 
         $r = Remove-JITAppServiceRule -Row (New-JitRow)
 
-        $r.Status                   | Should Be 'Removed'
-        $r.Details.site             | Should Be 'NotFound'
-        $r.Details.slots['staging'] | Should Be 'Removed'
-        (Get-PatchesFor '*/slots/staging/config/web').Count | Should Be 1
-        (Get-PatchesFor '*/sites/contoso-web/config/web').Count | Should Be 0
+        $r.Status                   | Should -Be 'Removed'
+        $r.Details.site             | Should -Be 'NotFound'
+        $r.Details.slots['staging'] | Should -Be 'Removed'
+        (Get-PatchesFor '*/slots/staging/config/web').Count | Should -Be 1
+        (Get-PatchesFor '*/sites/contoso-web/config/web').Count | Should -Be 0
     }
 
     It 'strips the rule from the SCM list as well' {
@@ -670,10 +667,10 @@ Describe 'Remove-JITAppServiceRule' {
 
         $r = Remove-JITAppServiceRule -Row (New-JitRow)
 
-        $r.Status | Should Be 'Removed'
+        $r.Status | Should -Be 'Removed'
         $body = (Get-PatchesFor '*/sites/contoso-web/config/web')[0].Body
-        @($body.properties.ipSecurityRestrictions).Count    | Should Be 0
-        @($body.properties.scmIpSecurityRestrictions).Count | Should Be 0
+        @($body.properties.ipSecurityRestrictions).Count    | Should -Be 0
+        @($body.properties.scmIpSecurityRestrictions).Count | Should -Be 0
     }
 
     It 'still reports the site outcome and flags Details when slot enumeration throws' {
@@ -682,10 +679,10 @@ Describe 'Remove-JITAppServiceRule' {
 
         $r = Remove-JITAppServiceRule -Row (New-JitRow)
 
-        $r.Status                        | Should Be 'Removed'
-        $r.Details.slotEnumerationFailed | Should Be $true
-        $r.Details.slotCount             | Should Be 0
-        Assert-MockCalled -ModuleName JITTargets Write-Warning -Times 1 -Scope It
+        $r.Status                        | Should -Be 'Removed'
+        $r.Details.slotEnumerationFailed | Should -Be $true
+        $r.Details.slotCount             | Should -Be 0
+        Should -Invoke -CommandName Write-Warning -ModuleName JITTargets -Times 1 -Scope It
     }
 
     It 'marks only the failing slot Failed during revocation' {
@@ -697,10 +694,10 @@ Describe 'Remove-JITAppServiceRule' {
 
         $r = Remove-JITAppServiceRule -Row (New-JitRow)
 
-        $r.Status                          | Should Be 'Removed'
-        $r.Details.slots['staging']        | Should Be 'Failed'
-        $r.Details.slots['qa']             | Should Be 'Removed'
-        $r.Details.slotFailures['staging'] | Should Not BeNullOrEmpty
+        $r.Status                          | Should -Be 'Removed'
+        $r.Details.slots['staging']        | Should -Be 'Failed'
+        $r.Details.slots['qa']             | Should -Be 'Removed'
+        $r.Details.slotFailures['staging'] | Should -Not -BeNullOrEmpty
     }
 
     It 'falls back to RowKey when RuleIdentifier is missing' {
@@ -711,7 +708,7 @@ Describe 'Remove-JITAppServiceRule' {
 
         $r = Remove-JITAppServiceRule -Row $row
 
-        $r.Status | Should Be 'Removed'
+        $r.Status | Should -Be 'Removed'
     }
 
     It 'returns NotFound without any ARM call when the row has no identifier at all' {
@@ -722,16 +719,16 @@ Describe 'Remove-JITAppServiceRule' {
 
         $r = Remove-JITAppServiceRule -Row $row
 
-        $r.Status               | Should Be 'NotFound'
-        $r.Details.reason       | Should Be 'no-identifier'
-        Assert-MockCalled -ModuleName JITTargets Invoke-ArmRestRaw -Exactly -Times 0 -Scope It
+        $r.Status               | Should -Be 'NotFound'
+        $r.Details.reason       | Should -Be 'no-identifier'
+        Should -Invoke -CommandName Invoke-ArmRestRaw -ModuleName JITTargets -Exactly -Times 0 -Scope It
     }
 
     It 'propagates a failure on the site itself during revocation' {
         $global:AppSvcGetFailPaths = @($script:SitePath)
         $global:AppSvcSlotPages    = @((New-SlotPageJson -Slots @()))
 
-        Test-Throws { Remove-JITAppServiceRule -Row (New-JitRow) } | Should Be $true
+        { Remove-JITAppServiceRule -Row (New-JitRow) } | Should -Throw
     }
 }
 
@@ -742,20 +739,20 @@ Describe 'ConvertTo-AppServiceSlotShortName' {
 
     It 'takes the segment after the last slash of the compound ARM name' {
         InModuleScope JITTargets {
-            ConvertTo-AppServiceSlotShortName 'mysite/staging' | Should Be 'staging'
+            ConvertTo-AppServiceSlotShortName 'mysite/staging' | Should -Be 'staging'
         }
     }
 
     It 'passes a name that is already short through unchanged' {
         InModuleScope JITTargets {
-            ConvertTo-AppServiceSlotShortName 'staging' | Should Be 'staging'
+            ConvertTo-AppServiceSlotShortName 'staging' | Should -Be 'staging'
         }
     }
 
     It 'returns $null for a null or empty name' {
         InModuleScope JITTargets {
-            ConvertTo-AppServiceSlotShortName $null | Should BeNullOrEmpty
-            ConvertTo-AppServiceSlotShortName ''    | Should BeNullOrEmpty
+            ConvertTo-AppServiceSlotShortName $null | Should -BeNullOrEmpty
+            ConvertTo-AppServiceSlotShortName ''    | Should -BeNullOrEmpty
         }
     }
 }
@@ -765,14 +762,14 @@ Describe 'Get-AppServiceConfigPath' {
     It 'builds the site config/web path when no slot is given' {
         InModuleScope JITTargets {
             Get-AppServiceConfigPath -SubscriptionId 's' -ResourceGroup 'rg' -ResourceName 'web' |
-                Should Be '/subscriptions/s/resourceGroups/rg/providers/Microsoft.Web/sites/web/config/web'
+                Should -Be '/subscriptions/s/resourceGroups/rg/providers/Microsoft.Web/sites/web/config/web'
         }
     }
 
     It 'nests slots one level deeper' {
         InModuleScope JITTargets {
             Get-AppServiceConfigPath -SubscriptionId 's' -ResourceGroup 'rg' -ResourceName 'web' -Slot 'staging' |
-                Should Be '/subscriptions/s/resourceGroups/rg/providers/Microsoft.Web/sites/web/slots/staging/config/web'
+                Should -Be '/subscriptions/s/resourceGroups/rg/providers/Microsoft.Web/sites/web/slots/staging/config/web'
         }
     }
 }
@@ -781,34 +778,34 @@ Describe 'Test-AppServiceListRestricted' {
 
     It 'treats a DefaultAction of Deny as restricted even with no rules' {
         InModuleScope JITTargets {
-            Test-AppServiceListRestricted -Rules @() -DefaultAction 'Deny' | Should Be $true
+            Test-AppServiceListRestricted -Rules @() -DefaultAction 'Deny' | Should -Be $true
         }
     }
 
     It 'treats an empty list with DefaultAction Allow as open' {
         InModuleScope JITTargets {
-            Test-AppServiceListRestricted -Rules @() -DefaultAction 'Allow' | Should Be $false
+            Test-AppServiceListRestricted -Rules @() -DefaultAction 'Allow' | Should -Be $false
         }
     }
 
     It 'treats a list holding only the catch-all Any rule as open' {
         InModuleScope JITTargets {
             $rules = @([PSCustomObject]@{ ipAddress = 'Any'; action = 'Allow'; priority = 2147483647 })
-            Test-AppServiceListRestricted -Rules $rules -DefaultAction 'Allow' | Should Be $false
+            Test-AppServiceListRestricted -Rules $rules -DefaultAction 'Allow' | Should -Be $false
         }
     }
 
     It 'treats a concrete ipAddress rule as restricted' {
         InModuleScope JITTargets {
             $rules = @([PSCustomObject]@{ ipAddress = '198.51.100.7/32'; action = 'Allow'; priority = 100 })
-            Test-AppServiceListRestricted -Rules $rules -DefaultAction 'Allow' | Should Be $true
+            Test-AppServiceListRestricted -Rules $rules -DefaultAction 'Allow' | Should -Be $true
         }
     }
 
     It 'treats a vnet rule as restricted' {
         InModuleScope JITTargets {
             $rules = @([PSCustomObject]@{ vnetSubnetResourceId = '/subscriptions/x/.../subnets/s'; action = 'Allow'; priority = 100 })
-            Test-AppServiceListRestricted -Rules $rules -DefaultAction 'Allow' | Should Be $true
+            Test-AppServiceListRestricted -Rules $rules -DefaultAction 'Allow' | Should -Be $true
         }
     }
 }

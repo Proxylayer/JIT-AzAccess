@@ -57,12 +57,12 @@ Describe 'Invoke-JITArmReadModifyWrite' {
                     param($resource)
                     return @{ properties = @{ ipRules = @(@{ ipAddressOrRange = '2.2.2.2' }) } }
                 }
-            $r.Changed | Should Be $true
+            $r.Changed | Should -Be $true
         }
-        Assert-MockCalled -ModuleName JITTargets Invoke-ArmRestRaw -Exactly -Times 1 -Scope It -ParameterFilter {
+        Should -Invoke -CommandName Invoke-ArmRestRaw -ModuleName JITTargets -Exactly -Times 1 -Scope It -ParameterFilter {
             $Method -eq 'GET'
         }
-        Assert-MockCalled -ModuleName JITTargets Invoke-ArmRestRaw -Exactly -Times 1 -Scope It -ParameterFilter {
+        Should -Invoke -CommandName Invoke-ArmRestRaw -ModuleName JITTargets -Exactly -Times 1 -Scope It -ParameterFilter {
             $Method -eq 'PATCH' -and $ExtraHeaders['If-Match'] -eq '"etag-v1"'
         }
     }
@@ -73,7 +73,7 @@ Describe 'Invoke-JITArmReadModifyWrite' {
                 param($resource) return @{ properties = @{ ipRules = @(@{ ipAddressOrRange = '2.2.2.2' }) } }
             } | Out-Null
         }
-        Assert-MockCalled -ModuleName JITTargets Wait-JITArmAsyncOperation -Exactly -Times 0 -Scope It
+        Should -Invoke -CommandName Wait-JITArmAsyncOperation -ModuleName JITTargets -Exactly -Times 0 -Scope It
     }
 
     # ── (b) 412 on first write -> re-GET -> second write succeeds ───────────────
@@ -98,12 +98,12 @@ Describe 'Invoke-JITArmReadModifyWrite' {
             $r = Invoke-JITArmReadModifyWrite -Path '/x' -ApiVersion '2024-11-15' -Modify {
                 param($resource) return @{ properties = @{ ipRules = @(@{ ipAddressOrRange = '9.9.9.9' }) } }
             }
-            $r.Changed | Should Be $true
+            $r.Changed | Should -Be $true
         }
 
         # Re-GET happened (GET twice) and it converged in exactly 2 write attempts (<=5).
-        Assert-MockCalled -ModuleName JITTargets Invoke-ArmRestRaw -Exactly -Times 2 -Scope It -ParameterFilter { $Method -eq 'GET' }
-        Assert-MockCalled -ModuleName JITTargets Invoke-ArmRestRaw -Exactly -Times 2 -Scope It -ParameterFilter { $Method -eq 'PATCH' }
+        Should -Invoke -CommandName Invoke-ArmRestRaw -ModuleName JITTargets -Exactly -Times 2 -Scope It -ParameterFilter { $Method -eq 'GET' }
+        Should -Invoke -CommandName Invoke-ArmRestRaw -ModuleName JITTargets -Exactly -Times 2 -Scope It -ParameterFilter { $Method -eq 'PATCH' }
     }
 
     It 'sends the re-read ETag on the retry write after a 412' {
@@ -128,7 +128,7 @@ Describe 'Invoke-JITArmReadModifyWrite' {
             } | Out-Null
         }
         # First write carried etag-1, the surviving (retry) write carried etag-2.
-        Assert-MockCalled -ModuleName JITTargets Invoke-ArmRestRaw -Exactly -Times 1 -Scope It -ParameterFilter {
+        Should -Invoke -CommandName Invoke-ArmRestRaw -ModuleName JITTargets -Exactly -Times 1 -Scope It -ParameterFilter {
             $Method -eq 'PATCH' -and $ExtraHeaders['If-Match'] -eq '"etag-2"'
         }
     }
@@ -140,11 +140,11 @@ Describe 'Invoke-JITArmReadModifyWrite' {
             $r = Invoke-JITArmReadModifyWrite -Path '/x' -ApiVersion '2024-11-15' -Modify {
                 param($resource) return $false
             }
-            $r.Changed | Should Be $false
+            $r.Changed | Should -Be $false
         }
-        Assert-MockCalled -ModuleName JITTargets Invoke-ArmRestRaw -Exactly -Times 1 -Scope It -ParameterFilter { $Method -eq 'GET' }
-        Assert-MockCalled -ModuleName JITTargets Invoke-ArmRestRaw -Exactly -Times 0 -Scope It -ParameterFilter { $Method -ne 'GET' }
-        Assert-MockCalled -ModuleName JITTargets Wait-JITArmAsyncOperation -Exactly -Times 0 -Scope It
+        Should -Invoke -CommandName Invoke-ArmRestRaw -ModuleName JITTargets -Exactly -Times 1 -Scope It -ParameterFilter { $Method -eq 'GET' }
+        Should -Invoke -CommandName Invoke-ArmRestRaw -ModuleName JITTargets -Exactly -Times 0 -Scope It -ParameterFilter { $Method -ne 'GET' }
+        Should -Invoke -CommandName Wait-JITArmAsyncOperation -ModuleName JITTargets -Exactly -Times 0 -Scope It
     }
 
     # ── (d) LRO: 202 Accepted -> poll to completion ────────────────────────────
@@ -161,7 +161,7 @@ Describe 'Invoke-JITArmReadModifyWrite' {
                 param($resource) return @{ properties = @{ ipRules = @(@{ ipAddressOrRange = '3.3.3.3' }) } }
             } | Out-Null
         }
-        Assert-MockCalled -ModuleName JITTargets Wait-JITArmAsyncOperation -Exactly -Times 1 -Scope It
+        Should -Invoke -CommandName Wait-JITArmAsyncOperation -ModuleName JITTargets -Exactly -Times 1 -Scope It
     }
 
     # ── (d) LRO: 200 that still carries an Azure-AsyncOperation header -> poll ──
@@ -178,6 +178,6 @@ Describe 'Invoke-JITArmReadModifyWrite' {
                 param($resource) return @{ properties = @{ ipRules = @(@{ ipAddressOrRange = '3.3.3.3' }) } }
             } | Out-Null
         }
-        Assert-MockCalled -ModuleName JITTargets Wait-JITArmAsyncOperation -Exactly -Times 1 -Scope It
+        Should -Invoke -CommandName Wait-JITArmAsyncOperation -ModuleName JITTargets -Exactly -Times 1 -Scope It
     }
 }
