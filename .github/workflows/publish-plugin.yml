@@ -186,10 +186,34 @@ jobs:
           path: NuGet/*.nupkg
           if-no-files-found: error
 
+      # Best effort, deliberately NOT a release blocker.
+      #
+      # GitHub only persists attestations for a private repository on a paid
+      # plan, so on this one the step fails with "Feature not available for
+      # the Proxylayer organization". It runs BEFORE the push, so until now it
+      # aborted the job and nothing was ever published - the v0.9.0 tag failed
+      # the same way, and that release reached nuget.org by some other route.
+      #
+      # Provenance is worth having and worth keeping attempted, so that making
+      # the repo public or upgrading the plan starts producing it with no
+      # change here. It is not worth refusing to ship a security fix over, so
+      # its failure is recorded loudly and the release continues.
       - name: Attest build provenance
+        id: attest
+        continue-on-error: true
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: NuGet/*.nupkg
+
+      - name: Report provenance outcome
+        shell: pwsh
+        run: |
+          if ('${{ steps.attest.outcome }}' -eq 'success') {
+            Write-Host 'Build provenance attested.'
+          } else {
+            # An annotation, so it is visible on the run rather than buried.
+            Write-Host '::warning title=No build provenance::This package was published WITHOUT a provenance attestation. GitHub only persists attestations for private repositories on a paid plan. Make the repository public or upgrade the plan to restore it.'
+          }
 
       # Previously this set an "enabled" flag and the push step was skipped
       # when the secret was absent — so a release tag produced a fully GREEN
