@@ -238,7 +238,11 @@ jobs:
         id: nuget-login
         uses: NuGet/login@v1.2.0
         with:
-          user: ProxyLayer
+          # The nuget.org username that CREATED the trust policy, which is not
+          # the same field as the package owner shown beside it. Setting the
+          # owner organisation here fails the exchange with
+          # "No matching trust policy owned by user 'ProxyLayer' was found".
+          user: jbland
 
       - name: Push to nuget.org
         shell: pwsh
