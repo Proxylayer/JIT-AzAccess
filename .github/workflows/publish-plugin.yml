@@ -80,9 +80,26 @@ jobs:
 
           if ($env:EVENT_NAME -eq 'push' -and $env:REF -notlike 'refs/tags/*') {
             $run = $false
-            # A force-push or a new branch gives an all-zero/absent "before";
-            # fall back to running rather than silently skipping a publish.
-            if ([string]::IsNullOrWhiteSpace($env:BEFORE) -or $env:BEFORE -match '^0{40}$') {
+
+            # Reasons the "before" SHA can be unusable - all of which should
+            # publish rather than skip:
+            #   - a brand-new branch: GitHub sends all zeros.
+            #   - a force-push after a history rewrite: GitHub sends the real
+            #     previous SHA, but that commit no longer exists here, so a
+            #     diff against it aborts with "bad object". That used to fail
+            #     the step *after* it had already decided correctly to skip,
+            #     turning a clean no-op into a red run on the default branch.
+            $beforeUsable = -not ([string]::IsNullOrWhiteSpace($env:BEFORE) -or
+                                  $env:BEFORE -match '^0{40}$')
+            if ($beforeUsable) {
+              git cat-file -e "$($env:BEFORE)^{commit}" 2>$null
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host "'before' SHA $env:BEFORE is no longer in this repository."
+                $beforeUsable = $false
+              }
+            }
+
+            if (-not $beforeUsable) {
               Write-Host "No usable 'before' SHA - running."
               $run = $true
             } else {
@@ -97,6 +114,11 @@ jobs:
           }
 
           "run=$($run.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+
+          # The decision is carried by the output above. Keep the step's own
+          # exit status from inheriting whatever git last left in
+          # $LASTEXITCODE.
+          exit 0
 
   publish:
     needs: gate
