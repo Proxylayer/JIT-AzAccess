@@ -194,22 +194,37 @@ jobs:
       # Previously this set an "enabled" flag and the push step was skipped
       # when the secret was absent — so a release tag produced a fully GREEN
       # run that published nothing. A publish workflow that cannot publish is
-      # a failure; it must say so.
-      - name: Require the NuGet API key
-        shell: pwsh
-        env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:NUGET_API_KEY)) {
-            throw "NUGET_API_KEY is not configured for this repository, so this run cannot publish. Set the secret, then re-run."
-          }
-          Write-Host "NuGet API key present."
+      # a failure; it must say so. The same rule holds for OIDC below: a
+      # failed exchange fails the run.
+      #
+      # TRUSTED PUBLISHING. There is no NUGET_API_KEY secret and there should
+      # not be one. nuget.org's "JIT-Publish" policy trusts this exact
+      # repository and workflow file, and this step exchanges the job's
+      # short-lived GitHub OIDC token for an API key that expires in minutes.
+      # Nothing long-lived is stored in the repository, so there is no secret
+      # to leak, rotate, or forget to rotate.
+      #
+      # Two things this depends on, both easy to break by accident:
+      #   * `id-token: write` in the job permissions above. It is already
+      #     there for attest-build-provenance; removing it breaks publishing
+      #     too.
+      #   * The policy is bound to the WORKFLOW FILENAME. Renaming this file
+      #     silently invalidates it, and the push will start failing 403.
+      - name: Exchange OIDC token for a short-lived NuGet API key
+        id: nuget-login
+        uses: NuGet/login@v1.2.0
+        with:
+          user: ProxyLayer
 
       - name: Push to nuget.org
         shell: pwsh
         env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:NUGET_API_KEY)) {
+            throw "The OIDC exchange returned no API key, so this run cannot publish. Check the nuget.org trusted-publishing policy still names this repository and workflow file."
+          }
+
           # --skip-duplicate keeps the push idempotent: a branch-push run that
           # didn't bump the csproj's <Version> is a no-op rather than a
           # workflow failure. Tag-driven and manual-override runs are expected
