@@ -6,10 +6,13 @@ name: Publish plugin
 #   - Tag push like `v0.3.1`
 #       → authoritative: builds the plugin at the tag's version
 #         (overriding the csproj <Version>) and pushes to NuGet.
-#   - Branch push to main with changes inside the plugin folder
+#   - Branch push to `release` with changes inside the plugin folder
 #       → opportunistic: builds at the csproj <Version>;
 #         --skip-duplicate makes it a no-op if that version is already
 #         on NuGet.
+#       This said `main` until now. There is no `main` in this repository —
+#       the default branch is `release` — so the opportunistic path had
+#       never once fired, while reading as though it had.
 #
 # NOTE on the trigger shape: `paths:` used to sit under `push:`, but a path
 # filter applies to EVERY push event, tags included. So a `v*` tag on a commit
@@ -28,7 +31,7 @@ name: Publish plugin
 
 on:
   push:
-    branches: [main]
+    branches: [release]
     tags:
       - 'v*'
   workflow_dispatch:
