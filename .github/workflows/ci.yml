@@ -6,7 +6,9 @@ name: CI
 
 on:
   push:
-    branches: [main, release]
+    # `release` is this repository's default branch; there is no `main`.
+    # Listing one would be a trigger that can never fire.
+    branches: [release]
   pull_request:
   workflow_dispatch:
 
@@ -21,7 +23,11 @@ env:
   # Pinned so a new Pester major cannot turn a green CI red overnight, and so
   # local and CI runs agree. test.ps1 accepts anything >= 5.5.0.
   PESTER_VERSION: '6.2.0'
-  PSSA_VERSION: '1.22.0'
+  # 1.25.0 is the version the suite was actually validated against locally.
+  # Pinning a DIFFERENT one defeats the point of pinning: a newer analyzer adds
+  # rules and an older one lacks them, so CI would lint with something nobody
+  # had run.
+  PSSA_VERSION: '1.25.0'
 
 jobs:
   powershell:
