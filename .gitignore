@@ -31,3 +31,7 @@ azuredeploy.parameters.json
 # are one `git add .` away from being published.
 src/JIT-AzAccess.json
 src/JIT-AzAccess-Manager.json
+
+# Claude Code local state (scribe notes, code maps, local permissions).
+# Tooling scratch, not part of the product.
+.claude/
