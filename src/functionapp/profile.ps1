@@ -15,6 +15,9 @@ Import-Module "$PSScriptRoot/Modules/JITHelpers/JITHelpers.psm1"   -Force
 
 # Subscription id is derived at runtime (env JIT_SUBSCRIPTION_ID wins, else the
 # platform's WEBSITE_OWNER_NAME / IMDS) so no config app-setting is required.
+# One line per cold start, so every App Insights trace can be tied to a build.
+Write-Host "JIT-AzAccess function app $(Get-JITAppVersion) starting (PowerShell $($PSVersionTable.PSVersion))."
+
 $subId = Get-JitSubscriptionId
 
 if ($env:WEBSITE_HOSTNAME -and $env:AZURETRAY_APP_REGISTRATION_OBJECT_ID -and $subId) {

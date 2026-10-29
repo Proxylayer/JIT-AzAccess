@@ -1,5 +1,15 @@
 # JITHelpers.psm1 — shared helpers for the JIT NSG function app.
 #
+# VERSION. The function app had no version of its own: the repo tag and the
+# plugin's csproj carried one, and the deployed server carried nothing, so a
+# log line or an alert could not say which build produced it. This is that
+# single source of truth, logged once per cold start by profile.ps1.
+#
+# It MUST match <Version> in
+# src/plugin/AzureTray.Plugin.JITAzAccess/AzureTray.Plugin.JITAzAccess.csproj —
+# the two ship together off one git tag. JITVersion.Tests.ps1 fails the build
+# if they drift, because a version that lies is worse than none at all.
+#
 # This module depends on HttpHelpers.psm1 instead of Az.* modules so the
 # function app stays slim. All Azure ops go through Invoke-RestMethod via
 # the helpers in that module.
@@ -1358,7 +1368,17 @@ function Get-CallerIp {
 
 #endregion
 
+function Get-JITAppVersion {
+    <#
+    .SYNOPSIS
+        The function app's own version. Kept in step with the plugin's csproj
+        <Version> by JITVersion.Tests.ps1.
+    #>
+    return '1.0.0'
+}
+
 Export-ModuleMember -Function @(
+    'Get-JITAppVersion'
     'Invoke-JwtValidation'
     'Test-CallerHasJitRequesterRole'
     'Get-JitSubscriptionId'
